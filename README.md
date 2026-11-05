@@ -190,3 +190,21 @@ The implementation has four small modules: `prose.py` (segmentation), `extract.p
 include temporary Git repositories and failure cases. Generated fixtures do not
 establish complete Microsoft Word compatibility. No real/private document corpus
 was available for this implementation.
+
+## Releases
+
+Every push to `main` runs `.github/workflows/publish.yml`. Release runs are queued
+and each checks out the current `main`, including previous release version bumps.
+The workflow increments the patch version in `pyproject.toml` and
+`src/pilcrow/__init__.py`, builds and validates the distributions, runs the test
+suite, and verifies the installed CLI version. It then commits the version bump, pushes
+the commit and tag atomically, and creates a GitHub release with the wheel and
+source archive. Release commits use `chore(release): ... [skip ci]` to avoid loops.
+If `main` advances during a build, the push fails safely before publishing; the
+queued run checks out the newer `main`.
+
+A separate job uploads those same release files to PyPI using Trusted Publishing.
+Configure the PyPI publisher for owner `omertekin2002`, repository `Pilcrow`,
+workflow `publish.yml`, and GitHub environment `pypi`. No PyPI API token is needed.
+If only the PyPI upload fails, fix its configuration and use **Re-run failed jobs**
+on that workflow run to retry the existing release without bumping the version.
