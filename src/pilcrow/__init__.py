@@ -1,3 +1,3 @@
 """DOCX stays authoritative; companions are for review only."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
