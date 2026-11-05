@@ -8,7 +8,27 @@ not an editable replacement or a round-trip format.
 This is an independent, small Python implementation, conceptually inspired by the
 companion-file approach of stet. No source or tests were copied from that project.
 
-## Install locally
+## Install
+
+With Node.js 22 or newer:
+
+```sh
+npx otekin pilcrow
+pilcrow --help
+```
+
+The installer installs `pilcrow-docx` from PyPI for your user account, using uv
+and downloading uv and Python if needed. It supports Linux, macOS, and Windows.
+If it prints a directory to add to PATH, add that directory and reopen your
+terminal. Run `npx otekin pilcrow --upgrade` to update Pilcrow.
+
+If you already use uv, you can also install directly:
+
+```sh
+uv tool install pilcrow-docx
+```
+
+### Install from source
 
 Requires Python 3.10 or later. Git is needed for repository discovery and the Git
 workflow. Word is not required to export. From this project's directory:
