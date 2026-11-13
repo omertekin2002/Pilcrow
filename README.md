@@ -213,6 +213,11 @@ was available for this implementation.
 
 ## Releases
 
+Every pull request runs `.github/workflows/ci.yml`: the test suite on Linux, macOS
+and Windows with Python 3.10 and 3.14 (plus 3.11–3.13 on Linux), and a packaging
+check that builds the sdist and wheel, runs `twine check`, and runs the installed
+wheel. The release workflow below still runs the suite again before publishing.
+
 Every push to `main` runs `.github/workflows/publish.yml`. Release runs are queued
 and each checks out the current `main`, including previous release version bumps.
 The workflow increments the patch version in `pyproject.toml` and

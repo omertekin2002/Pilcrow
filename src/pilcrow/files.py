@@ -64,19 +64,40 @@ def discover(root):
     return sorted(paths, key=str)
 
 
+def within(root, path):
+    """Return ``path`` relative to the resolved ``root``, or None if outside it.
+
+    ``root`` is resolved, but a user's path may spell it through an alias, such
+    as macOS ``/var`` -> ``/private/var`` or a Windows 8.3 short name. Only the
+    ancestor that names the root itself is resolved; components inside the root
+    stay lexical so ``no_symlinks`` still checks them.
+    """
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        pass
+    for ancestor in reversed(path.parents):  # shortest first
+        try:
+            resolved = ancestor.resolve()
+        except (OSError, RuntimeError):  # RuntimeError: symlink loop before 3.13
+            continue
+        if resolved == root:
+            return path.relative_to(ancestor)
+    return None
+
+
 def select(root, paths, all_documents):
     if all_documents:
         return discover(root)
     selected = []
     for raw in paths:
         path = Path(os.path.abspath(raw))  # lexical path: do not resolve a hidden symlink
-        try:
-            relative = path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"{raw}: outside --root {root}") from exc
+        relative = within(root, path)
+        if relative is None:
+            raise ValueError(f"{raw}: outside --root {root}")
         if not eligible(relative):
             raise ValueError(f"{raw}: expected a DOCX outside lock/output/environment paths")
-        selected.append(path)
+        selected.append(root / relative)
     return sorted(set(selected), key=str)
 
 

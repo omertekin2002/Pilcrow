@@ -24,6 +24,10 @@ def parser():
 
 
 def main(argv=None):
+    # A piped stdout on Windows uses the ANSI code page; escape file names it
+    # cannot encode, as stderr already does, instead of failing the document.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     args = parser().parse_args(argv)
     root = args.root.resolve()
     if not root.is_dir():
