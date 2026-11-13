@@ -47,7 +47,7 @@ is recommended (`python -m venv .venv`); activate it before installing:
 
 If activation is unavailable, invoke `.venv/bin/python` or
 `.venv\Scripts\python.exe` directly with `-m pip install .`, then `-m pilcrow`.
-For development, use `python -m pip install -e .`.
+For development, see [Development](#development).
 
 Pilcrow uses Python's ZIP reader and `defusedxml` for XML parsing. There is no Word
 process, cloud service, AI connection, watcher, or background service. Extraction
@@ -211,12 +211,28 @@ include temporary Git repositories and failure cases. Generated fixtures do not
 establish complete Microsoft Word compatibility. No real/private document corpus
 was available for this implementation.
 
+## Development
+
+Install Pilcrow in editable mode with the pinned lint and type-check tools, then
+run both checks from the project root (they read their settings from
+`pyproject.toml`):
+
+```sh
+python -m pip install -e '.[dev]'
+ruff check .
+mypy
+```
+
+`ruff check .` lints `src/`, `tests/` and `scripts/`; `mypy` type-checks
+`src/pilcrow` in strict mode.
+
 ## Releases
 
 Every pull request runs `.github/workflows/ci.yml`: the test suite on Linux, macOS
-and Windows with Python 3.10 and 3.14 (plus 3.11–3.13 on Linux), and a packaging
-check that builds the sdist and wheel, runs `twine check`, and runs the installed
-wheel. The release workflow below still runs the suite again before publishing.
+and Windows with Python 3.10 and 3.14 (plus 3.11–3.13 on Linux), a lint job that
+runs `ruff check .` and strict `mypy`, and a packaging check that builds the sdist
+and wheel, runs `twine check`, and runs the installed wheel. The release workflow
+below still runs the suite again before publishing.
 
 Every push to `main` runs `.github/workflows/publish.yml`. Release runs are queued
 and each checks out the current `main`, including previous release version bumps.

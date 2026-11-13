@@ -3,29 +3,39 @@
 This is a prose view, not a Word renderer. All omissions are reported in metadata.
 """
 
-from collections import Counter
-from dataclasses import dataclass
+from __future__ import annotations
+
 import hashlib
 import json
-from pathlib import Path
 import posixpath
 import re
+from collections import Counter
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeAlias
 from zipfile import BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
 
 from .prose import normalize, sentences
 
+if TYPE_CHECKING:
+    # Only the node type; all parsing goes through defusedxml.
+    from xml.etree.ElementTree import Element
+
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS = {"w": W}
+# Relationship Id -> (type suffix, target, is external).
+Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
 
-def w(name):
+def w(name: str) -> str:
     return f"{{{W}}}{name}"
 
 
-def attr(node, name, default=""):
+def attr(node: Element, name: str, default: str = "") -> str:
     return node.get(w(name), default)
 
 
@@ -36,9 +46,9 @@ class DocumentError(ValueError):
 @dataclass
 class Extraction:
     prose: str
-    metadata: dict
+    metadata: dict[str, Any]
 
-    def outputs(self):
+    def outputs(self) -> dict[str, bytes]:
         return {
             ".prose.md": self.prose.encode("utf-8"),
             ".meta.json": (json.dumps(self.metadata, ensure_ascii=False, indent=2,
@@ -47,30 +57,30 @@ class Extraction:
 
 
 class Reader:
-    def __init__(self, package):
+    def __init__(self, package: ZipFile) -> None:
         self.package = package
         self.names = set(package.namelist())
-        self.warnings = {
+        self.warnings: set[str] = {
             "Formatting and page layout are not compared; unchanged prose is not an identical document."
         }
-        self.review = []
-        self.links = []
-        self.fields = []
-        self.styles = {}
-        self.field_stack = []
+        self.review: list[dict[str, str]] = []
+        self.links: list[dict[str, str]] = []
+        self.fields: list[dict[str, str]] = []
+        self.styles: dict[str, Element] = {}
+        self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
-        self.rels = {}
-        self.features = Counter()
+        self.rels: Relationships = {}
+        self.features: Counter[str] = Counter()
 
-    def xml(self, name):
+    def xml(self, name: str) -> Element:
         try:
             return ET.fromstring(self.package.read(name))
         except Exception as exc:
             raise DocumentError(f"cannot parse {name}: {exc}") from exc
 
-    def relationships(self, part):
+    def relationships(self, part: str) -> Relationships:
         path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
-        result = {}
+        result: Relationships = {}
         if path not in self.names:
             return result
         for rel in self.xml(path):
@@ -84,16 +94,16 @@ class Reader:
             result[rel.get("Id")] = (rel.get("Type", "").rsplit("/", 1)[-1], target, external)
         return result
 
-    def warn(self, message):
+    def warn(self, message: str) -> None:
         self.warnings.add(message)
 
-    def raw_text(self, node):
+    def raw_text(self, node: Element) -> str:
         return normalize("".join(
             (n.text or "") if n.tag in {w("t"), w("delText")} else " "
             for n in node.iter() if n.tag in {w("t"), w("delText"), w("tab"), w("br"), w("cr")}
         ))
 
-    def inline(self, node):
+    def inline(self, node: Element) -> str:
         tag = node.tag
         local = tag.rsplit("}", 1)[-1]
         if tag in {w("del"), w("ins"), w("moveFrom"), w("moveTo")}:
@@ -152,12 +162,12 @@ class Reader:
             return ""
         return "".join(self.inline(child) for child in node)
 
-    def record_field(self, instruction):
+    def record_field(self, instruction: str) -> None:
         value = normalize(instruction)
         self.fields.append({"command": value.split(" ", 1)[0],
                             "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part})
 
-    def properties(self, paragraph):
+    def properties(self, paragraph: Element) -> tuple[list[Element], str]:
         direct = paragraph.find("w:pPr", NS)
         style = direct.find("w:pStyle", NS) if direct is not None else None
         style_id = attr(style, "val") if style is not None else ""
@@ -175,7 +185,7 @@ class Reader:
             style_id = attr(based, "val") if based is not None else ""
         return properties, attr(style, "val") if style is not None else ""
 
-    def paragraph(self, node):
+    def paragraph(self, node: Element) -> str:
         text = self.inline(node)
         lines = sentences(text)
         if not lines:
@@ -201,7 +211,7 @@ class Reader:
                 return indent + "- " + ("\n" + indent + "  ").join(lines)
         return "\n".join(lines)
 
-    def blocks(self, node):
+    def blocks(self, node: Element) -> str:
         parts = []
         for child in node:
             if child.tag == w("p"):
@@ -224,7 +234,7 @@ class Reader:
                 parts.append(value)
         return "\n\n".join(parts)
 
-    def table_items(self, node, tag):
+    def table_items(self, node: Element, tag: str) -> Iterator[Element]:
         """Unwrap content controls without descending into nested tables."""
         for child in node:
             if child.tag == w(tag):
@@ -236,7 +246,7 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)
 
-    def table(self, node):
+    def table(self, node: Element) -> str:
         self.features["tables"] += 1
         lines = ["[Table]"]
         # Explicit cells avoid Markdown pipe escaping and ambiguity for multi-paragraph cells.
@@ -258,10 +268,10 @@ class Reader:
         lines.append("[/Table]")
         return "\n\n".join(lines)
 
-    def audit(self, tree):
+    def audit(self, tree: Element) -> None:
         # This small allowlist is intentionally conservative: unknown constructs warn.
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
-        def visit(node):
+        def visit(node: Element) -> None:
             local = node.tag.rsplit("}", 1)[-1]
             if node.tag.startswith("{" + W + "}") and local not in known:
                 self.warn(f"Unsupported Word construct {local}; its semantics are not fully compared.")
@@ -279,7 +289,7 @@ class Reader:
                 visit(child)
         visit(tree)
 
-    def render_part(self, part, tree):
+    def render_part(self, part: str, tree: Element) -> str:
         self.part, self.rels = part, self.relationships(part)
         self.audit(tree)
         value = self.blocks(tree)
@@ -289,11 +299,12 @@ class Reader:
                 self.record_field("".join(self.field_stack.pop()))
         return value
 
-    def extract(self):
+    def extract(self) -> Extraction:
         if "word/document.xml" not in self.names:
             raise DocumentError("missing word/document.xml; expected a standard DOCX package")
         main = self.xml("word/document.xml")
-        if main.tag != w("document") or main.find("w:body", NS) is None:
+        body = main.find("w:body", NS)
+        if main.tag != w("document") or body is None:
             raise DocumentError("unsupported Word XML dialect or missing document body (Strict OOXML is not supported)")
         main_rels = self.relationships("word/document.xml")
         supported = {"word/document.xml"}
@@ -303,7 +314,7 @@ class Reader:
                     raise DocumentError(f"missing related part {target}")
                 self.styles = {attr(s, "styleId"): s for s in self.xml(target)}
                 supported.add(target)
-        prose = [self.render_part("word/document.xml", main.find("w:body", NS))]
+        prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
                           if kind in {"footnotes", "endnotes", "comments", "header", "footer"} and not external})

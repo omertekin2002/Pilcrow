@@ -15,3 +15,29 @@ pilcrow = "pilcrow.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.17.5",
+    "mypy==2.4.1",
+    "types-defusedxml==0.7.0.20260504",
+]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = [
+    # Messages, XML fixtures and the construct allowlist use long lines on purpose;
+    # this config lints the code, it does not reformat it.
+    "E501",
+    # Whitespace-split word lists (abbreviations, known Word constructs) read
+    # better than the long list literals this rule asks for.
+    "SIM905",
+]
+
+[tool.mypy]
+strict = true
+files = ["src/pilcrow"]
+python_version = "3.10"
