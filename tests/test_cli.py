@@ -7,19 +7,18 @@ Run with ``python -m unittest discover -s tests -v`` from the project root.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
-import io
+from pathlib import Path
+from unittest.mock import patch
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
-
 
 PROJECT = Path(__file__).resolve().parents[1]
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -594,9 +593,12 @@ class CLITests(unittest.TestCase):
         before = self.exported()
         make_docx(source, paragraph("After."))
         stderr = io.StringIO()
-        with patch("pilcrow.files.os.replace", side_effect=OSError("simulated write failure")):
-            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
-                status = main(["export", str(source), "--root", str(self.root)])
+        with (
+            patch("pilcrow.files.os.replace", side_effect=OSError("simulated write failure")),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr),
+        ):
+            status = main(["export", str(source), "--root", str(self.root)])
         self.assertEqual(status, 2)
         self.assertIn("simulated write failure", stderr.getvalue())
         self.assertEqual(self.exported(), before)
