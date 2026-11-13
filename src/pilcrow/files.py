@@ -1,28 +1,29 @@
 """Explicit scope, Git-aware discovery, and atomic companion writes."""
 
 import os
-from pathlib import Path
 import subprocess
 import tempfile
+from collections.abc import Iterable
+from pathlib import Path
 
 OUTPUT = ".pilcrow"
 EXCLUDED = {OUTPUT, ".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".tox", ".nox", "build", "dist"}
 SUFFIXES = (".prose.md", ".meta.json")
 
 
-def git(root, *args):
+def git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
     try:
         return subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=False)
     except FileNotFoundError:
         return None
 
 
-def eligible(path):
+def eligible(path: Path) -> bool:
     return (path.suffix.lower() == ".docx" and not path.name.startswith("~$")
             and not any(p in EXCLUDED for p in path.parts))
 
 
-def no_symlinks(path, root):
+def no_symlinks(path: Path, root: Path) -> None:
     """Do not follow inputs or outputs outside scope through symlink components."""
     relative = path.relative_to(root)
     current = root
@@ -32,19 +33,22 @@ def no_symlinks(path, root):
             raise ValueError(f"symlink paths are not supported: {current}")
 
 
-def discover(root):
+def discover(root: Path) -> list[Path]:
     probe = git(root, "rev-parse", "--is-inside-work-tree")
     has_git = any((p / ".git").exists() for p in (root, *root.parents))
+    unavailable = "Git discovery unavailable in this repository; install/check Git or select explicit paths"
     if has_git and (probe is None or probe.returncode != 0):
-        raise ValueError("Git discovery unavailable in this repository; install/check Git or select explicit paths")
+        raise ValueError(unavailable)
     if probe and probe.returncode == 0 and probe.stdout.strip() == b"true":
         listing = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ".")
+        if listing is None:  # Git vanished after the probe above succeeded.
+            raise ValueError(unavailable)
         if listing.returncode:
             raise ValueError("Git discovery failed: " + os.fsdecode(listing.stderr).strip())
-        paths = {Path(os.fsdecode(p)) for p in listing.stdout.split(b"\0") if p}
+        listed = {Path(os.fsdecode(p)) for p in listing.stdout.split(b"\0") if p}
         # Deleted tracked inputs are handled by the orphan scan, not resurrected.
         selected = []
-        for path in sorted(paths):
+        for path in sorted(listed):
             if not eligible(path):
                 continue
             source = root / path
@@ -55,8 +59,8 @@ def discover(root):
                 continue
             selected.append(source)
         return selected
-    paths = []
-    def onerror(error):
+    paths: list[Path] = []
+    def onerror(error: OSError) -> None:
         raise error
     for directory, dirs, files in os.walk(root, onerror=onerror, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in EXCLUDED and not (Path(directory) / d).is_symlink())
@@ -64,7 +68,7 @@ def discover(root):
     return sorted(paths, key=str)
 
 
-def within(root, path):
+def within(root: Path, path: Path) -> Path | None:
     """Return ``path`` relative to the resolved ``root``, or None if outside it.
 
     ``root`` is resolved, but a user's path may spell it through an alias, such
@@ -86,7 +90,7 @@ def within(root, path):
     return None
 
 
-def select(root, paths, all_documents):
+def select(root: Path, paths: Iterable[str], all_documents: bool) -> list[Path]:
     if all_documents:
         return discover(root)
     selected = []
@@ -101,12 +105,12 @@ def select(root, paths, all_documents):
     return sorted(set(selected), key=str)
 
 
-def companions(root, source):
+def companions(root: Path, source: Path) -> list[Path]:
     stem = root / OUTPUT / source.relative_to(root)
     return [Path(str(stem) + suffix) for suffix in SUFFIXES]
 
 
-def orphaned(root):
+def orphaned(root: Path) -> list[Path]:
     base = root / OUTPUT
     no_symlinks(base, root)
     if not base.exists():
@@ -125,7 +129,7 @@ def orphaned(root):
     return sorted(result, key=str)
 
 
-def write_if_changed(path, content, root):
+def write_if_changed(path: Path, content: bytes, root: Path) -> bool:
     no_symlinks(path, root)
     if path.exists() and path.read_bytes() == content:
         return False
@@ -154,7 +158,7 @@ RULES = b"\n".join([
 ]) + b"\n"
 
 
-def setup(root):
+def setup(root: Path) -> bool:
     path = root / ".gitattributes"
     no_symlinks(path, root)
     old = path.read_bytes() if path.exists() else b""
