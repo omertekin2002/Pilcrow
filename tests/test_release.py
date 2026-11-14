@@ -1,8 +1,8 @@
 """Release version changes must agree with the installed CLI."""
 
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.bump_version import bump_version
 

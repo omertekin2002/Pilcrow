@@ -1,15 +1,16 @@
 """Refresh files only. Git mutations intentionally do not exist here."""
 
 import argparse
-from pathlib import Path
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 
 from . import __version__
 from .extract import DocumentError, extract
 from .files import companions, no_symlinks, orphaned, select, setup, write_if_changed
 
 
-def parser():
+def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Generate readable DOCX companions for GitHub Desktop.")
     result.add_argument("--version", action="version", version=__version__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -23,7 +24,11 @@ def parser():
     return result
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
+    # A piped stdout on Windows uses the ANSI code page; escape file names it
+    # cannot encode, as stderr already does, instead of failing the document.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     args = parser().parse_args(argv)
     root = args.root.resolve()
     if not root.is_dir():
@@ -31,8 +36,8 @@ def main(argv=None):
         return 2
     try:
         if args.command == "setup":
-            changed = setup(root)
-            print(f"{'Updated' if changed else 'Unchanged'} {root / '.gitattributes'}; review and commit through Git.")
+            updated = setup(root)
+            print(f"{'Updated' if updated else 'Unchanged'} {root / '.gitattributes'}; review and commit through Git.")
             return 0
         if bool(args.paths) == args.all:
             raise ValueError("specify DOCX paths OR --all; use --root to choose discovery/output scope")
@@ -43,8 +48,8 @@ def main(argv=None):
             try:
                 no_symlinks(source, root)
                 result = extract(source)
-                changed = []
-                for path, content in zip(companions(root, source), result.outputs().values()):
+                changed: list[str] = []
+                for path, content in zip(companions(root, source), result.outputs().values(), strict=True):
                     no_symlinks(path, root)
                     if args.command == "export":
                         if write_if_changed(path, content, root):

@@ -7,19 +7,18 @@ Run with ``python -m unittest discover -s tests -v`` from the project root.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
-import io
+from pathlib import Path
+from unittest.mock import patch
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
-
 
 PROJECT = Path(__file__).resolve().parents[1]
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -84,8 +83,10 @@ class CLITests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def cli(self, *args: str | Path, code: int = 0, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
+    def cli(
+        self, *args: str | Path, code: int = 0, cwd: Path | None = None, env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, **(env or {})}
         env["PYTHONPATH"] = os.pathsep.join((str(PROJECT / "src"), str(PROJECT), env.get("PYTHONPATH", "")))
         result = subprocess.run(
             [sys.executable, "-m", "pilcrow", *(str(arg) for arg in args)],
@@ -226,6 +227,36 @@ class CLITests(unittest.TestCase):
             self.skipTest("symlink creation unavailable on this platform")
         self.cli("export", "escape.docx", "--root", nested, cwd=nested, code=2)
         self.assertFalse((nested / ".pilcrow").exists())
+
+    def test_paths_through_an_alias_of_root_are_inside_root(self) -> None:
+        # macOS spells temp directories as /var -> /private/var, and Windows as
+        # 8.3 short names; --root is resolved, so the alias must still match.
+        real = self.root / "real"
+        real.mkdir()
+        alias = self.root / "alias"
+        try:
+            alias.symlink_to(real, target_is_directory=True)
+        except OSError:
+            self.skipTest("symlink creation unavailable on this platform")
+        make_docx(real / "essay.docx", paragraph("Aliased root."))
+        self.cli("export", alias / "essay.docx", "--root", alias)
+        self.cli("check", "alias/essay.docx", "--root", alias)
+        self.assertIn(b"Aliased root.", (real / ".pilcrow/essay.docx.prose.md").read_bytes())
+        # A symlink inside the root is still rejected when reached through the alias.
+        make_docx(self.root / "outside.docx", paragraph("Outside."))
+        (real / "escape.docx").symlink_to(self.root / "outside.docx")
+        self.cli("export", alias / "escape.docx", "--root", alias, code=2)
+        self.assertFalse((real / ".pilcrow/escape.docx.prose.md").exists())
+
+    def test_unencodable_names_do_not_fail_export(self) -> None:
+        # Windows pipes stdout through the ANSI code page, which lacks many letters,
+        # with the surrogateescape error handler by default.
+        make_docx(self.root / "İstanbul résumé.docx", paragraph("Encoded name."))
+        for encoding in ("ascii:strict", "ascii:surrogateescape"):
+            with self.subTest(encoding=encoding):
+                result = self.cli("export", "İstanbul résumé.docx", env={"PYTHONIOENCODING": encoding})
+                self.assertIn("\\u0130stanbul r\\xe9sum\\xe9.docx", result.stdout)
+        self.assertIn(b"Encoded name.", self.exported("İstanbul résumé.docx")[0])
 
     def test_default_root_is_current_directory(self) -> None:
         make_docx(self.root / "essay.docx", paragraph("Default root."))
@@ -562,9 +593,12 @@ class CLITests(unittest.TestCase):
         before = self.exported()
         make_docx(source, paragraph("After."))
         stderr = io.StringIO()
-        with patch("pilcrow.files.os.replace", side_effect=OSError("simulated write failure")):
-            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
-                status = main(["export", str(source), "--root", str(self.root)])
+        with (
+            patch("pilcrow.files.os.replace", side_effect=OSError("simulated write failure")),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr),
+        ):
+            status = main(["export", str(source), "--root", str(self.root)])
         self.assertEqual(status, 2)
         self.assertIn("simulated write failure", stderr.getvalue())
         self.assertEqual(self.exported(), before)
