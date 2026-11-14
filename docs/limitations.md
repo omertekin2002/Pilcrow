@@ -20,7 +20,8 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Comments | Text and author in metadata; anchors, dates, threaded replies, rich formatting, and resolved state not compared |
 | Hyperlinks | Accepted visible text in prose; label and destination in metadata, without fetching the URL |
 | Fields/citations | Saved display text in prose; normalized instruction fingerprint and first command token in metadata; never recalculate fields or manage Zotero |
-| Text boxes, drawings, images, embedded objects, equations | Omission warnings and placeholders for common inline constructs; no rendering, OCR, object execution, or asset-content comparison |
+| Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
+| Drawings, images, charts, embedded objects, equations | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or asset-content comparison |
 | Bold/italic, fonts, colors, other styles, pagination/layout | Not compared; always disclosed in coverage warning |
 
 Tracked text inclusion is an **accept-insertions/omit-deletions view**, not Word's
@@ -72,7 +73,7 @@ are retained literally and may themselves contain sensitive or local paths.
   sentences are indented. Table cells contain normal sentence/paragraph text.
   There are no per-sentence positional IDs or automatic counters.
 - The `.md` is optimized for the ordinary text diff, not faithful Markdown rendering:
-  literal Markdown metacharacters in Word are not escaped, and table/unsupported
+  literal Markdown metacharacters in Word are not escaped, and table/text box/unsupported
   markers can coincide with literal document text.
 
 ## Operational limits

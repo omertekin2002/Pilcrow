@@ -3,29 +3,44 @@
 This is a prose view, not a Word renderer. All omissions are reported in metadata.
 """
 
-from collections import Counter
-from dataclasses import dataclass
+from __future__ import annotations
+
 import hashlib
 import json
-from pathlib import Path
 import posixpath
 import re
+from collections import Counter
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeAlias
 from zipfile import BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
 
 from .prose import normalize, sentences
 
+if TYPE_CHECKING:
+    # Only the node type; all parsing goes through defusedxml.
+    from xml.etree.ElementTree import Element
+
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W}
+# Shape content that a rendered text box still leaves out of the prose.
+UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
+TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
+                 "position, anchoring, wrapping and shape formatting are not compared.")
+# Relationship Id -> (type suffix, target, is external).
+Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
 
-def w(name):
+def w(name: str) -> str:
     return f"{{{W}}}{name}"
 
 
-def attr(node, name, default=""):
+def attr(node: Element, name: str, default: str = "") -> str:
     return node.get(w(name), default)
 
 
@@ -36,9 +51,9 @@ class DocumentError(ValueError):
 @dataclass
 class Extraction:
     prose: str
-    metadata: dict
+    metadata: dict[str, Any]
 
-    def outputs(self):
+    def outputs(self) -> dict[str, bytes]:
         return {
             ".prose.md": self.prose.encode("utf-8"),
             ".meta.json": (json.dumps(self.metadata, ensure_ascii=False, indent=2,
@@ -47,30 +62,32 @@ class Extraction:
 
 
 class Reader:
-    def __init__(self, package):
+    def __init__(self, package: ZipFile) -> None:
         self.package = package
         self.names = set(package.namelist())
-        self.warnings = {
+        self.warnings: set[str] = {
             "Formatting and page layout are not compared; unchanged prose is not an identical document."
         }
-        self.review = []
-        self.links = []
-        self.fields = []
-        self.styles = {}
-        self.field_stack = []
+        self.review: list[dict[str, str]] = []
+        self.links: list[dict[str, str]] = []
+        self.fields: list[dict[str, str]] = []
+        self.styles: dict[str, Element] = {}
+        self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
-        self.rels = {}
-        self.features = Counter()
+        self.rels: Relationships = {}
+        self.features: Counter[str] = Counter()
+        # Text boxes found while reading a paragraph, rendered as blocks after it.
+        self.anchored: list[list[Element]] = []
 
-    def xml(self, name):
+    def xml(self, name: str) -> Element:
         try:
             return ET.fromstring(self.package.read(name))
         except Exception as exc:
             raise DocumentError(f"cannot parse {name}: {exc}") from exc
 
-    def relationships(self, part):
+    def relationships(self, part: str) -> Relationships:
         path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
-        result = {}
+        result: Relationships = {}
         if path not in self.names:
             return result
         for rel in self.xml(path):
@@ -84,16 +101,67 @@ class Reader:
             result[rel.get("Id")] = (rel.get("Type", "").rsplit("/", 1)[-1], target, external)
         return result
 
-    def warn(self, message):
+    def warn(self, message: str) -> None:
         self.warnings.add(message)
 
-    def raw_text(self, node):
+    def raw_text(self, node: Element) -> str:
         return normalize("".join(
             (n.text or "") if n.tag in {w("t"), w("delText")} else " "
-            for n in node.iter() if n.tag in {w("t"), w("delText"), w("tab"), w("br"), w("cr")}
+            for n in self.walk(node) if n.tag in {w("t"), w("delText"), w("tab"), w("br"), w("cr")}
         ))
 
-    def inline(self, node):
+    def walk(self, node: Element) -> Iterator[Element]:
+        """Like ``node.iter()``, but read only the rendered copy of a text box."""
+        yield node
+        branch = self.branch(node) if node.tag == f"{{{MC}}}AlternateContent" else None
+        for child in (branch if branch is not None else node):
+            yield from self.walk(child)
+
+    def branch(self, alternate: Element) -> Element | None:
+        """The one copy of an mc:AlternateContent text box to render, or None if it has none.
+
+        Word stores a modern text box twice: DrawingML in mc:Choice and VML in mc:Fallback.
+        """
+        def has_box(node: Element) -> bool:
+            return any(d.tag == w("txbxContent") for d in node.iter())
+        choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has_box(c)), None)
+        if choice is not None:
+            return choice
+        fallback = alternate.find(f"{{{MC}}}Fallback")
+        return fallback if fallback is not None and has_box(fallback) else None
+
+    def text_boxes(self, node: Element) -> list[Element]:
+        """Outermost rendered w:txbxContent elements in document order; nested ones render inside them."""
+        if node.tag == w("txbxContent"):
+            return [node]
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.branch(node)
+            return self.text_boxes(branch) if branch is not None else []
+        return [box for child in node for box in self.text_boxes(child)]
+
+    def unrendered_shape_parts(self, node: Element) -> bool:
+        """Whether a shape holding text boxes also holds pictures, charts or diagrams outside them."""
+        if node.tag == w("txbxContent"):
+            return False
+        if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+            return self.unrendered_shape_parts(branch)
+        # Alternatives without a text box (e.g. a grouped picture) are checked in full.
+        return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
+                or any(self.unrendered_shape_parts(child) for child in node))
+
+    def anchor(self, node: Element) -> tuple[str, list[str]]:
+        """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
+        self.anchored.append([])
+        text = self.inline(node)
+        boxes = self.anchored.pop()
+        return text, [self.text_box(box) for box in boxes]
+
+    def text_box(self, box: Element) -> str:
+        self.features["text boxes"] += 1
+        self.warn(TEXT_BOX_NOTE)
+        return "\n\n".join(("[Text box]", self.blocks(box) or "(empty)", "[/Text box]"))
+
+    def inline(self, node: Element) -> str:
         tag = node.tag
         local = tag.rsplit("}", 1)[-1]
         if tag in {w("del"), w("ins"), w("moveFrom"), w("moveTo")}:
@@ -144,6 +212,12 @@ class Reader:
         if tag == w("fldSimple"):
             self.record_field(attr(node, "instr"))
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
+        if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+            return "".join(self.inline(child) for child in branch)
+        if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
+            self.anchored[-1].extend(boxes)
+            if not self.unrendered_shape_parts(node):
+                return ""
         if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
@@ -152,12 +226,12 @@ class Reader:
             return ""
         return "".join(self.inline(child) for child in node)
 
-    def record_field(self, instruction):
+    def record_field(self, instruction: str) -> None:
         value = normalize(instruction)
         self.fields.append({"command": value.split(" ", 1)[0],
                             "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part})
 
-    def properties(self, paragraph):
+    def properties(self, paragraph: Element) -> tuple[list[Element], str]:
         direct = paragraph.find("w:pPr", NS)
         style = direct.find("w:pStyle", NS) if direct is not None else None
         style_id = attr(style, "val") if style is not None else ""
@@ -175,8 +249,11 @@ class Reader:
             style_id = attr(based, "val") if based is not None else ""
         return properties, attr(style, "val") if style is not None else ""
 
-    def paragraph(self, node):
-        text = self.inline(node)
+    def paragraph(self, node: Element) -> str:
+        text, boxes = self.anchor(node)
+        return "\n\n".join(part for part in (self.paragraph_text(node, text), *boxes) if part)
+
+    def paragraph_text(self, node: Element, text: str) -> str:
         lines = sentences(text)
         if not lines:
             return ""
@@ -201,7 +278,7 @@ class Reader:
                 return indent + "- " + ("\n" + indent + "  ").join(lines)
         return "\n".join(lines)
 
-    def blocks(self, node):
+    def blocks(self, node: Element) -> str:
         parts = []
         for child in node:
             if child.tag == w("p"):
@@ -213,8 +290,11 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
+            elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
+                value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag in {w("altChunk"), w("drawing"), w("pict"), w("object")}:
-                value = self.inline(child)
+                text, boxes = self.anchor(child)
+                value = "\n\n".join(part for part in (text, *boxes) if part)
             else:
                 if child.tag in {w("ins"), w("moveTo")}:
                     self.review.append({"kind": child.tag.rsplit("}", 1)[-1], "author": attr(child, "author"),
@@ -224,7 +304,7 @@ class Reader:
                 parts.append(value)
         return "\n\n".join(parts)
 
-    def table_items(self, node, tag):
+    def table_items(self, node: Element, tag: str) -> Iterator[Element]:
         """Unwrap content controls without descending into nested tables."""
         for child in node:
             if child.tag == w(tag):
@@ -236,7 +316,7 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)
 
-    def table(self, node):
+    def table(self, node: Element) -> str:
         self.features["tables"] += 1
         lines = ["[Table]"]
         # Explicit cells avoid Markdown pipe escaping and ambiguity for multi-paragraph cells.
@@ -258,11 +338,25 @@ class Reader:
         lines.append("[/Table]")
         return "\n\n".join(lines)
 
-    def audit(self, tree):
+    def audit(self, tree: Element) -> None:
         # This small allowlist is intentionally conservative: unknown constructs warn.
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
-        def visit(node):
+        def visit(node: Element) -> None:
             local = node.tag.rsplit("}", 1)[-1]
+            if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+                # Only the copy holding the rendered text box is read.
+                for child in branch:
+                    visit(child)
+                return
+            if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
+                # A rendered text box: audit its Word content, not the shape markup around it.
+                # inline() warns for pictures or charts that share the shape.
+                boxes = self.text_boxes(node)
+                if boxes:
+                    for box in boxes:
+                        for child in box:
+                            visit(child)
+                    return
             if node.tag.startswith("{" + W + "}") and local not in known:
                 self.warn(f"Unsupported Word construct {local}; its semantics are not fully compared.")
             if local.endswith("Pr") or local in {"tblGrid", "sdtEndPr"}:
@@ -279,7 +373,7 @@ class Reader:
                 visit(child)
         visit(tree)
 
-    def render_part(self, part, tree):
+    def render_part(self, part: str, tree: Element) -> str:
         self.part, self.rels = part, self.relationships(part)
         self.audit(tree)
         value = self.blocks(tree)
@@ -289,11 +383,12 @@ class Reader:
                 self.record_field("".join(self.field_stack.pop()))
         return value
 
-    def extract(self):
+    def extract(self) -> Extraction:
         if "word/document.xml" not in self.names:
             raise DocumentError("missing word/document.xml; expected a standard DOCX package")
         main = self.xml("word/document.xml")
-        if main.tag != w("document") or main.find("w:body", NS) is None:
+        body = main.find("w:body", NS)
+        if main.tag != w("document") or body is None:
             raise DocumentError("unsupported Word XML dialect or missing document body (Strict OOXML is not supported)")
         main_rels = self.relationships("word/document.xml")
         supported = {"word/document.xml"}
@@ -303,7 +398,7 @@ class Reader:
                     raise DocumentError(f"missing related part {target}")
                 self.styles = {attr(s, "styleId"): s for s in self.xml(target)}
                 supported.add(target)
-        prose = [self.render_part("word/document.xml", main.find("w:body", NS))]
+        prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
                           if kind in {"footnotes", "endnotes", "comments", "header", "footer"} and not external})

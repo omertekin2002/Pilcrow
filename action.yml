@@ -1,0 +1,51 @@
+name: Pilcrow check
+description: Fail when DOCX review companions are missing, stale or orphaned (runs `pilcrow check --all`).
+author: omertekin2002
+
+inputs:
+  root:
+    description: Document repository root to check, relative to the workspace (the `--root` option).
+    required: false
+    default: "."
+  python-version:
+    description: Python version used to run Pilcrow (3.10 or later).
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    # update-environment: false keeps this Python off the caller's PATH, so later
+    # steps in the caller's job see the environment they set up themselves.
+    - id: python
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+        update-environment: false
+
+    # Install from this action's own checkout, so `uses: omertekin2002/Pilcrow@<tag>`
+    # runs exactly that tag's code, into a private virtual environment.
+    - id: install
+      name: Install Pilcrow
+      shell: bash
+      env:
+        PILCROW_PYTHON: ${{ steps.python.outputs.python-path }}
+        PILCROW_SOURCE: ${{ github.action_path }}
+        PILCROW_VENV: ${{ runner.temp }}/pilcrow-action-venv
+      run: |
+        "$PILCROW_PYTHON" -m venv --clear "$PILCROW_VENV"
+        if [ -x "$PILCROW_VENV/bin/python" ]; then
+          venv_python="$PILCROW_VENV/bin/python"
+        else
+          venv_python="$PILCROW_VENV/Scripts/python.exe"
+        fi
+        "$venv_python" -m pip install --quiet --disable-pip-version-check "$PILCROW_SOURCE"
+        echo "python=$venv_python" >> "$GITHUB_OUTPUT"
+
+    # Exit code is Pilcrow's: 1 for missing/stale/orphan companions, 2 for errors.
+    - name: Check companions
+      shell: bash
+      env:
+        PILCROW_PYTHON: ${{ steps.install.outputs.python }}
+        PILCROW_ROOT: ${{ inputs.root }}
+      run: '"$PILCROW_PYTHON" -m pilcrow check --all --root "$PILCROW_ROOT"'

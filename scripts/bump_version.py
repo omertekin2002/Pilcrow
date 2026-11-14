@@ -1,7 +1,7 @@
 """Keep package metadata and the CLI version in sync for patch releases."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 
 def bump_version(root: Path) -> str:
