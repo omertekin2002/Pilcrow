@@ -139,4 +139,4 @@ jobs:
           fi
           cat "$RUNNER_TEMP/hook-stale.log"
           grep -E '^pilcrow check\.+Failed$' "$RUNNER_TEMP/hook-stale.log"
-          grep 'stale' "$RUNNER_TEMP/hook-stale.log"
+          grep 'STALE' "$RUNNER_TEMP/hook-stale.log"

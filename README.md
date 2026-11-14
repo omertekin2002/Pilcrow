@@ -150,6 +150,57 @@ Byte-identical outputs keep their existing modification times. Each file is
 atomic, **not the whole pair or batch**: if interrupted between files, run `check`
 and export again. Avoid concurrent exports into the same root.
 
+## Enforce freshness
+
+Pilcrow ships a [pre-commit](https://pre-commit.com) hook and a GitHub Action, so a
+document repository can refuse stale companions locally and in CI. Both only run
+`pilcrow check --all`: they never export, stage, or rewrite files. When either
+fails, run `pilcrow export` yourself and commit the DOCX and its companions
+together.
+
+Pin both to a Pilcrow release tag (see the repository's Releases). The hook and
+action first ship in the release after v0.1.2; the snippets below assume `v0.1.3`.
+
+`.pre-commit-config.yaml` in your document repository root (then run
+`pre-commit install` once):
+
+```yaml
+repos:
+  - repo: https://github.com/omertekin2002/Pilcrow
+    rev: v0.1.3
+    hooks:
+      - id: pilcrow-check
+```
+
+The hook runs `pilcrow check --all --root .` from the repository root when a commit
+adds or changes a DOCX or a file under `.pilcrow/`. pre-commit does not pass
+deleted paths to hooks, so a commit that only deletes files (for example a DOCX
+without its companions) skips the hook; the CI check below catches the resulting
+orphans. To run the check on every commit instead, add `always_run: true` under
+`- id: pilcrow-check`. The hook is for the pre-commit framework, run by
+`git commit` once `pre-commit install` has set it up. It has not been tested with
+GitHub Desktop.
+
+`.github/workflows/pilcrow.yml` in your document repository:
+
+```yaml
+name: Pilcrow
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: omertekin2002/Pilcrow@v0.1.3
+        with:
+          root: .              # optional, default "."
+          python-version: "3.12"  # optional, default "3.12"
+```
+
+The action installs Pilcrow from the tagged source into a private virtual
+environment and fails with Pilcrow's exit code: 1 for missing, stale or orphan
+companions, 2 for errors.
+
 ## Branches and conflicts
 
 Opt in to conservative merge rules once, from your document repository root:
@@ -231,7 +282,10 @@ mypy
 Every pull request runs `.github/workflows/ci.yml`: the test suite on Linux, macOS
 and Windows with Python 3.10 and 3.14 (plus 3.11–3.13 on Linux), a lint job that
 runs `ruff check .` and strict `mypy`, and a packaging check that builds the sdist
-and wheel, runs `twine check`, and runs the installed wheel. The release workflow
+and wheel, runs `twine check`, and runs the installed wheel. An `enforce` job
+builds a fixture document repository with `scripts/make_fixture_repo.py` and checks
+that the action (`uses: ./`) and the pre-commit hook (`pre-commit try-repo`) pass
+with fresh companions and fail after the DOCX changes without re-export. The release workflow
 below still runs the suite again before publishing.
 
 Every push to `main` runs `.github/workflows/publish.yml`. Release runs are queued
