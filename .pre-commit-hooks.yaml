@@ -1,0 +1,12 @@
+# Hooks for the pre-commit framework (https://pre-commit.com). The hook only
+# checks: it never exports, stages or rewrites files. Run `pilcrow export`
+# yourself, then commit the DOCX and its companions together.
+- id: pilcrow-check
+  name: pilcrow check
+  description: Fail when DOCX review companions under .pilcrow/ are missing, stale or orphaned.
+  entry: pilcrow check --all --root .
+  language: python
+  pass_filenames: false
+  always_run: false
+  # Run when a DOCX (any case) or a companion under .pilcrow/ is staged.
+  files: '(?i)(\.docx$|^\.pilcrow/)'
