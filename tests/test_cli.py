@@ -622,6 +622,21 @@ class CLITests(unittest.TestCase):
         self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
         self.assertIn(TEXT_BOX_NOTE, meta["warnings"])
 
+    def test_block_level_alternate_content_is_rendered_once(self) -> None:
+        choice = anchored("Choice anchor.", drawing_text_box(paragraph("Choice box.")))
+        fallback = anchored("Fallback anchor.", vml_text_box(paragraph("Fallback box.")))
+        body = paragraph("Before.") + f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>'
+        prose, meta = self.export_text_box(body)
+        self.assertEqual(prose, "Before.\n\nChoice anchor.\n\n[Text box]\n\nChoice box.\n\n[/Text box]\n")
+        self.assert_only_text_box_warning(meta)
+
+    def test_grouped_picture_in_a_compatibility_wrapper_keeps_its_placeholder(self) -> None:
+        picture = f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="pic"><pic:pic xmlns:pic="{PIC}"/></mc:Choice><mc:Fallback/></mc:AlternateContent>'
+        shape = drawing_text_box(paragraph("Grouped box.")).replace("</wps:wsp>", "</wps:wsp>" + picture)
+        prose, meta = self.export_text_box(anchored("Group anchor.", shape))
+        self.assertEqual(prose, "Group anchor.[Unsupported drawing]\n\n[Text box]\n\nGrouped box.\n\n[/Text box]\n")
+        self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")
         for _ in range(400):

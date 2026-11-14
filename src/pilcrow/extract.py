@@ -143,9 +143,9 @@ class Reader:
         """Whether a shape holding text boxes also holds pictures, charts or diagrams outside them."""
         if node.tag == w("txbxContent"):
             return False
-        if node.tag == f"{{{MC}}}AlternateContent":
-            branch = self.branch(node)
-            return branch is not None and self.unrendered_shape_parts(branch)
+        if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+            return self.unrendered_shape_parts(branch)
+        # Alternatives without a text box (e.g. a grouped picture) are checked in full.
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
                 or any(self.unrendered_shape_parts(child) for child in node))
 
@@ -290,6 +290,8 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
+            elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
+                value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag in {w("altChunk"), w("drawing"), w("pict"), w("object")}:
                 text, boxes = self.anchor(child)
                 value = "\n\n".join(part for part in (text, *boxes) if part)
@@ -341,7 +343,12 @@ class Reader:
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
         def visit(node: Element) -> None:
             local = node.tag.rsplit("}", 1)[-1]
-            if node.tag in {f"{{{MC}}}AlternateContent", w("drawing"), w("pict"), w("txbxContent")}:
+            if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+                # Only the copy holding the rendered text box is read.
+                for child in branch:
+                    visit(child)
+                return
+            if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
                 # A rendered text box: audit its Word content, not the shape markup around it.
                 # inline() warns for pictures or charts that share the shape.
                 boxes = self.text_boxes(node)
