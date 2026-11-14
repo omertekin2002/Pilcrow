@@ -26,7 +26,12 @@ if TYPE_CHECKING:
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W}
+# Shape content that a rendered text box still leaves out of the prose.
+UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
+TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
+                 "position, anchoring, wrapping and shape formatting are not compared.")
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
@@ -71,6 +76,8 @@ class Reader:
         self.part = "word/document.xml"
         self.rels: Relationships = {}
         self.features: Counter[str] = Counter()
+        # Text boxes found while reading a paragraph, rendered as blocks after it.
+        self.anchored: list[list[Element]] = []
 
     def xml(self, name: str) -> Element:
         try:
@@ -100,8 +107,59 @@ class Reader:
     def raw_text(self, node: Element) -> str:
         return normalize("".join(
             (n.text or "") if n.tag in {w("t"), w("delText")} else " "
-            for n in node.iter() if n.tag in {w("t"), w("delText"), w("tab"), w("br"), w("cr")}
+            for n in self.walk(node) if n.tag in {w("t"), w("delText"), w("tab"), w("br"), w("cr")}
         ))
+
+    def walk(self, node: Element) -> Iterator[Element]:
+        """Like ``node.iter()``, but read only the rendered copy of a text box."""
+        yield node
+        branch = self.branch(node) if node.tag == f"{{{MC}}}AlternateContent" else None
+        for child in (branch if branch is not None else node):
+            yield from self.walk(child)
+
+    def branch(self, alternate: Element) -> Element | None:
+        """The one copy of an mc:AlternateContent text box to render, or None if it has none.
+
+        Word stores a modern text box twice: DrawingML in mc:Choice and VML in mc:Fallback.
+        """
+        def has_box(node: Element) -> bool:
+            return any(d.tag == w("txbxContent") for d in node.iter())
+        choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has_box(c)), None)
+        if choice is not None:
+            return choice
+        fallback = alternate.find(f"{{{MC}}}Fallback")
+        return fallback if fallback is not None and has_box(fallback) else None
+
+    def text_boxes(self, node: Element) -> list[Element]:
+        """Outermost rendered w:txbxContent elements in document order; nested ones render inside them."""
+        if node.tag == w("txbxContent"):
+            return [node]
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.branch(node)
+            return self.text_boxes(branch) if branch is not None else []
+        return [box for child in node for box in self.text_boxes(child)]
+
+    def unrendered_shape_parts(self, node: Element) -> bool:
+        """Whether a shape holding text boxes also holds pictures, charts or diagrams outside them."""
+        if node.tag == w("txbxContent"):
+            return False
+        if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+            return self.unrendered_shape_parts(branch)
+        # Alternatives without a text box (e.g. a grouped picture) are checked in full.
+        return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
+                or any(self.unrendered_shape_parts(child) for child in node))
+
+    def anchor(self, node: Element) -> tuple[str, list[str]]:
+        """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
+        self.anchored.append([])
+        text = self.inline(node)
+        boxes = self.anchored.pop()
+        return text, [self.text_box(box) for box in boxes]
+
+    def text_box(self, box: Element) -> str:
+        self.features["text boxes"] += 1
+        self.warn(TEXT_BOX_NOTE)
+        return "\n\n".join(("[Text box]", self.blocks(box) or "(empty)", "[/Text box]"))
 
     def inline(self, node: Element) -> str:
         tag = node.tag
@@ -154,6 +212,12 @@ class Reader:
         if tag == w("fldSimple"):
             self.record_field(attr(node, "instr"))
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
+        if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+            return "".join(self.inline(child) for child in branch)
+        if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
+            self.anchored[-1].extend(boxes)
+            if not self.unrendered_shape_parts(node):
+                return ""
         if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
@@ -186,7 +250,10 @@ class Reader:
         return properties, attr(style, "val") if style is not None else ""
 
     def paragraph(self, node: Element) -> str:
-        text = self.inline(node)
+        text, boxes = self.anchor(node)
+        return "\n\n".join(part for part in (self.paragraph_text(node, text), *boxes) if part)
+
+    def paragraph_text(self, node: Element, text: str) -> str:
         lines = sentences(text)
         if not lines:
             return ""
@@ -223,8 +290,11 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
+            elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
+                value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag in {w("altChunk"), w("drawing"), w("pict"), w("object")}:
-                value = self.inline(child)
+                text, boxes = self.anchor(child)
+                value = "\n\n".join(part for part in (text, *boxes) if part)
             else:
                 if child.tag in {w("ins"), w("moveTo")}:
                     self.review.append({"kind": child.tag.rsplit("}", 1)[-1], "author": attr(child, "author"),
@@ -273,6 +343,20 @@ class Reader:
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
         def visit(node: Element) -> None:
             local = node.tag.rsplit("}", 1)[-1]
+            if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
+                # Only the copy holding the rendered text box is read.
+                for child in branch:
+                    visit(child)
+                return
+            if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
+                # A rendered text box: audit its Word content, not the shape markup around it.
+                # inline() warns for pictures or charts that share the shape.
+                boxes = self.text_boxes(node)
+                if boxes:
+                    for box in boxes:
+                        for child in box:
+                            visit(child)
+                    return
             if node.tag.startswith("{" + W + "}") and local not in known:
                 self.warn(f"Unsupported Word construct {local}; its semantics are not fully compared.")
             if local.endswith("Pr") or local in {"tblGrid", "sdtEndPr"}:

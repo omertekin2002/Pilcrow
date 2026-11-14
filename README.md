@@ -246,9 +246,15 @@ DOCX. No automatic OOXML merging or sentence-lineage system is provided.
 See [coverage, normalization, and backlog](docs/limitations.md). The prose retains
 common headings, list indentation, tables, notes, headers, and footers. Tracked
 insertions/move destinations are included and deletions/move sources omitted.
-Complex tracked structure/layout is limited and reported. Images, equations,
-text boxes, and embedded objects are not rendered. Formatting-only edits can
+Complex tracked structure/layout is limited and reported. Text box text is shown
+between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
+box's position, wrapping, and shape formatting are not compared. Images, charts,
+equations, and embedded objects are not rendered. Formatting-only edits can
 leave both companions unchanged and still matter in Word.
+
+Upgrading from a version that left text box text out: documents with text boxes
+report stale companions once, because their prose now includes that text. Run
+`pilcrow export` and commit the refreshed companions.
 
 Run the generated-fixture suite:
 

@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -35,6 +36,64 @@ def document(body: str) -> str:
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body>{body}</w:body></w:document>'
     )
+
+
+MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+WPG = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+V = "urn:schemas-microsoft-com:vml"
+TEXT_BOX_NOTE = (
+    "Text box text is shown in [Text box] blocks after its anchoring paragraph; "
+    "position, anchoring, wrapping and shape formatting are not compared."
+)
+
+
+def drawing_text_box(content: str, *, picture: bool = False) -> str:
+    """A DrawingML text box shape (wps:wsp) as Word writes it, optionally grouped with a picture."""
+    shape = (
+        f'<wps:wsp xmlns:wps="{WPS}"><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/>'
+        '<a:ext cx="1828800" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></wps:spPr>'
+        f'<wps:txbx><w:txbxContent>{content}</w:txbxContent></wps:txbx><wps:bodyPr rot="0" vert="horz"/></wps:wsp>'
+    )
+    uri = WPS
+    if picture:
+        uri = WPG
+        shape = f'<wpg:wgp xmlns:wpg="{WPG}"><wpg:cNvGrpSpPr/><wpg:grpSpPr/>{shape}<pic:pic xmlns:pic="{PIC}"><pic:blipFill><a:blip r:embed="image1"/></pic:blipFill></pic:pic></wpg:wgp>'
+    return (
+        f'<w:drawing><wp:anchor xmlns:wp="{WP}" distT="0" distB="0" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
+        '<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>'
+        '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>'
+        '<wp:extent cx="1828800" cy="914400"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="bothSides"/>'
+        f'<wp:docPr id="1" name="Text Box 1"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="{A}"><a:graphicData uri="{uri}">'
+        f'{shape}</a:graphicData></a:graphic></wp:anchor></w:drawing>'
+    )
+
+
+def vml_text_box(content: str) -> str:
+    """A legacy VML text box, as in older files and in mc:Fallback."""
+    return (
+        f'<w:pict><v:shapetype xmlns:v="{V}" id="_x0000_t202" coordsize="21600,21600" o:spt="202" '
+        'xmlns:o="urn:schemas-microsoft-com:office:office" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/>'
+        f'</v:shapetype><v:shape xmlns:v="{V}" id="Text Box 1" type="#_x0000_t202" style="position:absolute;width:144pt;height:72pt">'
+        f'<v:textbox><w:txbxContent>{content}</w:txbxContent></v:textbox></v:shape></w:pict>'
+    )
+
+
+def modern_text_box(content: str, *, fallback: str | None = None, picture: bool = False) -> str:
+    """mc:AlternateContent with a DrawingML Choice and a VML Fallback copy of the same text."""
+    return (
+        f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{drawing_text_box(content, picture=picture)}</mc:Choice>'
+        f'<mc:Fallback>{vml_text_box(content if fallback is None else fallback)}</mc:Fallback></mc:AlternateContent>'
+    )
+
+
+def anchored(text: str, shape: str) -> str:
+    """A paragraph with its own text and one shape in a following run."""
+    return f'<w:p><w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r><w:r>{shape}</w:r></w:p>'
 
 
 def make_docx(
@@ -460,6 +519,134 @@ class CLITests(unittest.TestCase):
         self.assertRegex(result.stdout + result.stderr, r"(?i)drawing")
         self.assertIn(b"Surrounding prose.", self.exported()[0])
         self.cli("check", "essay.docx", "--root", self.root)
+
+
+    def export_text_box(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        make_docx(self.root / "essay.docx", body, **options)
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        return prose.decode("utf-8"), json.loads(meta)
+
+    def assert_only_text_box_warning(self, meta: dict[str, Any], *extra: str) -> None:
+        self.assertEqual(meta["warnings"], sorted([
+            "Formatting and page layout are not compared; unchanged prose is not an identical document.",
+            TEXT_BOX_NOTE, *extra,
+        ]))
+
+    def test_modern_text_box_text_is_rendered_once_after_its_anchor(self) -> None:
+        body = paragraph("Before.") + anchored("Anchor text.", modern_text_box(paragraph("Boxed sentence. Second one."))) + paragraph("After.")
+        prose, meta = self.export_text_box(body)
+        self.assertEqual(prose, "Before.\n\nAnchor text.\n\n[Text box]\n\nBoxed sentence.\nSecond one.\n\n[/Text box]\n\nAfter.\n")
+        # One small, stable warning set rather than one per DrawingML/VML element.
+        self.assert_only_text_box_warning(meta)
+
+    def test_vml_text_box_is_rendered_like_a_modern_one(self) -> None:
+        body = paragraph("Before.") + anchored("Anchor text.", vml_text_box(paragraph("Boxed sentence. Second one."))) + paragraph("After.")
+        prose, meta = self.export_text_box(body)
+        self.assertEqual(prose, "Before.\n\nAnchor text.\n\n[Text box]\n\nBoxed sentence.\nSecond one.\n\n[/Text box]\n\nAfter.\n")
+        self.assert_only_text_box_warning(meta)
+
+    def test_choice_copy_is_preferred_and_fallback_used_only_without_one(self) -> None:
+        body = anchored("", modern_text_box(paragraph("Choice copy."), fallback=paragraph("Fallback copy.")))
+        prose, _ = self.export_text_box(body)
+        self.assertIn("Choice copy.", prose)
+        self.assertNotIn("Fallback copy.", prose)
+        # A Choice holding only a picture defers to the Fallback text box.
+        picture = f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}"><pic:pic xmlns:pic="{PIC}"/></a:graphicData></a:graphic></wp:inline></w:drawing>'
+        alternate = f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{picture}</mc:Choice><mc:Fallback>{vml_text_box(paragraph("Fallback copy."))}</mc:Fallback></mc:AlternateContent>'
+        prose, meta = self.export_text_box(anchored("", alternate))
+        self.assertEqual(prose, "[Text box]\n\nFallback copy.\n\n[/Text box]\n")
+        self.assert_only_text_box_warning(meta)
+
+    def test_text_box_edit_is_stale_until_exported_again(self) -> None:
+        source = self.root / "essay.docx"
+        make_docx(source, anchored("Stable anchor.", modern_text_box(paragraph("Original callout."))))
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        make_docx(source, anchored("Stable anchor.", modern_text_box(paragraph("Revised callout."))))
+        self.cli("check", "essay.docx", code=1)
+        self.assertEqual(self.exported(), before, "check must not regenerate stale files")
+        self.cli("export", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], before[0].replace(b"Original callout.", b"Revised callout."))
+        self.cli("check", "essay.docx")
+
+    def test_tracked_changes_in_a_text_box_are_reviewed_once(self) -> None:
+        content = (
+            '<w:p><w:ins w:id="1" w:author="Ada"><w:r><w:t>Inserted words.</w:t></w:r></w:ins>'
+            '<w:del w:id="2" w:author="Ben"><w:r><w:delText>Deleted words.</w:delText></w:r></w:del></w:p>'
+        )
+        body = f'<w:p><w:ins w:id="3" w:author="Cara"><w:r>{modern_text_box(content)}</w:r></w:ins></w:p>'
+        prose, meta = self.export_text_box(body)
+        self.assertEqual(prose, "[Text box]\n\nInserted words.\n\n[/Text box]\n")
+        review = [(item["kind"], item["author"], item["text"]) for item in meta["review"]]
+        self.assertEqual(review, [
+            ("ins", "Cara", "Inserted words.Deleted words."),
+            ("ins", "Ada", "Inserted words."),
+            ("del", "Ben", "Deleted words."),
+        ])
+
+    def test_text_boxes_in_cells_headers_and_nested_boxes(self) -> None:
+        inner = modern_text_box(paragraph("Inner box."))
+        outer = modern_text_box(paragraph("Outer box.") + anchored("Outer anchor.", inner))
+        body = '<w:tbl><w:tr><w:tc>' + anchored("Cell anchor.", modern_text_box(paragraph("Cell box."))) + '</w:tc></w:tr></w:tbl>'
+        body += anchored("Body anchor.", outer) + anchored("Two boxes.", modern_text_box(paragraph("First.")) + vml_text_box(paragraph("Second.")))
+        body += '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>'
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Header anchor.", vml_text_box(paragraph("Header box.")))}</w:hdr>'
+        prose, meta = self.export_text_box(
+            body, extra={"word/header1.xml": header},
+            relationships=f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>',
+        )
+        self.assertIn("[Cell]\n\nCell anchor.\n\n[Text box]\n\nCell box.\n\n[/Text box]\n\n[/Row]", prose)
+        self.assertIn(
+            "Body anchor.\n\n[Text box]\n\nOuter box.\n\nOuter anchor.\n\n[Text box]\n\nInner box.\n\n[/Text box]\n\n[/Text box]",
+            prose,
+        )
+        self.assertIn("Two boxes.\n\n[Text box]\n\nFirst.\n\n[/Text box]\n\n[Text box]\n\nSecond.\n\n[/Text box]", prose)
+        self.assertIn("## Header (word/header1.xml)\n\nHeader anchor.\n\n[Text box]\n\nHeader box.\n\n[/Text box]", prose)
+        for text in ("Cell box.", "Outer box.", "Inner box.", "First.", "Second.", "Header box."):
+            self.assertEqual(prose.count(text), 1, text)
+        self.assertEqual(prose.count("[Text box]"), prose.count("[/Text box]"))
+        self.assertNotIn("Unsupported", prose)
+        self.assert_only_text_box_warning(meta, "Headers and footers are shown by part; page/section placement is not reconstructed.")
+
+    def test_shapes_without_text_keep_placeholders(self) -> None:
+        picture = f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}"><pic:pic xmlns:pic="{PIC}"/></a:graphicData></a:graphic></wp:inline></w:drawing>'
+        prose, meta = self.export_text_box(anchored("Picture anchor.", picture))
+        self.assertEqual(prose, "Picture anchor.[Unsupported drawing]\n")
+        self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        self.assertNotIn(TEXT_BOX_NOTE, meta["warnings"])
+        # A picture grouped with a text box is still reported; the text box text is shown.
+        prose, meta = self.export_text_box(anchored("Group anchor.", modern_text_box(paragraph("Grouped box."), picture=True)))
+        self.assertEqual(prose, "Group anchor.[Unsupported drawing]\n\n[Text box]\n\nGrouped box.\n\n[/Text box]\n")
+        self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        self.assertIn(TEXT_BOX_NOTE, meta["warnings"])
+
+    def test_block_level_alternate_content_is_rendered_once(self) -> None:
+        choice = anchored("Choice anchor.", drawing_text_box(paragraph("Choice box.")))
+        fallback = anchored("Fallback anchor.", vml_text_box(paragraph("Fallback box.")))
+        body = paragraph("Before.") + f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>'
+        prose, meta = self.export_text_box(body)
+        self.assertEqual(prose, "Before.\n\nChoice anchor.\n\n[Text box]\n\nChoice box.\n\n[/Text box]\n")
+        self.assert_only_text_box_warning(meta)
+
+    def test_grouped_picture_in_a_compatibility_wrapper_keeps_its_placeholder(self) -> None:
+        picture = f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="pic"><pic:pic xmlns:pic="{PIC}"/></mc:Choice><mc:Fallback/></mc:AlternateContent>'
+        shape = drawing_text_box(paragraph("Grouped box.")).replace("</wps:wsp>", "</wps:wsp>" + picture)
+        prose, meta = self.export_text_box(anchored("Group anchor.", shape))
+        self.assertEqual(prose, "Group anchor.[Unsupported drawing]\n\n[Text box]\n\nGrouped box.\n\n[/Text box]\n")
+        self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
+    def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
+        content = paragraph("Innermost.")
+        for _ in range(400):
+            # The Fallback copy is left empty: duplicating each level would double the fixture.
+            content = anchored("", modern_text_box(content, fallback=""))
+        make_docx(self.root / "essay.docx", content)
+        result = self.cli("export", "essay.docx", code=2)
+        self.assertIn("error: essay.docx:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.companions()[0].exists())
 
     def test_setup_and_export_leave_git_index_and_history_untouched(self) -> None:
         self.init_git()
