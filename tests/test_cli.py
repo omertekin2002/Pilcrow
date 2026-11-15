@@ -528,13 +528,15 @@ class CLITests(unittest.TestCase):
         body = (
             list_item("Second list first.", "7", ilvl=2)
             + paragraph("Styled item.", '<w:pPr><w:pStyle w:val="ListBullet"/></w:pPr>')
+            # Own numPr with only ilvl: numId comes from the style.
+            + paragraph("Styled sub-item.", '<w:pPr><w:pStyle w:val="ListBullet"/><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr>')
             + list_item("Back to the first.", "7")
             + paragraph("", '<w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr>')  # empty: not rendered
             + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>'
         )
         self.write_lists(body, numbering(
             abstract_num("0", level(0, "decimal", "%1."), level(2, "lowerRoman", "%3.")),
-            abstract_num("1", level(0)),
+            abstract_num("1", level(0), level(1, "bullet", "o")),
             num("3", "1"), num("5", "1"), num("7", "0"), num("9", "1"),
         ), extra=extra, relationships=relationships)
         self.cli("export", "essay.docx")
@@ -543,15 +545,17 @@ class CLITests(unittest.TestCase):
                 {"level": 0, "format": "decimal", "text": "%1.", "start": 1},
                 {"level": 2, "format": "lowerRoman", "text": "%3.", "start": 1},
             ]},
-            {"list": 2, "part": "word/document.xml",
-             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+            {"list": 2, "part": "word/document.xml", "levels": [
+                {"level": 0, "format": "bullet", "text": "•", "start": 1},
+                {"level": 1, "format": "bullet", "text": "o", "start": 1},
+            ]},
             {"list": 3, "part": "word/header1.xml",
              "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
         ])
         self.assertNotIn("word/numbering.xml", self.exported()[1].decode("utf-8"))
         self.assertEqual(json.loads(self.exported()[1])["list_runs"], [
             {"list": 1, "part": "word/document.xml", "items": 1},
-            {"list": 2, "part": "word/document.xml", "items": 1},
+            {"list": 2, "part": "word/document.xml", "items": 2},
             {"list": 1, "part": "word/document.xml", "items": 1},
             {"list": 1, "part": "word/header1.xml", "items": 1},
             {"list": 3, "part": "word/header1.xml", "items": 1},
@@ -593,6 +597,63 @@ class CLITests(unittest.TestCase):
                 write("1", "2", "1", "2")
                 self.cli("export", "essay.docx")
                 self.assertEqual(self.exported(), before)
+
+    def test_custom_formats_notes_cells_and_odd_values(self) -> None:
+        def custom(pattern: str) -> str:
+            return (
+                f'<w:lvl w:ilvl="0"><w:start w:val="1"/><mc:AlternateContent xmlns:mc="{MC}">'
+                f'<mc:Choice Requires="w14"><w:numFmt w:val="custom" w:format="{pattern}"/></mc:Choice>'
+                '<mc:Fallback><w:numFmt w:val="decimal"/></mc:Fallback></mc:AlternateContent>'
+                '<w:lvlText w:val="%1."/></w:lvl>'
+            )
+
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NoList"><w:name w:val="No List"/>'
+            '<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        extra = {
+            "word/styles.xml": styles,
+            "word/footnotes.xml": f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1">{list_item("Noted item.", "3")}</w:footnote></w:footnotes>',
+        }
+        relationships = (
+            f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+            f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>'
+        )
+        body = (
+            '<w:tbl><w:tr><w:tc>' + list_item("Cell item.", "1") + '</w:tc></w:tr></w:tbl>'
+            + paragraph("Unnumbered by style.", '<w:pPr><w:pStyle w:val="NoList"/><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>')
+            + list_item("Odd start.", "2")
+            + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+        )
+
+        def write(pattern: str) -> None:
+            self.write_lists(body, numbering(
+                abstract_num("0", custom(pattern)),
+                abstract_num("1", level(0, "decimal", "%1.", start="9" * 5000)),
+                abstract_num("2", level(0, "upperLetter", "%1.", start="two")),
+                num("1", "0"), num("2", "1"), num("3", "2"),
+            ), extra=extra, relationships=relationships)
+
+        write("001, 002, 003, ...")
+        result = self.cli("export", "essay.docx")
+        self.assertNotIn(UNKNOWN_LIST_NOTE, result.stderr)
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "custom: 001, 002, 003, ...", "text": "%1.", "start": 1}]},
+            {"list": 2, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "decimal", "text": "%1.", "start": 0}]},
+            {"list": 3, "part": "word/footnotes.xml",
+             "levels": [{"level": 0, "format": "upperLetter", "text": "%1.", "start": 0}]},
+        ])
+        write("01, 02, 03, ...")
+        self.cli("check", "essay.docx", code=1)
+
+    def test_numbering_part_without_a_relationship_is_unrendered(self) -> None:
+        make_docx(self.root / "essay.docx", list_item("Item.", "1"),
+                  extra={"word/numbering.xml": numbering(abstract_num("0", level(0)), num("1", "0"))})
+        result = self.cli("export", "essay.docx")
+        self.assertIn("Unrendered package part: word/numbering.xml", result.stderr)
+        self.assertIn(UNKNOWN_LIST_NOTE, result.stderr)
 
     def test_unresolvable_lists_are_unknown_with_a_warning(self) -> None:
         unknown = {"level": 0, "format": "unknown", "text": "", "start": 0}

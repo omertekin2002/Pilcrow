@@ -76,7 +76,9 @@ class Reader:
         self.links: list[dict[str, str]] = []
         self.fields: list[dict[str, str]] = []
         self.styles: dict[str, Element] = {}
-        self.numbering: Element | None = None
+        # w:num by numId and w:abstractNum by abstractNumId; the first definition wins.
+        self.nums: dict[str, Element] = {}
+        self.abstract_nums: dict[str, Element] = {}
         # Raw numId -> list entry; insertion order is first use, so ordinals ignore raw IDs.
         self.lists: dict[str, dict[str, Any]] = {}
         # Which list each list item belongs to, run-length encoded in traversal order.
@@ -301,6 +303,8 @@ class Reader:
         if found is None:
             found = next((n for p in props if (n := p.find("w:numPr/w:numId", NS)) is not None), None)
         num_id = attr(found, "val") if found is not None else None
+        if num_id == "0":
+            return  # numbering switched off by a style; nothing to fingerprint
         key = num_id if num_id is not None else ""
         entry = self.lists.setdefault(key, {"list": len(self.lists) + 1, "part": self.part, "levels": {}})
         if level not in entry["levels"]:
@@ -314,13 +318,9 @@ class Reader:
     def list_level(self, num_id: str | None, level: int) -> dict[str, Any]:
         """Resolve w:num -> w:abstractNum -> w:lvl, applying w:lvlOverride."""
         unknown = {"level": level, "format": "unknown", "text": "", "start": 0}
-        numbering = self.numbering
-        num = None if numbering is None or num_id is None else next(
-            (n for n in numbering.findall("w:num", NS) if attr(n, "numId") == num_id), None)
+        num = self.nums.get(num_id) if num_id is not None else None
         abstract_id = num.find("w:abstractNumId", NS) if num is not None else None
-        abstract = None if numbering is None or abstract_id is None else next(
-            (a for a in numbering.findall("w:abstractNum", NS)
-             if attr(a, "abstractNumId") == attr(abstract_id, "val")), None)
+        abstract = None if abstract_id is None else self.abstract_nums.get(attr(abstract_id, "val"))
         if num is None or abstract is None or abstract.find("w:numStyleLink", NS) is not None:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
@@ -332,17 +332,24 @@ class Reader:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
         fmt = lvl.find("w:numFmt", NS)
+        alternate = lvl.find(f"{{{MC}}}AlternateContent")
+        if fmt is None and alternate is not None:
+            # Word stores custom formats such as "001, 002, ..." in mc:Choice, with a Fallback.
+            fmt = next((f for branch in alternate for f in branch.findall("w:numFmt", NS)), None)
+        # OOXML defaults an absent w:numFmt to decimal.
+        format_name = attr(fmt, "val", "decimal") if fmt is not None else "decimal"
+        if fmt is not None and attr(fmt, "format"):
+            format_name += ": " + attr(fmt, "format")
         text = lvl.find("w:lvlText", NS)
         start = lvl.find("w:start", NS)
         start_override = override.find("w:startOverride", NS) if override is not None else None
         if start_override is not None:
             start = start_override
         start_value = attr(start, "val") if start is not None else ""
-        return {"level": level,
-                # OOXML defaults an absent w:numFmt to decimal.
-                "format": attr(fmt, "val", "decimal") if fmt is not None else "decimal",
+        return {"level": level, "format": format_name,
                 "text": attr(text, "val") if text is not None else "",
-                "start": int(start_value) if re.fullmatch(r"-?[0-9]+", start_value) else 0}
+                # Bounded so a huge value cannot exceed int()'s digit limit.
+                "start": int(start_value) if re.fullmatch(r"-?[0-9]{1,10}", start_value) else 0}
 
     def blocks(self, node: Element) -> str:
         parts = []
@@ -467,7 +474,11 @@ class Reader:
             elif kind == "numbering" and not external:
                 if target not in self.names:
                     raise DocumentError(f"missing related part {target}")
-                self.numbering = self.xml(target)
+                numbering = self.xml(target)
+                for node in numbering.findall("w:num", NS):
+                    self.nums.setdefault(attr(node, "numId"), node)
+                for node in numbering.findall("w:abstractNum", NS):
+                    self.abstract_nums.setdefault(attr(node, "abstractNumId"), node)
                 supported.add(target)
         prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.

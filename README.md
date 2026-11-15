@@ -247,7 +247,8 @@ See [coverage, normalization, and backlog](docs/limitations.md). The prose retai
 common headings, list indentation, tables, notes, headers, and footers. Tracked
 insertions/move destinations are included and deletions/move sources omitted.
 List bullet/number formats are recorded in metadata, so changing them makes
-companions stale; the counters themselves are not shown in prose.
+companions stale; the counters themselves are not shown in prose, and numbered
+headings are not compared.
 Complex tracked structure/layout is limited and reported. Text box text is shown
 between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
 box's position, wrapping, and shape formatting are not compared. Images, charts,
@@ -258,9 +259,11 @@ Upgrading from a version that left text box text out: documents with text boxes
 report stale companions once, because their prose now includes that text. Run
 `pilcrow export` and commit the refreshed companions.
 
-Upgrading from a version that did not record list formats: documents with lists
-report stale companions once, because `.meta.json` now records each list's
-bullet/number format. Run `pilcrow export` and commit the refreshed companions.
+Upgrading from a version that did not record list formats: every document reports
+stale companions once, because `.meta.json` now always has `lists` and
+`list_runs` keys (empty for documents without lists). Run `pilcrow export` and
+commit the refreshed companions. A document whose numbering relationship points to
+a missing part is now an error, like a missing styles part.
 
 Run the generated-fixture suite:
 

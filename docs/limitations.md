@@ -11,8 +11,8 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Content | v1 behavior |
 | --- | --- |
 | Paragraphs | Runs joined without artificial spaces; blank line between nonempty paragraphs |
-| Headings | Outline level, inherited paragraph styles, and conventional Heading1–9 style IDs; capped at six Markdown levels |
-| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, together with which list each item belongs to, so bullet/number/start changes and moves between lists make companions stale; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning |
+| Headings | Outline level, inherited paragraph styles, and conventional Heading1–9 style IDs; capped at six Markdown levels; heading numbering (e.g. `Chapter 1`) is neither rendered nor recorded in list metadata |
+| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, together with which list each item belongs to, so bullet/number/start changes and moves between lists make companions stale; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning; custom formats such as `001, 002, …` record their pattern; bullet fonts, legal numbering, suffixes, and level restarts are not recorded |
 | Tables | Explicit table, row, and cell markers, including empty cells; nested tables and content-control wrappers; grid spans/vertical merge markers retained, no rendered grid/layout |
 | Footnotes/endnotes | Related parts with reference markers; separator notes omitted; IDs retained, so renumbering can produce diffs |
 | Headers/footers | Related parts shown as separate sections by part name; no page/section placement mapping |
@@ -35,7 +35,7 @@ Hidden text is included and triggers a visibility warning; formatting is not use
 to decide what Word would display. Unknown Word/XML constructs trigger conservative warnings. Extra package parts
 are listed as unrendered; their bytes are not hashed. Some save-only parts
 (`docProps`, settings, font tables, theme) are deliberately ignored. Numbering
-definitions are read only for the list levels the document uses, so edits to
+definitions are read only for the list levels that list items (not headings) use, so edits to
 unused definitions and renumbered list IDs do not change companions. Counter
 values (which number an item shows) and list layout can still change without a
 companion update.
