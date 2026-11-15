@@ -96,6 +96,38 @@ def anchored(text: str, shape: str) -> str:
     return f'<w:p><w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r><w:r>{shape}</w:r></w:p>'
 
 
+NUMBERING_REL = f'<Relationship Id="numbering" Type="{R}/numbering" Target="numbering.xml"/>'
+LIST_NOTE = (
+    "List boundaries and indentation are retained; bullet and number formats are recorded in "
+    "metadata, but counter values and bullet glyphs are not reconstructed."
+)
+UNKNOWN_LIST_NOTE = (
+    "Some list numbering formats could not be resolved (no numbering part, an unknown "
+    "list or level, or style-linked numbering); they are recorded as unknown."
+)
+
+
+def list_item(text: str, num_id: str, ilvl: int = 0) -> str:
+    return paragraph(text, f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
+
+
+def level(ilvl: int = 0, fmt: str = "bullet", text: str = "•", start: str | None = "1") -> str:
+    start_xml = f'<w:start w:val="{start}"/>' if start is not None else ""
+    return f'<w:lvl w:ilvl="{ilvl}">{start_xml}<w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/></w:lvl>'
+
+
+def abstract_num(abstract_id: str, *levels: str) -> str:
+    return f'<w:abstractNum w:abstractNumId="{abstract_id}">{"".join(levels)}</w:abstractNum>'
+
+
+def num(num_id: str, abstract_id: str, overrides: str = "") -> str:
+    return f'<w:num w:numId="{num_id}"><w:abstractNumId w:val="{abstract_id}"/>{overrides}</w:num>'
+
+
+def numbering(*definitions: str) -> str:
+    return f'<w:numbering xmlns:w="{W}">{"".join(definitions)}</w:numbering>'
+
+
 def make_docx(
     path: Path,
     body: str,
@@ -405,6 +437,160 @@ class CLITests(unittest.TestCase):
         self.assertIn("Right cell", prose)
         self.assertLess(prose.index("A section"), prose.index("A list item"))
         self.assertLess(prose.index("Left cell"), prose.index("Right cell"))
+
+    def write_lists(self, body: str, numbering_xml: str | None, *, extra: dict[str, str] | None = None,
+                    relationships: str = "") -> None:
+        parts = dict(extra or {})
+        if numbering_xml is not None:
+            parts["word/numbering.xml"] = numbering_xml
+            relationships += NUMBERING_REL
+        make_docx(self.root / "essay.docx", body, extra=parts, relationships=relationships)
+
+    def exported_lists(self) -> list[dict[str, Any]]:
+        lists: list[dict[str, Any]] = json.loads(self.exported()[1])["lists"]
+        return lists
+
+    def test_list_format_changes_are_stale_in_metadata_only(self) -> None:
+        body = paragraph("Intro.") + list_item("First item.", "1") + list_item("Second item.", "1")
+
+        def write(definition: str, overrides: str = "") -> None:
+            self.write_lists(body, numbering(abstract_num("0", definition), num("1", "0", overrides)))
+
+        write(level(fmt="bullet", text="•"))
+        result = self.cli("export", "essay.docx")
+        self.assertIn(LIST_NOTE, result.stderr)
+        before = self.exported()
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+        ])
+        self.assertIn(LIST_NOTE, json.loads(before[1])["warnings"])
+        variants = [
+            (level(fmt="decimal", text="%1."), "", {"format": "decimal", "text": "%1.", "start": 1}),
+            (level(fmt="decimal", text="%1)"), "", {"format": "decimal", "text": "%1)", "start": 1}),
+            (level(fmt="decimal", text="%1)", start="5"), "", {"format": "decimal", "text": "%1)", "start": 5}),
+            (level(fmt="decimal", text="%1)", start="5"),
+             '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="3"/></w:lvlOverride>',
+             {"format": "decimal", "text": "%1)", "start": 3}),
+            (level(fmt="decimal", text="%1)", start="5"),
+             f'<w:lvlOverride w:ilvl="0">{level(fmt="lowerLetter", text="%1)", start="2")}</w:lvlOverride>',
+             {"format": "lowerLetter", "text": "%1)", "start": 2}),
+            (level(fmt="decimal", text="%1)", start=None), "", {"format": "decimal", "text": "%1)", "start": 0}),
+        ]
+        previous = before
+        for definition, overrides, expected in variants:
+            with self.subTest(expected=expected):
+                write(definition, overrides)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0], "list format changes must not alter the prose")
+                self.assertNotEqual(after[1], previous[1])
+                self.assertEqual(self.exported_lists()[0]["levels"], [{"level": 0, **expected}])
+                self.cli("check", "essay.docx")
+                previous = after
+
+    def test_renumbered_ids_and_unused_definitions_do_not_churn(self) -> None:
+        body = list_item("Bullet.", "1") + list_item("Nested.", "1", ilvl=1) + list_item("Numbered.", "2")
+        self.write_lists(body, numbering(
+            abstract_num("0", level(0), level(1, "bullet", "o")),
+            abstract_num("1", level(0, "decimal", "%1.")),
+            num("1", "0"), num("2", "1"),
+        ))
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual([entry["list"] for entry in self.exported_lists()], [1, 2])
+        renumbered = list_item("Bullet.", "12") + list_item("Nested.", "12", ilvl=1) + list_item("Numbered.", "4")
+        # New IDs, reordered definitions, an unused list, and a changed level no item uses.
+        self.write_lists(renumbered, numbering(
+            abstract_num("9", level(0, "decimal", "%1.")),
+            abstract_num("7", level(0), level(1, "bullet", "o"), level(2, "upperRoman", "%3:", "8")),
+            abstract_num("3", level(0, "lowerLetter", "%1)")),
+            num("4", "9"), num("5", "3"), num("12", "7"),
+        ))
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before)
+
+    def test_list_ordinals_follow_first_use_across_parts(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="ListBullet"><w:name w:val="List Bullet"/>'
+            '<w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        extra = {
+            "word/styles.xml": styles,
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}">{list_item("Header item.", "7")}{list_item("Header only.", "5")}</w:hdr>',
+        }
+        relationships = (
+            f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+            f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+        )
+        body = (
+            list_item("Second list first.", "7", ilvl=2)
+            + paragraph("Styled item.", '<w:pPr><w:pStyle w:val="ListBullet"/></w:pPr>')
+            + list_item("Back to the first.", "7")
+            + paragraph("", '<w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr>')  # empty: not rendered
+            + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>'
+        )
+        self.write_lists(body, numbering(
+            abstract_num("0", level(0, "decimal", "%1."), level(2, "lowerRoman", "%3.")),
+            abstract_num("1", level(0)),
+            num("3", "1"), num("5", "1"), num("7", "0"), num("9", "1"),
+        ), extra=extra, relationships=relationships)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml", "levels": [
+                {"level": 0, "format": "decimal", "text": "%1.", "start": 1},
+                {"level": 2, "format": "lowerRoman", "text": "%3.", "start": 1},
+            ]},
+            {"list": 2, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+            {"list": 3, "part": "word/header1.xml",
+             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+        ])
+        self.assertNotIn("word/numbering.xml", self.exported()[1].decode("utf-8"))
+
+    def test_list_in_a_text_box_counts_after_its_anchoring_item(self) -> None:
+        outer = list_item("Anchor item.", "4").replace("</w:r></w:p>", f"</w:r><w:r>{modern_text_box(list_item('Boxed item.', '2'))}</w:r></w:p>")
+        self.write_lists(outer, numbering(abstract_num("0", level(0)), abstract_num("1", level(0, "decimal", "%1.")),
+                                          num("2", "1"), num("4", "0")))
+        self.cli("export", "essay.docx")
+        prose = self.exported()[0].decode("utf-8")
+        self.assertLess(prose.index("Anchor item."), prose.index("Boxed item."))
+        self.assertEqual([entry["levels"][0]["format"] for entry in self.exported_lists()], ["bullet", "decimal"])
+
+    def test_unresolvable_lists_are_unknown_with_a_warning(self) -> None:
+        unknown = {"level": 0, "format": "unknown", "text": "", "start": 0}
+        cases = {
+            "no numbering part": (list_item("Item.", "1"), None),
+            "unknown numId": (list_item("Item.", "8"), numbering(abstract_num("0", level(0)), num("1", "0"))),
+            "unknown abstractNum": (list_item("Item.", "1"), numbering(abstract_num("0", level(0)), num("1", "6"))),
+            "unknown level": (list_item("Item.", "1", ilvl=3), numbering(abstract_num("0", level(0)), num("1", "0"))),
+            "numStyleLink": (list_item("Item.", "1"), numbering(
+                '<w:abstractNum w:abstractNumId="0"><w:numStyleLink w:val="Bullets"/></w:abstractNum>', num("1", "0"))),
+        }
+        for name, (body, numbering_xml) in cases.items():
+            with self.subTest(name):
+                self.write_lists(body, numbering_xml)
+                result = self.cli("export", "essay.docx")
+                self.assertIn(UNKNOWN_LIST_NOTE, result.stderr)
+                level_no = 3 if name == "unknown level" else 0
+                self.assertEqual(self.exported_lists(), [
+                    {"list": 1, "part": "word/document.xml", "levels": [{**unknown, "level": level_no}]},
+                ])
+        self.write_lists(list_item("Item.", "1"), None, relationships=NUMBERING_REL)
+        self.cli("export", "essay.docx", code=2)
+
+    def test_documents_without_lists_record_an_empty_array(self) -> None:
+        self.write_lists(paragraph("Plain prose."), None)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [])
+        removed = paragraph("No longer a list.", '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr>')
+        self.write_lists(removed, numbering(abstract_num("0", level(0)), num("1", "0")))
+        result = self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [])
+        self.assertNotIn(LIST_NOTE, result.stderr)
+        self.assertNotIn("numbering.xml", result.stderr)
 
     def test_notes_headers_and_footers_are_exported(self) -> None:
         extra = {

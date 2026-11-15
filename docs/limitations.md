@@ -12,7 +12,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | --- | --- |
 | Paragraphs | Runs joined without artificial spaces; blank line between nonempty paragraphs |
 | Headings | Outline level, inherited paragraph styles, and conventional Heading1–9 style IDs; capped at six Markdown levels |
-| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker; automatic numbers/bullet glyphs are not reconstructed and trigger a warning |
+| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, so bullet/number/start changes make companions stale; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning |
 | Tables | Explicit table, row, and cell markers, including empty cells; nested tables and content-control wrappers; grid spans/vertical merge markers retained, no rendered grid/layout |
 | Footnotes/endnotes | Related parts with reference markers; separator notes omitted; IDs retained, so renumbering can produce diffs |
 | Headers/footers | Related parts shown as separate sections by part name; no page/section placement mapping |
@@ -34,15 +34,21 @@ hyperlinks/fields inside comments are not separately interpreted.
 Hidden text is included and triggers a visibility warning; formatting is not used
 to decide what Word would display. Unknown Word/XML constructs trigger conservative warnings. Extra package parts
 are listed as unrendered; their bytes are not hashed. Some save-only parts
-(`docProps`, settings, font tables, theme, numbering definitions) are deliberately
-ignored. List values and layout can therefore change without a companion update.
+(`docProps`, settings, font tables, theme) are deliberately ignored. Numbering
+definitions are read only for the list levels the document uses, so edits to
+unused definitions and renumbered list IDs do not change companions. Counter
+values (which number an item shows) and list layout can still change without a
+companion update.
 Unsupported assets can change while warning text remains identical. The `partial-prose`
 coverage marker and CLI wording apply even when there are no specific warnings.
 No claim of a complete/unchanged document is made. This is a modest coverage report,
 not an audit of every OOXML relationship or layout semantic.
 
 Metadata contains only schema/view/coverage, warnings, review text/authors, link
-destinations, and field fingerprints. Field fingerprints avoid huge Zotero JSON
+destinations, field fingerprints, and list formats. `lists` has one entry per
+list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
+Word's `numId`, which can change on save), with the part where it is first used
+and the format, level text, and start value of each level its items use. Field fingerprints avoid huge Zotero JSON
 payloads but only say a normalized code changed, not what that change means.
 Arrays follow document traversal order; related parts and warnings sort
 lexically. Internal part paths come from the package; no machine paths, save
@@ -100,7 +106,7 @@ reports any existing companions as orphans. Empty discovery can succeed with
    save-without-editing and Zotero documents, before claiming GUI compatibility.
 2. Tune sentence segmentation against collaborators' languages and abbreviation
    conventions; keep fixtures for every regression.
-3. Decide whether list values, comment anchors, field-code previews, or image hashes
+3. Decide whether reconstructed list counters, comment anchors, field-code previews, or image hashes
    justify more metadata. Avoid a dump of all OOXML.
 4. Improve tracked structural revisions, note-reference validation, complex tables,
    and relationship/path canonicalization only as actual documents require it.
