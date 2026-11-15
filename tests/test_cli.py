@@ -549,6 +549,13 @@ class CLITests(unittest.TestCase):
              "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
         ])
         self.assertNotIn("word/numbering.xml", self.exported()[1].decode("utf-8"))
+        self.assertEqual(json.loads(self.exported()[1])["list_runs"], [
+            {"list": 1, "part": "word/document.xml", "items": 1},
+            {"list": 2, "part": "word/document.xml", "items": 1},
+            {"list": 1, "part": "word/document.xml", "items": 1},
+            {"list": 1, "part": "word/header1.xml", "items": 1},
+            {"list": 3, "part": "word/header1.xml", "items": 1},
+        ])
 
     def test_list_in_a_text_box_counts_after_its_anchoring_item(self) -> None:
         outer = list_item("Anchor item.", "4").replace("</w:r></w:p>", f"</w:r><w:r>{modern_text_box(list_item('Boxed item.', '2'))}</w:r></w:p>")
@@ -558,6 +565,34 @@ class CLITests(unittest.TestCase):
         prose = self.exported()[0].decode("utf-8")
         self.assertLess(prose.index("Anchor item."), prose.index("Boxed item."))
         self.assertEqual([entry["levels"][0]["format"] for entry in self.exported_lists()], ["bullet", "decimal"])
+
+    def test_moving_an_item_between_existing_lists_is_stale(self) -> None:
+        definitions = numbering(abstract_num("0", level(0)), abstract_num("1", level(0, "decimal", "%1.")),
+                                num("1", "0"), num("2", "1"))
+
+        def write(*ids: str) -> None:
+            texts = ("Alpha.", "Beta.", "Gamma.", "Delta.")
+            body = paragraph("Intro.") + "".join(list_item(text, num_id) for text, num_id in zip(texts, ids, strict=True))
+            self.write_lists(body, definitions)
+
+        write("1", "2", "1", "2")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(json.loads(before[1])["list_runs"], [
+            {"list": 1, "part": "word/document.xml", "items": 1},
+            {"list": 2, "part": "word/document.xml", "items": 1},
+            {"list": 1, "part": "word/document.xml", "items": 1},
+            {"list": 2, "part": "word/document.xml", "items": 1},
+        ])
+        for ids in (("1", "2", "2", "2"), ("1", "2", "2", "1")):
+            with self.subTest(ids=ids):
+                write(*ids)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported()[0], before[0])
+                write("1", "2", "1", "2")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
 
     def test_unresolvable_lists_are_unknown_with_a_warning(self) -> None:
         unknown = {"level": 0, "format": "unknown", "text": "", "start": 0}
@@ -585,6 +620,7 @@ class CLITests(unittest.TestCase):
         self.write_lists(paragraph("Plain prose."), None)
         self.cli("export", "essay.docx")
         self.assertEqual(self.exported_lists(), [])
+        self.assertEqual(json.loads(self.exported()[1])["list_runs"], [])
         removed = paragraph("No longer a list.", '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr>')
         self.write_lists(removed, numbering(abstract_num("0", level(0)), num("1", "0")))
         result = self.cli("export", "essay.docx")

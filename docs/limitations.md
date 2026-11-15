@@ -12,7 +12,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | --- | --- |
 | Paragraphs | Runs joined without artificial spaces; blank line between nonempty paragraphs |
 | Headings | Outline level, inherited paragraph styles, and conventional Heading1–9 style IDs; capped at six Markdown levels |
-| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, so bullet/number/start changes make companions stale; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning |
+| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, together with which list each item belongs to, so bullet/number/start changes and moves between lists make companions stale; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning |
 | Tables | Explicit table, row, and cell markers, including empty cells; nested tables and content-control wrappers; grid spans/vertical merge markers retained, no rendered grid/layout |
 | Footnotes/endnotes | Related parts with reference markers; separator notes omitted; IDs retained, so renumbering can produce diffs |
 | Headers/footers | Related parts shown as separate sections by part name; no page/section placement mapping |
@@ -48,7 +48,11 @@ Metadata contains only schema/view/coverage, warnings, review text/authors, link
 destinations, field fingerprints, and list formats. `lists` has one entry per
 list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
 Word's `numId`, which can change on save), with the part where it is first used
-and the format, level text, and start value of each level its items use. Field fingerprints avoid huge Zotero JSON
+and the format, level text, and start value of each level its items use.
+`list_runs` records which list each list item belongs to, as runs of consecutive
+list items (other paragraphs in between are skipped) of the same list in the same
+part, so moving an item between lists is a metadata change; inserting an item
+changes only one count. Field fingerprints avoid huge Zotero JSON
 payloads but only say a normalized code changed, not what that change means.
 Arrays follow document traversal order; related parts and warnings sort
 lexically. Internal part paths come from the package; no machine paths, save

@@ -79,6 +79,8 @@ class Reader:
         self.numbering: Element | None = None
         # Raw numId -> list entry; insertion order is first use, so ordinals ignore raw IDs.
         self.lists: dict[str, dict[str, Any]] = {}
+        # Which list each list item belongs to, run-length encoded in traversal order.
+        self.list_runs: list[dict[str, Any]] = []
         self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
@@ -303,6 +305,11 @@ class Reader:
         entry = self.lists.setdefault(key, {"list": len(self.lists) + 1, "part": self.part, "levels": {}})
         if level not in entry["levels"]:
             entry["levels"][level] = self.list_level(num_id, level)
+        last = self.list_runs[-1] if self.list_runs else None
+        if last is not None and last["list"] == entry["list"] and last["part"] == self.part:
+            last["items"] += 1
+        else:
+            self.list_runs.append({"list": entry["list"], "part": self.part, "items": 1})
 
     def list_level(self, num_id: str | None, level: int) -> dict[str, Any]:
         """Resolve w:num -> w:abstractNum -> w:lvl, applying w:lvlOverride."""
@@ -500,7 +507,8 @@ class Reader:
                     "coverage": "partial-prose", "warnings": sorted(self.warnings),
                     "review": self.review, "hyperlinks": self.links, "fields": self.fields,
                     "lists": [{**entry, "levels": [entry["levels"][k] for k in sorted(entry["levels"])]}
-                              for entry in self.lists.values()]}
+                              for entry in self.lists.values()],
+                    "list_runs": self.list_runs}
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 
