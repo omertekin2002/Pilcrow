@@ -111,9 +111,11 @@ def list_item(text: str, num_id: str, ilvl: int = 0) -> str:
     return paragraph(text, f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
 
 
-def level(ilvl: int = 0, fmt: str = "bullet", text: str = "•", start: str | None = "1") -> str:
+def level(ilvl: int = 0, fmt: str = "bullet", text: str = "•", start: str | None = "1", *,
+          style: str | None = None) -> str:
     start_xml = f'<w:start w:val="{start}"/>' if start is not None else ""
-    return f'<w:lvl w:ilvl="{ilvl}">{start_xml}<w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/></w:lvl>'
+    style_xml = f'<w:pStyle w:val="{style}"/>' if style is not None else ""
+    return f'<w:lvl w:ilvl="{ilvl}">{start_xml}<w:numFmt w:val="{fmt}"/>{style_xml}<w:lvlText w:val="{text}"/></w:lvl>'
 
 
 def abstract_num(abstract_id: str, *levels: str) -> str:
@@ -520,6 +522,66 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(self.exported_lists()[0]["levels"], [{"level": 0, **expected}])
                 self.cli("check", "essay.docx")
                 previous = after
+
+    def test_style_associated_list_formats_make_metadata_stale(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="BaseList">'
+            '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+            '<w:style w:type="paragraph" w:styleId="NestedList"><w:basedOn w:val="BaseList"/></w:style>'
+            '<w:style w:type="paragraph" w:styleId="DerivedList"><w:basedOn w:val="NestedList"/></w:style>'
+            '</w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        for style in ("NestedList", "DerivedList"):
+            for direct in ("", '<w:numPr><w:numId w:val="1"/></w:numPr>'):
+                with self.subTest(style=style, direct=direct):
+                    body = paragraph("Styled item.", f'<w:pPr><w:pStyle w:val="{style}"/>{direct}</w:pPr>')
+
+                    def write(fmt: str, body: str = body) -> None:
+                        # BaseList and NestedList both match ancestors; the nearer style selects level 1.
+                        self.write_lists(body, numbering(abstract_num("0", level(0, style="BaseList"),
+                                                                   level(1, fmt, style="NestedList")),
+                                                         num("1", "0")),
+                                         extra={"word/styles.xml": styles}, relationships=relationships)
+
+                    write("bullet")
+                    self.cli("export", "essay.docx")
+                    before = self.exported()
+                    self.assertEqual(before[0], b"  - Styled item.\n")
+                    self.assertEqual(self.exported_lists()[0]["levels"], [
+                        {"level": 1, "format": "bullet", "text": "•", "start": 1},
+                    ])
+                    write("decimal")
+                    self.cli("check", "essay.docx", code=1)
+                    self.cli("export", "essay.docx")
+                    after = self.exported()
+                    self.assertEqual(after[0], before[0])
+                    self.assertNotEqual(after[1], before[1])
+                    self.assertEqual(self.exported_lists()[0]["levels"][0]["format"], "decimal")
+
+    def test_direct_list_level_overrides_style_association(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = paragraph("Explicit item.", '<w:pPr><w:pStyle w:val="NestedList"/>'
+                         '<w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>')
+
+        def write(fmt: str) -> None:
+            self.write_lists(body, numbering(abstract_num("0", level(0), level(1, fmt, style="NestedList")),
+                                             num("1", "0")),
+                             extra={"word/styles.xml": styles}, relationships=relationships)
+
+        write("bullet")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(before[0], b"- Explicit item.\n")
+        self.assertEqual(self.exported_lists()[0]["levels"][0]["level"], 0)
+        write("decimal")
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before, "unused style-associated level must not churn metadata")
 
     def test_renumbered_ids_and_unused_definitions_do_not_churn(self) -> None:
         body = list_item("Bullet.", "1") + list_item("Nested.", "1", ilvl=1) + list_item("Numbered.", "2")

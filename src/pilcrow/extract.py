@@ -356,24 +356,49 @@ class Reader:
         num = next((p.find("w:numPr", NS) for p in props if p.find("w:numPr", NS) is not None), None)
         if level:
             return "#" * level + " " + normalize(text)
-        if num is not None:
-            num_id = num.find("w:numId", NS)
-            if num_id is None or attr(num_id, "val") != "0":
-                self.warn(LIST_NOTE)
-                ilvl = num.find("w:ilvl", NS)
-                depth = attr(ilvl, "val", "0") if ilvl is not None else "0"
-                self.record_list(props, num, int(depth) if depth.isdigit() else 0)
-                indent = "  " * min(20, int(depth)) if depth.isdigit() else ""
-                return indent + "- " + ("\n" + indent + "  ").join(lines)
+        if num is not None and self.list_id(props, num) != "0":
+            self.warn(LIST_NOTE)
+            depth = self.list_depth(node, props, num, style_id)
+            self.record_list(props, num, depth)
+            indent = "  " * min(20, depth)
+            return indent + "- " + ("\n" + indent + "  ").join(lines)
         return "\n".join(lines)
 
-    def record_list(self, props: list[Element], num: Element, level: int) -> None:
-        """Fingerprint the effective format of one used list level, keyed by first use."""
+    def list_id(self, props: list[Element], num: Element) -> str | None:
+        """The nearest numId, including one inherited by a partial direct numPr."""
         # A numPr may carry only ilvl and inherit numId from its style chain.
         found = num.find("w:numId", NS)
         if found is None:
             found = next((n for p in props if (n := p.find("w:numPr/w:numId", NS)) is not None), None)
-        num_id = attr(found, "val") if found is not None else None
+        return attr(found, "val") if found is not None else None
+
+    def list_depth(self, paragraph: Element, props: list[Element], num: Element, style_id: str) -> int:
+        """Resolve direct ilvl first, then the paragraph style's associated numbering level."""
+        ilvl = paragraph.find("w:pPr/w:numPr/w:ilvl", NS)
+        if ilvl is None:
+            num_id = self.list_id(props, num)
+            definition = self.nums.get(num_id) if num_id is not None else None
+            abstract_id = definition.find("w:abstractNumId", NS) if definition is not None else None
+            abstract = None if abstract_id is None else self.abstract_nums.get(attr(abstract_id, "val"))
+            seen = set()
+            # A derived paragraph style may inherit its numbering from a basedOn style.
+            # Match the nearest style first, independent of numbering-level XML order.
+            while abstract is not None and style_id in self.styles and style_id not in seen:
+                seen.add(style_id)
+                for lvl in abstract.findall("w:lvl", NS):
+                    associated = lvl.find("w:pStyle", NS)
+                    depth = attr(lvl, "ilvl")
+                    if associated is not None and attr(associated, "val") == style_id and depth.isdigit():
+                        return int(depth)
+                based = self.styles[style_id].find("w:basedOn", NS)
+                style_id = attr(based, "val") if based is not None else ""
+            ilvl = num.find("w:ilvl", NS)
+        depth = attr(ilvl, "val", "0") if ilvl is not None else "0"
+        return int(depth) if depth.isdigit() else 0
+
+    def record_list(self, props: list[Element], num: Element, level: int) -> None:
+        """Fingerprint the effective format of one used list level, keyed by first use."""
+        num_id = self.list_id(props, num)
         if num_id == "0":
             return  # numbering switched off by a style; nothing to fingerprint
         key = num_id if num_id is not None else ""
