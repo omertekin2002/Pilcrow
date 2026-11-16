@@ -23,15 +23,24 @@ you are allowed to share. Do not use the only copy of important work.
 6. Insert/delete text with Track Changes on, add a comment, then export. Prose
    should include inserted text and omit deleted text. Review text/authors should
    appear in metadata. Inspect complex tracked structures in Word directly.
-7. Make a bold-only change and change an image. Export. No prose update is required;
-   coverage warnings should still make the limitation clear. Inspect in Word.
-8. If using Zotero/fields, update citations/bibliography in Word before saving.
+7. Turn Track Changes off. Make a bold-only change, save, and run `check`: expect
+   exit 0, because formatting is not compared. Keep Track Changes off for the next
+   step. Word stores a tracked formatting change as a revision, which can add a
+   "Tracked formatting or structure changes" warning to metadata and make `check`
+   exit 1 whether or not the image change is detected. Then commit the DOCX and
+   companions in Desktop, so the next step's diff starts from here and not from
+   the commit in step 2.
+8. Replace an image, save, and run `check`: expect exit 1, for the image only.
+   Export and inspect the metadata diff against the commit from step 7. No prose
+   update is required; only the `images` entry should change, and coverage
+   warnings should still make the limitation clear. Inspect in Word.
+9. If using Zotero/fields, update citations/bibliography in Word before saving.
    Confirm saved display text appears in prose and code changes can affect the
    field fingerprints. Pilcrow does not refresh or verify the bibliography.
-9. Commit the edited DOCX and companions together. Select the companion in Desktop
-   History and inspect the committed difference. Confirm branch/index/history
-   remain under your control.
-10. In the disposable repository only, try two branches with changes to the same
+10. Commit the edited DOCX and companions together. Select the companion in Desktop
+    History and inspect the committed difference. Confirm branch/index/history
+    remain under your control.
+11. In the disposable repository only, try two branches with changes to the same
     document after committing `pilcrow setup` rules. Merge through your usual
     workflow. Choose/reconcile the DOCX, regenerate companions, check, and complete
     the merge. Never resolve Word content by editing only the companion.

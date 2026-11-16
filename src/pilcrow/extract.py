@@ -28,10 +28,23 @@ W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W}
+# Image references: DrawingML blips (r:embed internal, r:link external), the SVG copy
+# Word stores in a blip's extension list, and legacy VML image data.
+BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+SVG_BLIP = "{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip"
+IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
 # Shape content that a rendered text box still leaves out of the prose.
 UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
 TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
                  "position, anchoring, wrapping and shape formatting are not compared.")
+LIST_NOTE = ("List boundaries and indentation are retained; bullet and number formats are recorded in "
+             "metadata, but counter values and bullet glyphs are not reconstructed.")
+UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
+                     "list or level, or style-linked numbering); they are recorded as unknown.")
+IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
+                      "those images are recorded without a hash.")
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
@@ -42,6 +55,23 @@ def w(name: str) -> str:
 
 def attr(node: Element, name: str, default: str = "") -> str:
     return node.get(w(name), default)
+
+
+def decimal(value: str) -> int | None:
+    """Read an ST_DecimalNumber (xsd:integer): a sign and leading zeroes are valid.
+
+    At most ten significant digits, so a huge value cannot exceed int()'s digit limit.
+    """
+    match = re.fullmatch(r"([+-]?)0*([0-9]{1,10})", value.strip(" \t\r\n"))
+    if match is None:
+        return None
+    return -int(match[2]) if match[1] == "-" else int(match[2])
+
+
+def number_id(value: str) -> str:
+    """One spelling per numbering ID, so "1", "+1" and "01" name the same definition."""
+    number = decimal(value)
+    return value if number is None else str(number)
 
 
 class DocumentError(ValueError):
@@ -72,6 +102,18 @@ class Reader:
         self.links: list[dict[str, str]] = []
         self.fields: list[dict[str, str]] = []
         self.styles: dict[str, Element] = {}
+        # w:num by numId and w:abstractNum by abstractNumId; the first definition wins.
+        self.nums: dict[str, Element] = {}
+        self.abstract_nums: dict[str, Element] = {}
+        # Raw numId -> list entry; insertion order is first use, so ordinals ignore raw IDs.
+        self.lists: dict[str, dict[str, Any]] = {}
+        # Which list each list item belongs to, run-length encoded in traversal order.
+        self.list_runs: list[dict[str, Any]] = []
+        # Image references in traversal order, and hashed media part -> (sha256, size).
+        self.images: list[dict[str, Any]] = []
+        self.media: dict[str, tuple[str, int]] = {}
+        # Inside an unselected mc:AlternateContent copy whose prose is still read.
+        self.unselected = 0
         self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
@@ -149,12 +191,71 @@ class Reader:
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
                 or any(self.unrendered_shape_parts(child) for child in node))
 
+    def image_refs(self, node: Element) -> Iterator[list[str | None]]:
+        """Relationship IDs of each image in ``node``, in document order.
+
+        Text box content is skipped (it is read when the box renders), and only one
+        copy of an mc:AlternateContent is read: the text box branch, else the first
+        mc:Choice, else mc:Fallback.
+        """
+        if node.tag == w("txbxContent"):
+            return
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.image_branch(node)
+            if branch is not None:
+                yield from self.image_refs(branch)
+            return
+        if node.tag in {BLIP, SVG_BLIP}:
+            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")]
+        elif node.tag == IMAGEDATA:
+            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)]
+        for child in node:
+            yield from self.image_refs(child)
+
+    def image_branch(self, alternate: Element) -> Element | None:
+        """The one copy of an mc:AlternateContent whose images are recorded."""
+        branch = self.branch(alternate)
+        if branch is None:
+            branch = next((c for c in alternate if c.tag == f"{{{MC}}}Choice"), alternate.find(f"{{{MC}}}Fallback"))
+        return branch
+
+    def record_images(self, node: Element) -> None:
+        """Record each image in ``node`` by content hash (internal) or target (external)."""
+        if self.unselected:
+            return
+        for ids in self.image_refs(node):
+            entry: dict[str, Any] = {"part": self.part}
+            for rid in filter(None, ids):
+                rel = self.rels.get(rid)
+                if rel is not None and rel[2]:
+                    entry["target"] = rel[1]  # never fetched, like hyperlinks
+                elif rel is not None and rel[1] in self.names:
+                    if rel[1] not in self.media:
+                        try:
+                            data = self.package.read(rel[1])
+                        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
+                            raise DocumentError(f"cannot read {rel[1]}: {exc}") from exc
+                        self.media[rel[1]] = (hashlib.sha256(data).hexdigest(), len(data))
+                    entry["sha256"], entry["bytes"] = self.media[rel[1]]
+                else:
+                    self.warn(MISSING_IMAGE_NOTE)
+                    entry.setdefault("sha256", None)
+            if len(entry) == 1:  # no relationship ID at all
+                self.warn(MISSING_IMAGE_NOTE)
+                entry["sha256"] = None
+            self.images.append(entry)
+            self.warn(IMAGE_NOTE)
+
     def anchor(self, node: Element) -> tuple[str, list[str]]:
         """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
+        text, boxes = self.anchor_boxes(node)
+        return text, [self.text_box(box) for box in boxes]
+
+    def anchor_boxes(self, node: Element) -> tuple[str, list[Element]]:
+        """Read ``node`` inline and return the text boxes it anchors, not yet rendered."""
         self.anchored.append([])
         text = self.inline(node)
-        boxes = self.anchored.pop()
-        return text, [self.text_box(box) for box in boxes]
+        return text, self.anchored.pop()
 
     def text_box(self, box: Element) -> str:
         self.features["text boxes"] += 1
@@ -214,6 +315,8 @@ class Reader:
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
         if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
             return "".join(self.inline(child) for child in branch)
+        if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
+            self.record_images(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
             if not self.unrendered_shape_parts(node):
@@ -250,8 +353,10 @@ class Reader:
         return properties, attr(style, "val") if style is not None else ""
 
     def paragraph(self, node: Element) -> str:
-        text, boxes = self.anchor(node)
-        return "\n\n".join(part for part in (self.paragraph_text(node, text), *boxes) if part)
+        text, boxes = self.anchor_boxes(node)
+        # Render the paragraph before its boxes so list first use follows prose order.
+        own = self.paragraph_text(node, text)
+        return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
 
     def paragraph_text(self, node: Element, text: str) -> str:
         lines = sentences(text)
@@ -269,14 +374,119 @@ class Reader:
         if level:
             return "#" * level + " " + normalize(text)
         if num is not None:
+            # Prose keeps the rule it had before list metadata: the nearest numPr alone decides
+            # whether this is a list item and how far it is indented. The inherited numId and
+            # the style-associated level are resolved for the metadata only.
             num_id = num.find("w:numId", NS)
             if num_id is None or attr(num_id, "val") != "0":
-                self.warn("List boundaries and indentation are retained; automatic numbering and bullet glyphs are not reconstructed.")
+                self.warn(LIST_NOTE)
+                self.record_list(props, num, self.numbering_level(node, props, num, style_id))
                 ilvl = num.find("w:ilvl", NS)
                 depth = attr(ilvl, "val", "0") if ilvl is not None else "0"
                 indent = "  " * min(20, int(depth)) if depth.isdigit() else ""
                 return indent + "- " + ("\n" + indent + "  ").join(lines)
         return "\n".join(lines)
+
+    def list_id(self, props: list[Element], num: Element) -> str | None:
+        """The nearest numId, including one inherited by a partial direct numPr."""
+        # A numPr may carry only ilvl and inherit numId from its style chain.
+        found = num.find("w:numId", NS)
+        if found is None:
+            found = next((n for p in props if (n := p.find("w:numPr/w:numId", NS)) is not None), None)
+        return number_id(attr(found, "val")) if found is not None else None
+
+    def numbering_level(self, paragraph: Element, props: list[Element], num: Element, style_id: str) -> int:
+        """The level whose format is recorded: direct ilvl, else the level associated with the style."""
+        ilvl = paragraph.find("w:pPr/w:numPr/w:ilvl", NS)
+        if ilvl is None:
+            num_id = self.list_id(props, num)
+            definition = self.nums.get(num_id) if num_id is not None else None
+            abstract_id = definition.find("w:abstractNumId", NS) if definition is not None else None
+            abstract = None if abstract_id is None else self.abstract_nums.get(number_id(attr(abstract_id, "val")))
+            levels = {} if definition is None or abstract is None else self.effective_levels(definition, abstract)
+            seen = set()
+            # A derived paragraph style may inherit its numbering from a basedOn style.
+            # Match the nearest style first, independent of numbering-level XML order.
+            while levels and style_id in self.styles and style_id not in seen:
+                seen.add(style_id)
+                for number, lvl in levels.items():
+                    associated = lvl.find("w:pStyle", NS)
+                    if associated is not None and attr(associated, "val") == style_id:
+                        return number
+                based = self.styles[style_id].find("w:basedOn", NS)
+                style_id = attr(based, "val") if based is not None else ""
+            ilvl = num.find("w:ilvl", NS)
+        level = decimal(attr(ilvl, "val")) if ilvl is not None else None
+        return level if level is not None and level >= 0 else 0
+
+    def effective_levels(self, num: Element, abstract: Element) -> dict[int, Element]:
+        """Each level's w:lvl once w:lvlOverride is applied, abstract levels first in document order."""
+        levels: dict[int, Element] = {}
+        for lvl in abstract.findall("w:lvl", NS):
+            number = decimal(attr(lvl, "ilvl"))
+            if number is not None and number >= 0:
+                levels.setdefault(number, lvl)
+        overridden = set()
+        for override in num.findall("w:lvlOverride", NS):
+            number = decimal(attr(override, "ilvl"))
+            if number is None or number < 0 or number in overridden:
+                continue  # the first override of a level is the one that applies
+            overridden.add(number)
+            replacement = override.find("w:lvl", NS)
+            if replacement is not None:  # replaces the whole level, style association included
+                levels[number] = replacement
+        return levels
+
+    def record_list(self, props: list[Element], num: Element, level: int) -> None:
+        """Fingerprint the effective format of one used list level, keyed by first use."""
+        num_id = self.list_id(props, num)
+        if num_id == "0":
+            return  # numbering switched off by a style; nothing to fingerprint
+        key = num_id if num_id is not None else ""
+        entry = self.lists.setdefault(key, {"list": len(self.lists) + 1, "part": self.part, "levels": {}})
+        if level not in entry["levels"]:
+            entry["levels"][level] = self.list_level(num_id, level)
+        # The level is part of a run: items of one list can take different formats from their levels
+        # without any difference in prose, when the level comes from the paragraph style.
+        run = {"list": entry["list"], "part": self.part, "level": level}
+        last = self.list_runs[-1] if self.list_runs else None
+        if last is not None and all(last[key] == value for key, value in run.items()):
+            last["items"] += 1
+        else:
+            self.list_runs.append({**run, "items": 1})
+
+    def list_level(self, num_id: str | None, level: int) -> dict[str, Any]:
+        """Resolve w:num -> w:abstractNum -> w:lvl, applying w:lvlOverride."""
+        unknown = {"level": level, "format": "unknown", "text": "", "start": 0}
+        num = self.nums.get(num_id) if num_id is not None else None
+        abstract_id = num.find("w:abstractNumId", NS) if num is not None else None
+        abstract = None if abstract_id is None else self.abstract_nums.get(number_id(attr(abstract_id, "val")))
+        if num is None or abstract is None or abstract.find("w:numStyleLink", NS) is not None:
+            self.warn(UNKNOWN_LIST_NOTE)
+            return unknown
+        override = next((o for o in num.findall("w:lvlOverride", NS) if decimal(attr(o, "ilvl")) == level), None)
+        lvl = self.effective_levels(num, abstract).get(level)
+        if lvl is None:
+            self.warn(UNKNOWN_LIST_NOTE)
+            return unknown
+        fmt = lvl.find("w:numFmt", NS)
+        alternate = lvl.find(f"{{{MC}}}AlternateContent")
+        if fmt is None and alternate is not None:
+            # Word stores custom formats such as "001, 002, ..." in mc:Choice, with a Fallback.
+            fmt = next((f for branch in alternate for f in branch.findall("w:numFmt", NS)), None)
+        # OOXML defaults an absent w:numFmt to decimal.
+        format_name = attr(fmt, "val", "decimal") if fmt is not None else "decimal"
+        if fmt is not None and attr(fmt, "format"):
+            format_name += ": " + attr(fmt, "format")
+        text = lvl.find("w:lvlText", NS)
+        start = lvl.find("w:start", NS)
+        start_override = override.find("w:startOverride", NS) if override is not None else None
+        if start_override is not None:
+            start = start_override
+        return {"level": level, "format": format_name,
+                "text": attr(text, "val") if text is not None else "",
+                # Absent, non-numeric and oversized values record 0.
+                "start": (decimal(attr(start, "val")) or 0) if start is not None else 0}
 
     def blocks(self, node: Element) -> str:
         parts = []
@@ -292,6 +502,16 @@ class Reader:
                 continue
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
+            elif child.tag == f"{{{MC}}}AlternateContent":
+                # Without a text box every copy's prose is still read, but images come from one copy.
+                chosen, values = self.image_branch(child), []
+                for copy in child:
+                    self.unselected += copy is not chosen
+                    try:
+                        values.append(self.blocks(copy))
+                    finally:
+                        self.unselected -= copy is not chosen
+                value = "\n\n".join(v for v in values if v)
             elif child.tag in {w("altChunk"), w("drawing"), w("pict"), w("object")}:
                 text, boxes = self.anchor(child)
                 value = "\n\n".join(part for part in (text, *boxes) if part)
@@ -398,6 +618,15 @@ class Reader:
                     raise DocumentError(f"missing related part {target}")
                 self.styles = {attr(s, "styleId"): s for s in self.xml(target)}
                 supported.add(target)
+            elif kind == "numbering" and not external:
+                if target not in self.names:
+                    raise DocumentError(f"missing related part {target}")
+                numbering = self.xml(target)
+                for node in numbering.findall("w:num", NS):
+                    self.nums.setdefault(number_id(attr(node, "numId")), node)
+                for node in numbering.findall("w:abstractNum", NS):
+                    self.abstract_nums.setdefault(number_id(attr(node, "abstractNumId")), node)
+                supported.add(target)
         prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
@@ -422,10 +651,11 @@ class Reader:
             else:
                 prose.append(f"## {kind.title()} ({part})\n\n" + self.render_part(part, tree))
                 self.warn("Headers and footers are shown by part; page/section placement is not reconstructed.")
+        supported.update(self.media)
         for name in sorted(self.names):
             if name in supported or name.endswith("/") or name.endswith(".rels") or name == "[Content_Types].xml" or name.startswith("docProps/"):
                 continue
-            if name in {"word/settings.xml", "word/webSettings.xml", "word/fontTable.xml", "word/numbering.xml"} or name.startswith("word/theme/"):
+            if name in {"word/settings.xml", "word/webSettings.xml", "word/fontTable.xml"} or name.startswith("word/theme/"):
                 continue
             self.warn(f"Unrendered package part: {name}; changes to its content are not compared.")
         if self.features["footnote references"] and not any(k == "footnotes" for k, _ in stories):
@@ -434,7 +664,10 @@ class Reader:
             self.warn("Endnote references have no related endnotes part.")
         metadata = {"schema": 1, "view": "accept-insertions-omit-deletions",
                     "coverage": "partial-prose", "warnings": sorted(self.warnings),
-                    "review": self.review, "hyperlinks": self.links, "fields": self.fields}
+                    "review": self.review, "hyperlinks": self.links, "fields": self.fields,
+                    "lists": [{**entry, "levels": [entry["levels"][k] for k in sorted(entry["levels"])]}
+                              for entry in self.lists.values()],
+                    "list_runs": self.list_runs, "images": self.images}
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 

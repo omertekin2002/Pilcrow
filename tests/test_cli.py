@@ -96,6 +96,71 @@ def anchored(text: str, shape: str) -> str:
     return f'<w:p><w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r><w:r>{shape}</w:r></w:p>'
 
 
+NUMBERING_REL = f'<Relationship Id="numbering" Type="{R}/numbering" Target="numbering.xml"/>'
+LIST_NOTE = (
+    "List boundaries and indentation are retained; bullet and number formats are recorded in "
+    "metadata, but counter values and bullet glyphs are not reconstructed."
+)
+UNKNOWN_LIST_NOTE = (
+    "Some list numbering formats could not be resolved (no numbering part, an unknown "
+    "list or level, or style-linked numbering); they are recorded as unknown."
+)
+
+
+def list_item(text: str, num_id: str, ilvl: int = 0) -> str:
+    return paragraph(text, f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
+
+
+def level(ilvl: int = 0, fmt: str = "bullet", text: str = "•", start: str | None = "1", *,
+          style: str | None = None) -> str:
+    start_xml = f'<w:start w:val="{start}"/>' if start is not None else ""
+    style_xml = f'<w:pStyle w:val="{style}"/>' if style is not None else ""
+    return f'<w:lvl w:ilvl="{ilvl}">{start_xml}<w:numFmt w:val="{fmt}"/>{style_xml}<w:lvlText w:val="{text}"/></w:lvl>'
+
+
+def abstract_num(abstract_id: str, *levels: str) -> str:
+    return f'<w:abstractNum w:abstractNumId="{abstract_id}">{"".join(levels)}</w:abstractNum>'
+
+
+def num(num_id: str, abstract_id: str, overrides: str = "") -> str:
+    return f'<w:num w:numId="{num_id}"><w:abstractNumId w:val="{abstract_id}"/>{overrides}</w:num>'
+
+
+def numbering(*definitions: str) -> str:
+    return f'<w:numbering xmlns:w="{W}">{"".join(definitions)}</w:numbering>'
+
+
+IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+MISSING_IMAGE_NOTE = (
+    "Some image relationships are missing or point to missing parts; "
+    "those images are recorded without a hash."
+)
+
+
+def picture(rid: str, attribute: str = "embed") -> str:
+    """An inline DrawingML picture referencing an image relationship."""
+    return (
+        f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}">'
+        f'<pic:pic xmlns:pic="{PIC}"><pic:blipFill><a:blip r:{attribute}="{rid}"/></pic:blipFill></pic:pic>'
+        '</a:graphicData></a:graphic></wp:inline></w:drawing>'
+    )
+
+
+def vml_picture(rid: str) -> str:
+    """A legacy VML picture, as in older files and in mc:Fallback."""
+    return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
+
+
+def image_rel(rid: str, target: str, *, external: bool = False) -> str:
+    mode = ' TargetMode="External"' if external else ""
+    return f'<Relationship Id="{rid}" Type="{R}/image" Target="{target}"{mode}/>'
+
+
+def image_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
+    raw = data.encode("utf-8")
+    return {"part": part, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
 def make_docx(
     path: Path,
     body: str,
@@ -406,6 +471,500 @@ class CLITests(unittest.TestCase):
         self.assertLess(prose.index("A section"), prose.index("A list item"))
         self.assertLess(prose.index("Left cell"), prose.index("Right cell"))
 
+    def write_lists(self, body: str, numbering_xml: str | None, *, extra: dict[str, str] | None = None,
+                    relationships: str = "") -> None:
+        parts = dict(extra or {})
+        if numbering_xml is not None:
+            parts["word/numbering.xml"] = numbering_xml
+            relationships += NUMBERING_REL
+        make_docx(self.root / "essay.docx", body, extra=parts, relationships=relationships)
+
+    def exported_lists(self) -> list[dict[str, Any]]:
+        lists: list[dict[str, Any]] = json.loads(self.exported()[1])["lists"]
+        return lists
+
+    def test_list_format_changes_are_stale_in_metadata_only(self) -> None:
+        body = paragraph("Intro.") + list_item("First item.", "1") + list_item("Second item.", "1")
+
+        def write(definition: str, overrides: str = "") -> None:
+            self.write_lists(body, numbering(abstract_num("0", definition), num("1", "0", overrides)))
+
+        write(level(fmt="bullet", text="•"))
+        result = self.cli("export", "essay.docx")
+        self.assertIn(LIST_NOTE, result.stderr)
+        before = self.exported()
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+        ])
+        self.assertIn(LIST_NOTE, json.loads(before[1])["warnings"])
+        variants = [
+            (level(fmt="decimal", text="%1."), "", {"format": "decimal", "text": "%1.", "start": 1}),
+            (level(fmt="decimal", text="%1)"), "", {"format": "decimal", "text": "%1)", "start": 1}),
+            (level(fmt="decimal", text="%1)", start="5"), "", {"format": "decimal", "text": "%1)", "start": 5}),
+            (level(fmt="decimal", text="%1)", start="5"),
+             '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="3"/></w:lvlOverride>',
+             {"format": "decimal", "text": "%1)", "start": 3}),
+            (level(fmt="decimal", text="%1)", start="5"),
+             f'<w:lvlOverride w:ilvl="0">{level(fmt="lowerLetter", text="%1)", start="2")}</w:lvlOverride>',
+             {"format": "lowerLetter", "text": "%1)", "start": 2}),
+            (level(fmt="decimal", text="%1)", start=None), "", {"format": "decimal", "text": "%1)", "start": 0}),
+        ]
+        previous = before
+        for definition, overrides, expected in variants:
+            with self.subTest(expected=expected):
+                write(definition, overrides)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0], "list format changes must not alter the prose")
+                self.assertNotEqual(after[1], previous[1])
+                self.assertEqual(self.exported_lists()[0]["levels"], [{"level": 0, **expected}])
+                self.cli("check", "essay.docx")
+                previous = after
+
+    def test_style_associated_list_formats_make_metadata_stale(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="BaseList">'
+            '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+            '<w:style w:type="paragraph" w:styleId="NestedList"><w:basedOn w:val="BaseList"/></w:style>'
+            '<w:style w:type="paragraph" w:styleId="DerivedList"><w:basedOn w:val="NestedList"/></w:style>'
+            '</w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        for style in ("NestedList", "DerivedList"):
+            for direct in ("", '<w:numPr><w:numId w:val="1"/></w:numPr>'):
+                with self.subTest(style=style, direct=direct):
+                    body = paragraph("Styled item.", f'<w:pPr><w:pStyle w:val="{style}"/>{direct}</w:pPr>')
+
+                    def write(fmt: str, body: str = body) -> None:
+                        # BaseList and NestedList both match ancestors; the nearer style selects level 1.
+                        self.write_lists(body, numbering(abstract_num("0", level(0, style="BaseList"),
+                                                                   level(1, fmt, style="NestedList")),
+                                                         num("1", "0")),
+                                         extra={"word/styles.xml": styles}, relationships=relationships)
+
+                    write("bullet")
+                    self.cli("export", "essay.docx")
+                    before = self.exported()
+                    self.assertEqual(before[0], b"- Styled item.\n",
+                                     "the associated level is recorded in metadata; prose indentation is unchanged")
+                    self.assertEqual(self.exported_lists()[0]["levels"], [
+                        {"level": 1, "format": "bullet", "text": "•", "start": 1},
+                    ])
+                    write("decimal")
+                    self.cli("check", "essay.docx", code=1)
+                    self.cli("export", "essay.docx")
+                    after = self.exported()
+                    self.assertEqual(after[0], before[0])
+                    self.assertNotEqual(after[1], before[1])
+                    self.assertEqual(self.exported_lists()[0]["levels"][0]["format"], "decimal")
+
+    def test_swapping_styles_associated_with_different_levels_is_stale(self) -> None:
+        # Both styles share one numId and carry no ilvl, so prose and the used levels stay the same;
+        # only which item takes which level's format changes.
+        styles = f'<w:styles xmlns:w="{W}">' + "".join(
+            f'<w:style w:type="paragraph" w:styleId="{style}">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>' for style in ("Bulleted", "Numbered")
+        ) + "</w:styles>"
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+
+        def write(*applied: str) -> None:
+            body = "".join(paragraph(text, f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>')
+                           for text, style in zip(("Alpha.", "Beta.", "Gamma."), applied, strict=True))
+            self.write_lists(body, numbering(abstract_num("0", level(0, style="Bulleted"),
+                                                          level(1, "decimal", "%2.", style="Numbered")),
+                                             num("1", "0")),
+                             extra={"word/styles.xml": styles}, relationships=relationships)
+
+        def runs() -> list[dict[str, object]]:
+            return [{"level": run["level"], "items": run["items"]} for run in json.loads(self.exported()[1])["list_runs"]]
+
+        write("Bulleted", "Numbered", "Numbered")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(before[0], b"- Alpha.\n\n- Beta.\n\n- Gamma.\n")
+        self.assertEqual(runs(), [{"level": 0, "items": 1}, {"level": 1, "items": 2}])
+        for applied in (("Numbered", "Bulleted", "Numbered"), ("Numbered", "Numbered", "Bulleted")):
+            with self.subTest(applied=applied):
+                write(*applied)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0], "the swap must not alter the prose")
+                self.assertEqual(json.loads(after[1])["lists"], json.loads(before[1])["lists"])
+                self.assertNotEqual(after[1], before[1])
+                write("Bulleted", "Numbered", "Numbered")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+
+    def test_style_associations_follow_level_overrides(self) -> None:
+        # A w:lvl inside w:lvlOverride replaces the abstract level, its w:pStyle association included.
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="Clause">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = paragraph("Clause item.", '<w:pPr><w:pStyle w:val="Clause"/></w:pPr>')
+
+        def override(ilvl: int, content: str) -> str:
+            return f'<w:lvlOverride w:ilvl="{ilvl}">{content}</w:lvlOverride>'
+
+        cases = {
+            # The association exists only on the override of level 1.
+            "override only": (abstract_num("0", level(0), level(1, "decimal", "%2.")),
+                              lambda fmt: override(1, level(1, fmt, "%2.", style="Clause"))),
+            # The override of level 0 drops the abstract association; the override of level 1 adds one.
+            "moved by overrides": (abstract_num("0", level(0, style="Clause"), level(1, "decimal", "%2.")),
+                                   lambda fmt: override(0, level(0)) + override(1, level(1, fmt, "%2.", style="Clause"))),
+            # An override without w:lvl leaves the abstract level, and its association, in place.
+            "start override keeps it": (abstract_num("0", level(0), level(1, "decimal", "%2.", style="Clause")),
+                                        lambda fmt: override(1, '<w:startOverride w:val="1"/>')
+                                        + override(2, level(2, fmt, "%3."))),
+        }
+        for name, (abstract, overrides) in cases.items():
+            with self.subTest(name):
+                def write(fmt: str, abstract: str = abstract, overrides: Any = overrides) -> None:
+                    self.write_lists(body, numbering(abstract, num("1", "0", overrides(fmt))),
+                                     extra={"word/styles.xml": styles}, relationships=relationships)
+
+                write("lowerRoman")
+                self.cli("export", "essay.docx")
+                before = self.exported()
+                self.assertEqual(before[0], b"- Clause item.\n")
+                recorded = self.exported_lists()[0]["levels"]
+                self.assertEqual([entry["level"] for entry in recorded], [1])
+                write("upperRoman")
+                if name == "start override keeps it":
+                    # Level 2 is unused, so its format is not recorded.
+                    self.assertEqual(recorded[0]["format"], "decimal")
+                    self.cli("check", "essay.docx")
+                    continue
+                self.assertEqual(recorded[0]["format"], "lowerRoman")
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0])
+                self.assertEqual(self.exported_lists()[0]["levels"][0]["format"], "upperRoman")
+
+    def test_direct_list_level_overrides_style_association(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = paragraph("Explicit item.", '<w:pPr><w:pStyle w:val="NestedList"/>'
+                         '<w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>')
+
+        def write(fmt: str) -> None:
+            self.write_lists(body, numbering(abstract_num("0", level(0), level(1, fmt, style="NestedList")),
+                                             num("1", "0")),
+                             extra={"word/styles.xml": styles}, relationships=relationships)
+
+        write("bullet")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(before[0], b"- Explicit item.\n")
+        self.assertEqual(self.exported_lists()[0]["levels"][0]["level"], 0)
+        write("decimal")
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before, "unused style-associated level must not churn metadata")
+
+    def test_style_resolution_for_metadata_leaves_list_prose_unchanged(self) -> None:
+        # Prose follows the nearest numPr alone, as it did before list metadata was recorded.
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'
+            '<w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+            '<w:style w:type="paragraph" w:styleId="NoList">'
+            '<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = (
+            # The style's own ilvl indents the prose; the level associated with the style is recorded.
+            paragraph("Styled item.", '<w:pPr><w:pStyle w:val="NestedList"/></w:pPr>')
+            # Own numPr with only ilvl while the style switches numbering off: a prose item, no list entry.
+            + paragraph("Unnumbered by style.", '<w:pPr><w:pStyle w:val="NoList"/><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr>')
+        )
+        self.write_lists(body, numbering(abstract_num("0", level(0), level(1, "decimal", "%2.", style="NestedList"),
+                                                      level(2, "lowerRoman", "%3.")),
+                                         num("1", "0")),
+                         extra={"word/styles.xml": styles}, relationships=relationships)
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(prose, b"    - Styled item.\n\n  - Unnumbered by style.\n")
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 1, "format": "decimal", "text": "%2.", "start": 1}]},
+        ])
+        self.assertEqual(json.loads(meta)["list_runs"],
+                         [{"list": 1, "part": "word/document.xml", "level": 1, "items": 1}])
+
+    def test_equivalent_start_spellings_do_not_churn_and_changed_starts_are_stale(self) -> None:
+        body = list_item("Item.", "1")
+
+        def write(start: str, override: str | None = None) -> None:
+            overrides = "" if override is None else (
+                f'<w:lvlOverride w:ilvl="0"><w:startOverride w:val="{override}"/></w:lvlOverride>')
+            self.write_lists(body, numbering(abstract_num("0", level(0, "decimal", "%1.", start=start)),
+                                             num("1", "0", overrides)))
+
+        write("1")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        # A sign, leading zeroes and surrounding whitespace are valid xsd:integer spellings.
+        for start, override in (("+1", None), ("01", None), ("+001", None), (" 1 ", None), ("0" * 5000 + "1", None),
+                                ("9", "+1"), ("9", "001")):
+            with self.subTest(start=start[-8:], override=override):
+                write(start, override)
+                self.cli("check", "essay.docx")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+        previous = 1
+        steps: list[tuple[str, str | None, int]] = [
+            ("+5", None, 5), ("05", None, 5), ("1", "+3", 3), ("1", "+7", 7), ("1", "007", 7),
+            ("-05", None, -5), ("-5", None, -5), ("-0", None, 0), ("+", None, 0), ("+-1", None, 0),
+            ("1" + "0" * 10, None, 0), ("0" * 20 + "9" * 10, None, 9999999999),
+        ]
+        for start, override, expected in steps:
+            with self.subTest(start=start, override=override):
+                write(start, override)
+                self.cli("check", "essay.docx", code=1 if expected != previous else 0)
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported()[0], before[0])
+                self.assertEqual(self.exported_lists()[0]["levels"][0]["start"], expected)
+                previous = expected
+
+    def test_equivalent_level_and_id_spellings_resolve_the_same_definitions(self) -> None:
+        def write(*, ilvl: str = "1", num_id: str = "1", defined_num: str = "1", abstract_ref: str = "0",
+                  defined_level: str = "1", override_level: str = "1") -> None:
+            body = paragraph("Item.", f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
+            definition = f'<w:lvl w:ilvl="{defined_level}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>'
+            override = f'<w:lvlOverride w:ilvl="{override_level}"><w:startOverride w:val="4"/></w:lvlOverride>'
+            self.write_lists(body, numbering(abstract_num("0", level(0), definition), num(defined_num, abstract_ref, override)))
+
+        write()
+        result = self.cli("export", "essay.docx")
+        self.assertNotIn(UNKNOWN_LIST_NOTE, result.stderr)
+        before = self.exported()
+        resolved = [{"list": 1, "part": "word/document.xml",
+                     "levels": [{"level": 1, "format": "decimal", "text": "%2.", "start": 4}]}]
+        self.assertEqual(self.exported_lists(), resolved)
+        variants: list[dict[str, str]] = [
+            {"ilvl": "01"}, {"num_id": "01"}, {"num_id": "+1"}, {"defined_num": "+01"}, {"abstract_ref": "+0"},
+            {"abstract_ref": "00"}, {"defined_level": "01"}, {"defined_level": "+1"}, {"override_level": "+01"},
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                write(**variant)
+                self.cli("check", "essay.docx")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+        # Prose indentation is not re-read here: only the recorded level follows the signed spelling.
+        write(ilvl="+1")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), resolved)
+
+    def test_renumbered_ids_and_unused_definitions_do_not_churn(self) -> None:
+        body = list_item("Bullet.", "1") + list_item("Nested.", "1", ilvl=1) + list_item("Numbered.", "2")
+        self.write_lists(body, numbering(
+            abstract_num("0", level(0), level(1, "bullet", "o")),
+            abstract_num("1", level(0, "decimal", "%1.")),
+            num("1", "0"), num("2", "1"),
+        ))
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual([entry["list"] for entry in self.exported_lists()], [1, 2])
+        renumbered = list_item("Bullet.", "12") + list_item("Nested.", "12", ilvl=1) + list_item("Numbered.", "4")
+        # New IDs, reordered definitions, an unused list, and a changed level no item uses.
+        self.write_lists(renumbered, numbering(
+            abstract_num("9", level(0, "decimal", "%1.")),
+            abstract_num("7", level(0), level(1, "bullet", "o"), level(2, "upperRoman", "%3:", "8")),
+            abstract_num("3", level(0, "lowerLetter", "%1)")),
+            num("4", "9"), num("5", "3"), num("12", "7"),
+        ))
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before)
+
+    def test_list_ordinals_follow_first_use_across_parts(self) -> None:
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="ListBullet"><w:name w:val="List Bullet"/>'
+            '<w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        extra = {
+            "word/styles.xml": styles,
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}">{list_item("Header item.", "7")}{list_item("Header only.", "5")}</w:hdr>',
+        }
+        relationships = (
+            f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+            f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+        )
+        body = (
+            list_item("Second list first.", "7", ilvl=2)
+            + paragraph("Styled item.", '<w:pPr><w:pStyle w:val="ListBullet"/></w:pPr>')
+            # Own numPr with only ilvl: numId comes from the style.
+            + paragraph("Styled sub-item.", '<w:pPr><w:pStyle w:val="ListBullet"/><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr>')
+            + list_item("Back to the first.", "7")
+            + paragraph("", '<w:pPr><w:numPr><w:numId w:val="9"/></w:numPr></w:pPr>')  # empty: not rendered
+            + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>'
+        )
+        self.write_lists(body, numbering(
+            abstract_num("0", level(0, "decimal", "%1."), level(2, "lowerRoman", "%3.")),
+            abstract_num("1", level(0), level(1, "bullet", "o")),
+            num("3", "1"), num("5", "1"), num("7", "0"), num("9", "1"),
+        ), extra=extra, relationships=relationships)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml", "levels": [
+                {"level": 0, "format": "decimal", "text": "%1.", "start": 1},
+                {"level": 2, "format": "lowerRoman", "text": "%3.", "start": 1},
+            ]},
+            {"list": 2, "part": "word/document.xml", "levels": [
+                {"level": 0, "format": "bullet", "text": "•", "start": 1},
+                {"level": 1, "format": "bullet", "text": "o", "start": 1},
+            ]},
+            {"list": 3, "part": "word/header1.xml",
+             "levels": [{"level": 0, "format": "bullet", "text": "•", "start": 1}]},
+        ])
+        self.assertNotIn("word/numbering.xml", self.exported()[1].decode("utf-8"))
+        self.assertEqual(json.loads(self.exported()[1])["list_runs"], [
+            {"list": 1, "part": "word/document.xml", "level": 2, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 1, "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 1, "part": "word/header1.xml", "level": 0, "items": 1},
+            {"list": 3, "part": "word/header1.xml", "level": 0, "items": 1},
+        ])
+
+    def test_list_in_a_text_box_counts_after_its_anchoring_item(self) -> None:
+        outer = list_item("Anchor item.", "4").replace("</w:r></w:p>", f"</w:r><w:r>{modern_text_box(list_item('Boxed item.', '2'))}</w:r></w:p>")
+        self.write_lists(outer, numbering(abstract_num("0", level(0)), abstract_num("1", level(0, "decimal", "%1.")),
+                                          num("2", "1"), num("4", "0")))
+        self.cli("export", "essay.docx")
+        prose = self.exported()[0].decode("utf-8")
+        self.assertLess(prose.index("Anchor item."), prose.index("Boxed item."))
+        self.assertEqual([entry["levels"][0]["format"] for entry in self.exported_lists()], ["bullet", "decimal"])
+
+    def test_moving_an_item_between_existing_lists_is_stale(self) -> None:
+        definitions = numbering(abstract_num("0", level(0)), abstract_num("1", level(0, "decimal", "%1.")),
+                                num("1", "0"), num("2", "1"))
+
+        def write(*ids: str) -> None:
+            texts = ("Alpha.", "Beta.", "Gamma.", "Delta.")
+            body = paragraph("Intro.") + "".join(list_item(text, num_id) for text, num_id in zip(texts, ids, strict=True))
+            self.write_lists(body, definitions)
+
+        write("1", "2", "1", "2")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(json.loads(before[1])["list_runs"], [
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
+        ])
+        for ids in (("1", "2", "2", "2"), ("1", "2", "2", "1")):
+            with self.subTest(ids=ids):
+                write(*ids)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported()[0], before[0])
+                write("1", "2", "1", "2")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+
+    def test_custom_formats_notes_cells_and_odd_values(self) -> None:
+        def custom(pattern: str) -> str:
+            return (
+                f'<w:lvl w:ilvl="0"><w:start w:val="1"/><mc:AlternateContent xmlns:mc="{MC}">'
+                f'<mc:Choice Requires="w14"><w:numFmt w:val="custom" w:format="{pattern}"/></mc:Choice>'
+                '<mc:Fallback><w:numFmt w:val="decimal"/></mc:Fallback></mc:AlternateContent>'
+                '<w:lvlText w:val="%1."/></w:lvl>'
+            )
+
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NoList"><w:name w:val="No List"/>'
+            '<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        extra = {
+            "word/styles.xml": styles,
+            "word/footnotes.xml": f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1">{list_item("Noted item.", "3")}</w:footnote></w:footnotes>',
+        }
+        relationships = (
+            f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+            f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>'
+        )
+        body = (
+            '<w:tbl><w:tr><w:tc>' + list_item("Cell item.", "1") + '</w:tc></w:tr></w:tbl>'
+            + paragraph("Unnumbered by style.", '<w:pPr><w:pStyle w:val="NoList"/><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>')
+            + list_item("Odd start.", "2")
+            + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+        )
+
+        def write(pattern: str) -> None:
+            self.write_lists(body, numbering(
+                abstract_num("0", custom(pattern)),
+                abstract_num("1", level(0, "decimal", "%1.", start="9" * 5000)),
+                abstract_num("2", level(0, "upperLetter", "%1.", start="two")),
+                num("1", "0"), num("2", "1"), num("3", "2"),
+            ), extra=extra, relationships=relationships)
+
+        write("001, 002, 003, ...")
+        result = self.cli("export", "essay.docx")
+        self.assertNotIn(UNKNOWN_LIST_NOTE, result.stderr)
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "custom: 001, 002, 003, ...", "text": "%1.", "start": 1}]},
+            {"list": 2, "part": "word/document.xml",
+             "levels": [{"level": 0, "format": "decimal", "text": "%1.", "start": 0}]},
+            {"list": 3, "part": "word/footnotes.xml",
+             "levels": [{"level": 0, "format": "upperLetter", "text": "%1.", "start": 0}]},
+        ])
+        write("01, 02, 03, ...")
+        self.cli("check", "essay.docx", code=1)
+
+    def test_numbering_part_without_a_relationship_is_unrendered(self) -> None:
+        make_docx(self.root / "essay.docx", list_item("Item.", "1"),
+                  extra={"word/numbering.xml": numbering(abstract_num("0", level(0)), num("1", "0"))})
+        result = self.cli("export", "essay.docx")
+        self.assertIn("Unrendered package part: word/numbering.xml", result.stderr)
+        self.assertIn(UNKNOWN_LIST_NOTE, result.stderr)
+
+    def test_unresolvable_lists_are_unknown_with_a_warning(self) -> None:
+        unknown = {"level": 0, "format": "unknown", "text": "", "start": 0}
+        cases = {
+            "no numbering part": (list_item("Item.", "1"), None),
+            "unknown numId": (list_item("Item.", "8"), numbering(abstract_num("0", level(0)), num("1", "0"))),
+            "unknown abstractNum": (list_item("Item.", "1"), numbering(abstract_num("0", level(0)), num("1", "6"))),
+            "unknown level": (list_item("Item.", "1", ilvl=3), numbering(abstract_num("0", level(0)), num("1", "0"))),
+            "numStyleLink": (list_item("Item.", "1"), numbering(
+                '<w:abstractNum w:abstractNumId="0"><w:numStyleLink w:val="Bullets"/></w:abstractNum>', num("1", "0"))),
+        }
+        for name, (body, numbering_xml) in cases.items():
+            with self.subTest(name):
+                self.write_lists(body, numbering_xml)
+                result = self.cli("export", "essay.docx")
+                self.assertIn(UNKNOWN_LIST_NOTE, result.stderr)
+                level_no = 3 if name == "unknown level" else 0
+                self.assertEqual(self.exported_lists(), [
+                    {"list": 1, "part": "word/document.xml", "levels": [{**unknown, "level": level_no}]},
+                ])
+        self.write_lists(list_item("Item.", "1"), None, relationships=NUMBERING_REL)
+        self.cli("export", "essay.docx", code=2)
+
+    def test_documents_without_lists_record_an_empty_array(self) -> None:
+        self.write_lists(paragraph("Plain prose."), None)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [])
+        self.assertEqual(json.loads(self.exported()[1])["list_runs"], [])
+        removed = paragraph("No longer a list.", '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr>')
+        self.write_lists(removed, numbering(abstract_num("0", level(0)), num("1", "0")))
+        result = self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), [])
+        self.assertNotIn(LIST_NOTE, result.stderr)
+        self.assertNotIn("numbering.xml", result.stderr)
+
     def test_notes_headers_and_footers_are_exported(self) -> None:
         extra = {
             "word/header1.xml": f'<w:hdr xmlns:w="{W}">{paragraph("Header words.")}</w:hdr>',
@@ -636,6 +1195,133 @@ class CLITests(unittest.TestCase):
         prose, meta = self.export_text_box(anchored("Group anchor.", shape))
         self.assertEqual(prose, "Group anchor.[Unsupported drawing]\n\n[Text box]\n\nGrouped box.\n\n[/Text box]\n")
         self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
+    def export_images(self, body: str, **options: Any) -> tuple[str, dict[str, Any], str]:
+        make_docx(self.root / "essay.docx", body, **options)
+        result = self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        return prose.decode("utf-8"), json.loads(meta), result.stderr
+
+    def test_image_swaps_are_stale_in_metadata_only_and_renames_are_not(self) -> None:
+        body = paragraph("Caption above.") + anchored("Figure:", picture("rId5"))
+
+        def write(name: str, data: str, rid: str = "rId5") -> None:
+            make_docx(self.root / "essay.docx", body.replace("rId5", rid),
+                      extra={f"word/media/{name}": data}, relationships=image_rel(rid, f"media/{name}"))
+
+        write("image1.png", "first picture bytes")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        meta = json.loads(before[1])
+        self.assertEqual(before[0], b"Caption above.\n\nFigure:[Unsupported drawing]\n")
+        self.assertEqual(meta["images"], [image_entry("first picture bytes")])
+        self.assertIn(IMAGE_NOTE, meta["warnings"])
+        self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
+        self.assertNotIn(b"image1.png", before[1], "media file names churn on save and are not recorded")
+        write("image1.png", "second picture bytes")
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], before[0], "image swaps must not alter the prose")
+        changed = json.loads(after[1])
+        self.assertEqual(changed["images"], [image_entry("second picture bytes")])
+        self.assertEqual({k: v for k, v in changed.items() if k != "images"},
+                         {k: v for k, v in meta.items() if k != "images"})
+        # Word renumbers media parts and relationship IDs on save; identical bytes stay fresh.
+        write("image7.png", "second picture bytes", rid="rId12")
+        self.cli("check", "essay.docx")
+
+    def test_images_in_headers_notes_text_boxes_and_vml_are_recorded_in_order(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Logo:", picture("logo"))}</w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'{anchored("Note figure:", picture("noteImage"))}</w:footnote></w:footnotes>')
+        boxed = paragraph("Boxed caption.") + anchored("", picture("boxed"))
+        # A compatibility wrapper with no text box: only the mc:Choice copy is recorded.
+        wrapped = f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{picture("choice")}</mc:Choice><mc:Fallback>{vml_picture("fallback")}</mc:Fallback></mc:AlternateContent>'
+        body = (anchored("Body:", picture("body") + modern_text_box(boxed)) + anchored("Legacy:", vml_picture("legacy"))
+                + anchored("Wrapped:", wrapped) + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        media = {name: f"{name} bytes" for name in ("body", "boxed", "legacy", "choice", "fallback", "logo", "note")}
+        extra = {f"word/media/{name}.png": data for name, data in media.items()}
+        extra.update({
+            "word/header1.xml": header, "word/footnotes.xml": footnotes,
+            "word/_rels/header1.xml.rels": f'<Relationships xmlns="{PKG_R}">{image_rel("logo", "media/logo.png")}</Relationships>',
+            "word/_rels/footnotes.xml.rels": f'<Relationships xmlns="{PKG_R}">{image_rel("noteImage", "media/note.png")}</Relationships>',
+        })
+        relationships = "".join(image_rel(rid, f"media/{rid}.png") for rid in ("body", "boxed", "legacy", "choice", "fallback"))
+        relationships += (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                          f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        prose, meta, stderr = self.export_images(body, extra=extra, relationships=relationships)
+        self.assertEqual(meta["images"], [
+            image_entry(media["body"]), image_entry(media["boxed"]), image_entry(media["legacy"]),
+            image_entry(media["choice"]), image_entry(media["note"], "word/footnotes.xml"),
+            image_entry(media["logo"], "word/header1.xml"),
+        ])
+        self.assertIn("[Text box]\n\nBoxed caption.\n\n[Unsupported drawing]\n\n[/Text box]", prose)
+        self.assertIn("Legacy:[Unsupported pict]", prose)
+        self.assertIn("Wrapped:[Unsupported AlternateContent]", prose)
+        # Only the unread Fallback copy is still an unrendered part.
+        unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
+        self.assertEqual(unrendered, ["Unrendered package part: word/media/fallback.png; changes to its content are not compared."])
+        self.assertNotIn(MISSING_IMAGE_NOTE, stderr)
+
+    def test_block_level_compatibility_copies_record_images_once(self) -> None:
+        def write(fallback: str) -> None:
+            choice = anchored("Choice:", picture("choice"))
+            backup = anchored("Fallback:", vml_picture("fallback"))
+            body = paragraph("Before.") + f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{choice}</mc:Choice><mc:Fallback>{backup}</mc:Fallback></mc:AlternateContent>'
+            make_docx(self.root / "essay.docx", body,
+                      extra={"word/media/choice.png": "choice bytes", "word/media/fallback.png": fallback},
+                      relationships=image_rel("choice", "media/choice.png") + image_rel("fallback", "media/fallback.png"))
+
+        write("fallback bytes")
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        # Prose still reads both copies, as before; only the mc:Choice image is recorded.
+        self.assertEqual(prose, b"Before.\n\nChoice:[Unsupported drawing]\n\nFallback:[Unsupported pict]\n")
+        self.assertEqual(json.loads(meta)["images"], [image_entry("choice bytes")])
+        write("changed fallback bytes")
+        self.cli("check", "essay.docx")
+
+    def test_external_and_dangling_images_are_recorded_without_reading_bytes(self) -> None:
+        body = (anchored("Linked:", picture("linked", "link")) + anchored("No relationship:", picture("nowhere"))
+                + anchored("No part:", picture("lost")))
+        relationships = (image_rel("linked", "https://example.invalid/figure.png", external=True)
+                         + image_rel("lost", "media/lost.png"))
+        prose, meta, stderr = self.export_images(body, relationships=relationships)
+        self.assertEqual(meta["images"], [
+            {"part": "word/document.xml", "target": "https://example.invalid/figure.png"},
+            {"part": "word/document.xml", "sha256": None},
+            {"part": "word/document.xml", "sha256": None},
+        ])
+        self.assertIn(MISSING_IMAGE_NOTE, meta["warnings"])
+        self.assertIn(MISSING_IMAGE_NOTE, stderr)
+        self.assertEqual(prose.count("[Unsupported drawing]"), 3)
+        self.cli("check", "essay.docx")
+
+    def test_corrupt_compressed_media_is_a_document_error(self) -> None:
+        source = self.root / "essay.docx"
+        make_docx(source, anchored("Figure:", picture("rId5")), extra={"word/media/image1.png": "picture " * 64},
+                  relationships=image_rel("rId5", "media/image1.png"))
+        with ZipFile(source) as archive:
+            info = archive.getinfo("word/media/image1.png")
+        data = bytearray(source.read_bytes())
+        # Overwrite the start of the DEFLATE stream with an invalid block type.
+        start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+        data[start:start + 8] = b"\xff" * 8
+        source.write_bytes(bytes(data))
+        result = self.cli("export", "essay.docx", code=2)
+        self.assertIn("error: essay.docx:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.companions()[0].exists())
+
+    def test_unreferenced_media_still_warns_and_imageless_documents_record_an_empty_array(self) -> None:
+        prose, meta, stderr = self.export_images(paragraph("Plain prose."), extra={"word/media/image9.png": "orphan"})
+        self.assertEqual(meta["images"], [])
+        self.assertIn("Unrendered package part: word/media/image9.png; changes to its content are not compared.", meta["warnings"])
+        self.assertNotIn(IMAGE_NOTE, meta["warnings"])
+        prose, meta, stderr = self.export_images(paragraph("Plain prose."))
+        self.assertEqual(meta["images"], [])
 
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")

@@ -246,15 +246,31 @@ DOCX. No automatic OOXML merging or sentence-lineage system is provided.
 See [coverage, normalization, and backlog](docs/limitations.md). The prose retains
 common headings, list indentation, tables, notes, headers, and footers. Tracked
 insertions/move destinations are included and deletions/move sources omitted.
+List bullet/number formats are recorded in metadata, so changing them makes
+companions stale; the counters themselves are not shown in prose, and numbered
+headings are not compared.
 Complex tracked structure/layout is limited and reported. Text box text is shown
 between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
 box's position, wrapping, and shape formatting are not compared. Images, charts,
-equations, and embedded objects are not rendered. Formatting-only edits can
+equations, and embedded objects are not rendered; images are recorded in
+metadata by content hash, so swapping, adding, removing, or reordering one makes
+companions stale (size, position, cropping, and alt text are not compared). Formatting-only edits can
 leave both companions unchanged and still matter in Word.
 
 Upgrading from a version that left text box text out: documents with text boxes
 report stale companions once, because their prose now includes that text. Run
 `pilcrow export` and commit the refreshed companions.
+
+Upgrading from a version that did not record list formats: every document reports
+stale companions once, because `.meta.json` now always has `lists` and
+`list_runs` keys (empty for documents without lists). Run `pilcrow export` and
+commit the refreshed companions. A document whose numbering relationship points to
+a missing part is now an error, like a missing styles part.
+
+Upgrading from a version that did not record image hashes: every document reports
+stale companions once, because `.meta.json` now always has an `images` key
+(empty for documents without images). This ships with the list-format change
+above, so one `pilcrow export` and commit covers both.
 
 Run the generated-fixture suite:
 
