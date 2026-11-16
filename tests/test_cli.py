@@ -547,7 +547,8 @@ class CLITests(unittest.TestCase):
                     write("bullet")
                     self.cli("export", "essay.docx")
                     before = self.exported()
-                    self.assertEqual(before[0], b"  - Styled item.\n")
+                    self.assertEqual(before[0], b"- Styled item.\n",
+                                     "the associated level is recorded in metadata; prose indentation is unchanged")
                     self.assertEqual(self.exported_lists()[0]["levels"], [
                         {"level": 1, "format": "bullet", "text": "•", "start": 1},
                     ])
@@ -582,6 +583,34 @@ class CLITests(unittest.TestCase):
         self.cli("check", "essay.docx")
         self.cli("export", "essay.docx")
         self.assertEqual(self.exported(), before, "unused style-associated level must not churn metadata")
+
+    def test_style_resolution_for_metadata_leaves_list_prose_unchanged(self) -> None:
+        # Prose follows the nearest numPr alone, as it did before list metadata was recorded.
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'
+            '<w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+            '<w:style w:type="paragraph" w:styleId="NoList">'
+            '<w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = (
+            # The style's own ilvl indents the prose; the level associated with the style is recorded.
+            paragraph("Styled item.", '<w:pPr><w:pStyle w:val="NestedList"/></w:pPr>')
+            # Own numPr with only ilvl while the style switches numbering off: a prose item, no list entry.
+            + paragraph("Unnumbered by style.", '<w:pPr><w:pStyle w:val="NoList"/><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr>')
+        )
+        self.write_lists(body, numbering(abstract_num("0", level(0), level(1, "decimal", "%2.", style="NestedList"),
+                                                      level(2, "lowerRoman", "%3.")),
+                                         num("1", "0")),
+                         extra={"word/styles.xml": styles}, relationships=relationships)
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(prose, b"    - Styled item.\n\n  - Unnumbered by style.\n")
+        self.assertEqual(self.exported_lists(), [
+            {"list": 1, "part": "word/document.xml",
+             "levels": [{"level": 1, "format": "decimal", "text": "%2.", "start": 1}]},
+        ])
+        self.assertEqual(json.loads(meta)["list_runs"], [{"list": 1, "part": "word/document.xml", "items": 1}])
 
     def test_renumbered_ids_and_unused_definitions_do_not_churn(self) -> None:
         body = list_item("Bullet.", "1") + list_item("Nested.", "1", ilvl=1) + list_item("Numbered.", "2")

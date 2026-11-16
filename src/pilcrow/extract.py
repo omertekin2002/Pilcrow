@@ -356,12 +356,18 @@ class Reader:
         num = next((p.find("w:numPr", NS) for p in props if p.find("w:numPr", NS) is not None), None)
         if level:
             return "#" * level + " " + normalize(text)
-        if num is not None and self.list_id(props, num) != "0":
-            self.warn(LIST_NOTE)
-            depth = self.list_depth(node, props, num, style_id)
-            self.record_list(props, num, depth)
-            indent = "  " * min(20, depth)
-            return indent + "- " + ("\n" + indent + "  ").join(lines)
+        if num is not None:
+            # Prose keeps the rule it had before list metadata: the nearest numPr alone decides
+            # whether this is a list item and how far it is indented. The inherited numId and
+            # the style-associated level are resolved for the metadata only.
+            num_id = num.find("w:numId", NS)
+            if num_id is None or attr(num_id, "val") != "0":
+                self.warn(LIST_NOTE)
+                self.record_list(props, num, self.numbering_level(node, props, num, style_id))
+                ilvl = num.find("w:ilvl", NS)
+                depth = attr(ilvl, "val", "0") if ilvl is not None else "0"
+                indent = "  " * min(20, int(depth)) if depth.isdigit() else ""
+                return indent + "- " + ("\n" + indent + "  ").join(lines)
         return "\n".join(lines)
 
     def list_id(self, props: list[Element], num: Element) -> str | None:
@@ -372,8 +378,8 @@ class Reader:
             found = next((n for p in props if (n := p.find("w:numPr/w:numId", NS)) is not None), None)
         return attr(found, "val") if found is not None else None
 
-    def list_depth(self, paragraph: Element, props: list[Element], num: Element, style_id: str) -> int:
-        """Resolve direct ilvl first, then the paragraph style's associated numbering level."""
+    def numbering_level(self, paragraph: Element, props: list[Element], num: Element, style_id: str) -> int:
+        """The level whose format is recorded: direct ilvl, else the level associated with the style."""
         ilvl = paragraph.find("w:pPr/w:numPr/w:ilvl", NS)
         if ilvl is None:
             num_id = self.list_id(props, num)
