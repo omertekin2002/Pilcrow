@@ -1054,6 +1054,22 @@ class CLITests(unittest.TestCase):
         self.assertEqual(prose.count("[Unsupported drawing]"), 3)
         self.cli("check", "essay.docx")
 
+    def test_corrupt_compressed_media_is_a_document_error(self) -> None:
+        source = self.root / "essay.docx"
+        make_docx(source, anchored("Figure:", picture("rId5")), extra={"word/media/image1.png": "picture " * 64},
+                  relationships=image_rel("rId5", "media/image1.png"))
+        with ZipFile(source) as archive:
+            info = archive.getinfo("word/media/image1.png")
+        data = bytearray(source.read_bytes())
+        # Overwrite the start of the DEFLATE stream with an invalid block type.
+        start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+        data[start:start + 8] = b"\xff" * 8
+        source.write_bytes(bytes(data))
+        result = self.cli("export", "essay.docx", code=2)
+        self.assertIn("error: essay.docx:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.companions()[0].exists())
+
     def test_unreferenced_media_still_warns_and_imageless_documents_record_an_empty_array(self) -> None:
         prose, meta, stderr = self.export_images(paragraph("Plain prose."), extra={"word/media/image9.png": "orphan"})
         self.assertEqual(meta["images"], [])

@@ -214,7 +214,10 @@ class Reader:
                     entry["target"] = rel[1]  # never fetched, like hyperlinks
                 elif rel is not None and rel[1] in self.names:
                     if rel[1] not in self.media:
-                        data = self.package.read(rel[1])
+                        try:
+                            data = self.package.read(rel[1])
+                        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
+                            raise DocumentError(f"cannot read {rel[1]}: {exc}") from exc
                         self.media[rel[1]] = (hashlib.sha256(data).hexdigest(), len(data))
                     entry["sha256"], entry["bytes"] = self.media[rel[1]]
                 else:
