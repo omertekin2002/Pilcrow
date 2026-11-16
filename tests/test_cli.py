@@ -128,6 +128,37 @@ def numbering(*definitions: str) -> str:
     return f'<w:numbering xmlns:w="{W}">{"".join(definitions)}</w:numbering>'
 
 
+IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+MISSING_IMAGE_NOTE = (
+    "Some image relationships are missing or point to missing parts; "
+    "those images are recorded without a hash."
+)
+
+
+def picture(rid: str, attribute: str = "embed") -> str:
+    """An inline DrawingML picture referencing an image relationship."""
+    return (
+        f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}">'
+        f'<pic:pic xmlns:pic="{PIC}"><pic:blipFill><a:blip r:{attribute}="{rid}"/></pic:blipFill></pic:pic>'
+        '</a:graphicData></a:graphic></wp:inline></w:drawing>'
+    )
+
+
+def vml_picture(rid: str) -> str:
+    """A legacy VML picture, as in older files and in mc:Fallback."""
+    return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
+
+
+def image_rel(rid: str, target: str, *, external: bool = False) -> str:
+    mode = ' TargetMode="External"' if external else ""
+    return f'<Relationship Id="{rid}" Type="{R}/image" Target="{target}"{mode}/>'
+
+
+def image_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
+    raw = data.encode("utf-8")
+    return {"part": part, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
 def make_docx(
     path: Path,
     body: str,
@@ -919,6 +950,99 @@ class CLITests(unittest.TestCase):
         prose, meta = self.export_text_box(anchored("Group anchor.", shape))
         self.assertEqual(prose, "Group anchor.[Unsupported drawing]\n\n[Text box]\n\nGrouped box.\n\n[/Text box]\n")
         self.assertIn("Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
+    def export_images(self, body: str, **options: Any) -> tuple[str, dict[str, Any], str]:
+        make_docx(self.root / "essay.docx", body, **options)
+        result = self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        return prose.decode("utf-8"), json.loads(meta), result.stderr
+
+    def test_image_swaps_are_stale_in_metadata_only_and_renames_are_not(self) -> None:
+        body = paragraph("Caption above.") + anchored("Figure:", picture("rId5"))
+
+        def write(name: str, data: str, rid: str = "rId5") -> None:
+            make_docx(self.root / "essay.docx", body.replace("rId5", rid),
+                      extra={f"word/media/{name}": data}, relationships=image_rel(rid, f"media/{name}"))
+
+        write("image1.png", "first picture bytes")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        meta = json.loads(before[1])
+        self.assertEqual(before[0], b"Caption above.\n\nFigure:[Unsupported drawing]\n")
+        self.assertEqual(meta["images"], [image_entry("first picture bytes")])
+        self.assertIn(IMAGE_NOTE, meta["warnings"])
+        self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
+        self.assertNotIn(b"image1.png", before[1], "media file names churn on save and are not recorded")
+        write("image1.png", "second picture bytes")
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], before[0], "image swaps must not alter the prose")
+        changed = json.loads(after[1])
+        self.assertEqual(changed["images"], [image_entry("second picture bytes")])
+        self.assertEqual({k: v for k, v in changed.items() if k != "images"},
+                         {k: v for k, v in meta.items() if k != "images"})
+        # Word renumbers media parts and relationship IDs on save; identical bytes stay fresh.
+        write("image7.png", "second picture bytes", rid="rId12")
+        self.cli("check", "essay.docx")
+
+    def test_images_in_headers_notes_text_boxes_and_vml_are_recorded_in_order(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Logo:", picture("logo"))}</w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'{anchored("Note figure:", picture("noteImage"))}</w:footnote></w:footnotes>')
+        boxed = paragraph("Boxed caption.") + anchored("", picture("boxed"))
+        # A compatibility wrapper with no text box: only the mc:Choice copy is recorded.
+        wrapped = f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{picture("choice")}</mc:Choice><mc:Fallback>{vml_picture("fallback")}</mc:Fallback></mc:AlternateContent>'
+        body = (anchored("Body:", picture("body") + modern_text_box(boxed)) + anchored("Legacy:", vml_picture("legacy"))
+                + anchored("Wrapped:", wrapped) + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        media = {name: f"{name} bytes" for name in ("body", "boxed", "legacy", "choice", "fallback", "logo", "note")}
+        extra = {f"word/media/{name}.png": data for name, data in media.items()}
+        extra.update({
+            "word/header1.xml": header, "word/footnotes.xml": footnotes,
+            "word/_rels/header1.xml.rels": f'<Relationships xmlns="{PKG_R}">{image_rel("logo", "media/logo.png")}</Relationships>',
+            "word/_rels/footnotes.xml.rels": f'<Relationships xmlns="{PKG_R}">{image_rel("noteImage", "media/note.png")}</Relationships>',
+        })
+        relationships = "".join(image_rel(rid, f"media/{rid}.png") for rid in ("body", "boxed", "legacy", "choice", "fallback"))
+        relationships += (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                          f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        prose, meta, stderr = self.export_images(body, extra=extra, relationships=relationships)
+        self.assertEqual(meta["images"], [
+            image_entry(media["body"]), image_entry(media["boxed"]), image_entry(media["legacy"]),
+            image_entry(media["choice"]), image_entry(media["note"], "word/footnotes.xml"),
+            image_entry(media["logo"], "word/header1.xml"),
+        ])
+        self.assertIn("[Text box]\n\nBoxed caption.\n\n[Unsupported drawing]\n\n[/Text box]", prose)
+        self.assertIn("Legacy:[Unsupported pict]", prose)
+        self.assertIn("Wrapped:[Unsupported AlternateContent]", prose)
+        # Only the unread Fallback copy is still an unrendered part.
+        unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
+        self.assertEqual(unrendered, ["Unrendered package part: word/media/fallback.png; changes to its content are not compared."])
+        self.assertNotIn(MISSING_IMAGE_NOTE, stderr)
+
+    def test_external_and_dangling_images_are_recorded_without_reading_bytes(self) -> None:
+        body = (anchored("Linked:", picture("linked", "link")) + anchored("No relationship:", picture("nowhere"))
+                + anchored("No part:", picture("lost")))
+        relationships = (image_rel("linked", "https://example.invalid/figure.png", external=True)
+                         + image_rel("lost", "media/lost.png"))
+        prose, meta, stderr = self.export_images(body, relationships=relationships)
+        self.assertEqual(meta["images"], [
+            {"part": "word/document.xml", "target": "https://example.invalid/figure.png"},
+            {"part": "word/document.xml", "sha256": None},
+            {"part": "word/document.xml", "sha256": None},
+        ])
+        self.assertIn(MISSING_IMAGE_NOTE, meta["warnings"])
+        self.assertIn(MISSING_IMAGE_NOTE, stderr)
+        self.assertEqual(prose.count("[Unsupported drawing]"), 3)
+        self.cli("check", "essay.docx")
+
+    def test_unreferenced_media_still_warns_and_imageless_documents_record_an_empty_array(self) -> None:
+        prose, meta, stderr = self.export_images(paragraph("Plain prose."), extra={"word/media/image9.png": "orphan"})
+        self.assertEqual(meta["images"], [])
+        self.assertIn("Unrendered package part: word/media/image9.png; changes to its content are not compared.", meta["warnings"])
+        self.assertNotIn(IMAGE_NOTE, meta["warnings"])
+        prose, meta, stderr = self.export_images(paragraph("Plain prose."))
+        self.assertEqual(meta["images"], [])
 
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")

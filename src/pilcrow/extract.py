@@ -28,6 +28,12 @@ W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W}
+# Image references: DrawingML blips (r:embed internal, r:link external), the SVG copy
+# Word stores in a blip's extension list, and legacy VML image data.
+BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+SVG_BLIP = "{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip"
+IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
 # Shape content that a rendered text box still leaves out of the prose.
 UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
 TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
@@ -36,6 +42,9 @@ LIST_NOTE = ("List boundaries and indentation are retained; bullet and number fo
              "metadata, but counter values and bullet glyphs are not reconstructed.")
 UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
                      "list or level, or style-linked numbering); they are recorded as unknown.")
+IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
+                      "those images are recorded without a hash.")
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
@@ -83,6 +92,9 @@ class Reader:
         self.lists: dict[str, dict[str, Any]] = {}
         # Which list each list item belongs to, run-length encoded in traversal order.
         self.list_runs: list[dict[str, Any]] = []
+        # Image references in traversal order, and hashed media part -> (sha256, size).
+        self.images: list[dict[str, Any]] = []
+        self.media: dict[str, tuple[str, int]] = {}
         self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
@@ -160,6 +172,51 @@ class Reader:
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
                 or any(self.unrendered_shape_parts(child) for child in node))
 
+    def image_refs(self, node: Element) -> Iterator[list[str | None]]:
+        """Relationship IDs of each image in ``node``, in document order.
+
+        Text box content is skipped (it is read when the box renders), and only one
+        copy of an mc:AlternateContent is read: the text box branch, else the first
+        mc:Choice, else mc:Fallback.
+        """
+        if node.tag == w("txbxContent"):
+            return
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.branch(node)
+            if branch is None:
+                branch = next((c for c in node if c.tag == f"{{{MC}}}Choice"), node.find(f"{{{MC}}}Fallback"))
+            if branch is not None:
+                yield from self.image_refs(branch)
+            return
+        if node.tag in {BLIP, SVG_BLIP}:
+            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")]
+        elif node.tag == IMAGEDATA:
+            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)]
+        for child in node:
+            yield from self.image_refs(child)
+
+    def record_images(self, node: Element) -> None:
+        """Record each image in ``node`` by content hash (internal) or target (external)."""
+        for ids in self.image_refs(node):
+            entry: dict[str, Any] = {"part": self.part}
+            for rid in filter(None, ids):
+                rel = self.rels.get(rid)
+                if rel is not None and rel[2]:
+                    entry["target"] = rel[1]  # never fetched, like hyperlinks
+                elif rel is not None and rel[1] in self.names:
+                    if rel[1] not in self.media:
+                        data = self.package.read(rel[1])
+                        self.media[rel[1]] = (hashlib.sha256(data).hexdigest(), len(data))
+                    entry["sha256"], entry["bytes"] = self.media[rel[1]]
+                else:
+                    self.warn(MISSING_IMAGE_NOTE)
+                    entry.setdefault("sha256", None)
+            if len(entry) == 1:  # no relationship ID at all
+                self.warn(MISSING_IMAGE_NOTE)
+                entry["sha256"] = None
+            self.images.append(entry)
+            self.warn(IMAGE_NOTE)
+
     def anchor(self, node: Element) -> tuple[str, list[str]]:
         """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
         text, boxes = self.anchor_boxes(node)
@@ -229,6 +286,8 @@ class Reader:
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
         if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
             return "".join(self.inline(child) for child in branch)
+        if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
+            self.record_images(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
             if not self.unrendered_shape_parts(node):
@@ -504,6 +563,7 @@ class Reader:
             else:
                 prose.append(f"## {kind.title()} ({part})\n\n" + self.render_part(part, tree))
                 self.warn("Headers and footers are shown by part; page/section placement is not reconstructed.")
+        supported.update(self.media)
         for name in sorted(self.names):
             if name in supported or name.endswith("/") or name.endswith(".rels") or name == "[Content_Types].xml" or name.startswith("docProps/"):
                 continue
@@ -519,7 +579,7 @@ class Reader:
                     "review": self.review, "hyperlinks": self.links, "fields": self.fields,
                     "lists": [{**entry, "levels": [entry["levels"][k] for k in sorted(entry["levels"])]}
                               for entry in self.lists.values()],
-                    "list_runs": self.list_runs}
+                    "list_runs": self.list_runs, "images": self.images}
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 

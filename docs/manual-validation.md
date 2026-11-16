@@ -23,8 +23,10 @@ you are allowed to share. Do not use the only copy of important work.
 6. Insert/delete text with Track Changes on, add a comment, then export. Prose
    should include inserted text and omit deleted text. Review text/authors should
    appear in metadata. Inspect complex tracked structures in Word directly.
-7. Make a bold-only change and change an image. Export. No prose update is required;
-   coverage warnings should still make the limitation clear. Inspect in Word.
+7. Make a bold-only change and replace an image. Run `check`: expect exit 1 for the
+   image only. Export. No prose update is required; the `images` entry in metadata
+   should change, and coverage warnings should still make the limitation clear.
+   Inspect in Word.
 8. If using Zotero/fields, update citations/bibliography in Word before saving.
    Confirm saved display text appears in prose and code changes can affect the
    field fingerprints. Pilcrow does not refresh or verify the bibliography.
