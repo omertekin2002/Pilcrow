@@ -1020,6 +1020,24 @@ class CLITests(unittest.TestCase):
         self.assertEqual(unrendered, ["Unrendered package part: word/media/fallback.png; changes to its content are not compared."])
         self.assertNotIn(MISSING_IMAGE_NOTE, stderr)
 
+    def test_block_level_compatibility_copies_record_images_once(self) -> None:
+        def write(fallback: str) -> None:
+            choice = anchored("Choice:", picture("choice"))
+            backup = anchored("Fallback:", vml_picture("fallback"))
+            body = paragraph("Before.") + f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="wps">{choice}</mc:Choice><mc:Fallback>{backup}</mc:Fallback></mc:AlternateContent>'
+            make_docx(self.root / "essay.docx", body,
+                      extra={"word/media/choice.png": "choice bytes", "word/media/fallback.png": fallback},
+                      relationships=image_rel("choice", "media/choice.png") + image_rel("fallback", "media/fallback.png"))
+
+        write("fallback bytes")
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        # Prose still reads both copies, as before; only the mc:Choice image is recorded.
+        self.assertEqual(prose, b"Before.\n\nChoice:[Unsupported drawing]\n\nFallback:[Unsupported pict]\n")
+        self.assertEqual(json.loads(meta)["images"], [image_entry("choice bytes")])
+        write("changed fallback bytes")
+        self.cli("check", "essay.docx")
+
     def test_external_and_dangling_images_are_recorded_without_reading_bytes(self) -> None:
         body = (anchored("Linked:", picture("linked", "link")) + anchored("No relationship:", picture("nowhere"))
                 + anchored("No part:", picture("lost")))

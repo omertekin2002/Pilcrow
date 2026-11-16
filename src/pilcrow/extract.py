@@ -95,6 +95,8 @@ class Reader:
         # Image references in traversal order, and hashed media part -> (sha256, size).
         self.images: list[dict[str, Any]] = []
         self.media: dict[str, tuple[str, int]] = {}
+        # Inside an unselected mc:AlternateContent copy whose prose is still read.
+        self.unselected = 0
         self.field_stack: list[list[str]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
@@ -182,9 +184,7 @@ class Reader:
         if node.tag == w("txbxContent"):
             return
         if node.tag == f"{{{MC}}}AlternateContent":
-            branch = self.branch(node)
-            if branch is None:
-                branch = next((c for c in node if c.tag == f"{{{MC}}}Choice"), node.find(f"{{{MC}}}Fallback"))
+            branch = self.image_branch(node)
             if branch is not None:
                 yield from self.image_refs(branch)
             return
@@ -195,8 +195,17 @@ class Reader:
         for child in node:
             yield from self.image_refs(child)
 
+    def image_branch(self, alternate: Element) -> Element | None:
+        """The one copy of an mc:AlternateContent whose images are recorded."""
+        branch = self.branch(alternate)
+        if branch is None:
+            branch = next((c for c in alternate if c.tag == f"{{{MC}}}Choice"), alternate.find(f"{{{MC}}}Fallback"))
+        return branch
+
     def record_images(self, node: Element) -> None:
         """Record each image in ``node`` by content hash (internal) or target (external)."""
+        if self.unselected:
+            return
         for ids in self.image_refs(node):
             entry: dict[str, Any] = {"part": self.part}
             for rid in filter(None, ids):
@@ -424,6 +433,16 @@ class Reader:
                 continue
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
+            elif child.tag == f"{{{MC}}}AlternateContent":
+                # Without a text box every copy's prose is still read, but images come from one copy.
+                chosen, values = self.image_branch(child), []
+                for copy in child:
+                    self.unselected += copy is not chosen
+                    try:
+                        values.append(self.blocks(copy))
+                    finally:
+                        self.unselected -= copy is not chosen
+                value = "\n\n".join(v for v in values if v)
             elif child.tag in {w("altChunk"), w("drawing"), w("pict"), w("object")}:
                 text, boxes = self.anchor(child)
                 value = "\n\n".join(part for part in (text, *boxes) if part)
