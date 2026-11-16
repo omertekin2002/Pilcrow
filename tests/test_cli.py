@@ -612,6 +612,71 @@ class CLITests(unittest.TestCase):
         ])
         self.assertEqual(json.loads(meta)["list_runs"], [{"list": 1, "part": "word/document.xml", "items": 1}])
 
+    def test_equivalent_start_spellings_do_not_churn_and_changed_starts_are_stale(self) -> None:
+        body = list_item("Item.", "1")
+
+        def write(start: str, override: str | None = None) -> None:
+            overrides = "" if override is None else (
+                f'<w:lvlOverride w:ilvl="0"><w:startOverride w:val="{override}"/></w:lvlOverride>')
+            self.write_lists(body, numbering(abstract_num("0", level(0, "decimal", "%1.", start=start)),
+                                             num("1", "0", overrides)))
+
+        write("1")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        # A sign, leading zeroes and surrounding whitespace are valid xsd:integer spellings.
+        for start, override in (("+1", None), ("01", None), ("+001", None), (" 1 ", None), ("0" * 5000 + "1", None),
+                                ("9", "+1"), ("9", "001")):
+            with self.subTest(start=start[-8:], override=override):
+                write(start, override)
+                self.cli("check", "essay.docx")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+        previous = 1
+        steps: list[tuple[str, str | None, int]] = [
+            ("+5", None, 5), ("05", None, 5), ("1", "+3", 3), ("1", "+7", 7), ("1", "007", 7),
+            ("-05", None, -5), ("-5", None, -5), ("-0", None, 0), ("+", None, 0), ("+-1", None, 0),
+            ("1" + "0" * 10, None, 0), ("0" * 20 + "9" * 10, None, 9999999999),
+        ]
+        for start, override, expected in steps:
+            with self.subTest(start=start, override=override):
+                write(start, override)
+                self.cli("check", "essay.docx", code=1 if expected != previous else 0)
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported()[0], before[0])
+                self.assertEqual(self.exported_lists()[0]["levels"][0]["start"], expected)
+                previous = expected
+
+    def test_equivalent_level_and_id_spellings_resolve_the_same_definitions(self) -> None:
+        def write(*, ilvl: str = "1", num_id: str = "1", defined_num: str = "1", abstract_ref: str = "0",
+                  defined_level: str = "1", override_level: str = "1") -> None:
+            body = paragraph("Item.", f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>')
+            definition = f'<w:lvl w:ilvl="{defined_level}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>'
+            override = f'<w:lvlOverride w:ilvl="{override_level}"><w:startOverride w:val="4"/></w:lvlOverride>'
+            self.write_lists(body, numbering(abstract_num("0", level(0), definition), num(defined_num, abstract_ref, override)))
+
+        write()
+        result = self.cli("export", "essay.docx")
+        self.assertNotIn(UNKNOWN_LIST_NOTE, result.stderr)
+        before = self.exported()
+        resolved = [{"list": 1, "part": "word/document.xml",
+                     "levels": [{"level": 1, "format": "decimal", "text": "%2.", "start": 4}]}]
+        self.assertEqual(self.exported_lists(), resolved)
+        variants: list[dict[str, str]] = [
+            {"ilvl": "01"}, {"num_id": "01"}, {"num_id": "+1"}, {"defined_num": "+01"}, {"abstract_ref": "+0"},
+            {"abstract_ref": "00"}, {"defined_level": "01"}, {"defined_level": "+1"}, {"override_level": "+01"},
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                write(**variant)
+                self.cli("check", "essay.docx")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+        # Prose indentation is not re-read here: only the recorded level follows the signed spelling.
+        write(ilvl="+1")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported_lists(), resolved)
+
     def test_renumbered_ids_and_unused_definitions_do_not_churn(self) -> None:
         body = list_item("Bullet.", "1") + list_item("Nested.", "1", ilvl=1) + list_item("Numbered.", "2")
         self.write_lists(body, numbering(

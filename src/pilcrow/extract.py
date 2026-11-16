@@ -57,6 +57,23 @@ def attr(node: Element, name: str, default: str = "") -> str:
     return node.get(w(name), default)
 
 
+def decimal(value: str) -> int | None:
+    """Read an ST_DecimalNumber (xsd:integer): a sign and leading zeroes are valid.
+
+    At most ten significant digits, so a huge value cannot exceed int()'s digit limit.
+    """
+    match = re.fullmatch(r"([+-]?)0*([0-9]{1,10})", value.strip(" \t\r\n"))
+    if match is None:
+        return None
+    return -int(match[2]) if match[1] == "-" else int(match[2])
+
+
+def number_id(value: str) -> str:
+    """One spelling per numbering ID, so "1", "+1" and "01" name the same definition."""
+    number = decimal(value)
+    return value if number is None else str(number)
+
+
 class DocumentError(ValueError):
     """An input is unavailable or cannot be safely interpreted."""
 
@@ -376,7 +393,7 @@ class Reader:
         found = num.find("w:numId", NS)
         if found is None:
             found = next((n for p in props if (n := p.find("w:numPr/w:numId", NS)) is not None), None)
-        return attr(found, "val") if found is not None else None
+        return number_id(attr(found, "val")) if found is not None else None
 
     def numbering_level(self, paragraph: Element, props: list[Element], num: Element, style_id: str) -> int:
         """The level whose format is recorded: direct ilvl, else the level associated with the style."""
@@ -385,7 +402,7 @@ class Reader:
             num_id = self.list_id(props, num)
             definition = self.nums.get(num_id) if num_id is not None else None
             abstract_id = definition.find("w:abstractNumId", NS) if definition is not None else None
-            abstract = None if abstract_id is None else self.abstract_nums.get(attr(abstract_id, "val"))
+            abstract = None if abstract_id is None else self.abstract_nums.get(number_id(attr(abstract_id, "val")))
             seen = set()
             # A derived paragraph style may inherit its numbering from a basedOn style.
             # Match the nearest style first, independent of numbering-level XML order.
@@ -393,14 +410,14 @@ class Reader:
                 seen.add(style_id)
                 for lvl in abstract.findall("w:lvl", NS):
                     associated = lvl.find("w:pStyle", NS)
-                    depth = attr(lvl, "ilvl")
-                    if associated is not None and attr(associated, "val") == style_id and depth.isdigit():
-                        return int(depth)
+                    level = decimal(attr(lvl, "ilvl"))
+                    if associated is not None and attr(associated, "val") == style_id and level is not None and level >= 0:
+                        return level
                 based = self.styles[style_id].find("w:basedOn", NS)
                 style_id = attr(based, "val") if based is not None else ""
             ilvl = num.find("w:ilvl", NS)
-        depth = attr(ilvl, "val", "0") if ilvl is not None else "0"
-        return int(depth) if depth.isdigit() else 0
+        level = decimal(attr(ilvl, "val")) if ilvl is not None else None
+        return level if level is not None and level >= 0 else 0
 
     def record_list(self, props: list[Element], num: Element, level: int) -> None:
         """Fingerprint the effective format of one used list level, keyed by first use."""
@@ -422,14 +439,14 @@ class Reader:
         unknown = {"level": level, "format": "unknown", "text": "", "start": 0}
         num = self.nums.get(num_id) if num_id is not None else None
         abstract_id = num.find("w:abstractNumId", NS) if num is not None else None
-        abstract = None if abstract_id is None else self.abstract_nums.get(attr(abstract_id, "val"))
+        abstract = None if abstract_id is None else self.abstract_nums.get(number_id(attr(abstract_id, "val")))
         if num is None or abstract is None or abstract.find("w:numStyleLink", NS) is not None:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
-        override = next((o for o in num.findall("w:lvlOverride", NS) if attr(o, "ilvl") == str(level)), None)
+        override = next((o for o in num.findall("w:lvlOverride", NS) if decimal(attr(o, "ilvl")) == level), None)
         lvl = override.find("w:lvl", NS) if override is not None else None
         if lvl is None:
-            lvl = next((v for v in abstract.findall("w:lvl", NS) if attr(v, "ilvl") == str(level)), None)
+            lvl = next((v for v in abstract.findall("w:lvl", NS) if decimal(attr(v, "ilvl")) == level), None)
         if lvl is None:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
@@ -447,11 +464,10 @@ class Reader:
         start_override = override.find("w:startOverride", NS) if override is not None else None
         if start_override is not None:
             start = start_override
-        start_value = attr(start, "val") if start is not None else ""
         return {"level": level, "format": format_name,
                 "text": attr(text, "val") if text is not None else "",
-                # Bounded so a huge value cannot exceed int()'s digit limit.
-                "start": int(start_value) if re.fullmatch(r"-?[0-9]{1,10}", start_value) else 0}
+                # Absent, non-numeric and oversized values record 0.
+                "start": (decimal(attr(start, "val")) or 0) if start is not None else 0}
 
     def blocks(self, node: Element) -> str:
         parts = []
@@ -588,9 +604,9 @@ class Reader:
                     raise DocumentError(f"missing related part {target}")
                 numbering = self.xml(target)
                 for node in numbering.findall("w:num", NS):
-                    self.nums.setdefault(attr(node, "numId"), node)
+                    self.nums.setdefault(number_id(attr(node, "numId")), node)
                 for node in numbering.findall("w:abstractNum", NS):
-                    self.abstract_nums.setdefault(attr(node, "abstractNumId"), node)
+                    self.abstract_nums.setdefault(number_id(attr(node, "abstractNumId")), node)
                 supported.add(target)
         prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
