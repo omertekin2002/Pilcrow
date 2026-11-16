@@ -12,7 +12,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | --- | --- |
 | Paragraphs | Runs joined without artificial spaces; blank line between nonempty paragraphs |
 | Headings | Outline level, inherited paragraph styles, and conventional Heading1–9 style IDs; capped at six Markdown levels; heading numbering (e.g. `Chapter 1`) is neither rendered nor recorded in list metadata |
-| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, together with which list each item belongs to, so bullet/number/start changes and moves between lists make companions stale; the recorded level is the paragraph's own `ilvl`, else the level the numbering definition associates with its paragraph style (`w:lvl/w:pStyle`), while prose indentation follows only the nearest `numPr`'s `ilvl`, so the two can differ; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning; custom formats such as `001, 002, …` record their pattern; bullet fonts, legal numbering, suffixes, and level restarts are not recorded |
+| Lists | Item and indentation boundaries from direct/inherited `numPr`; generic `-` marker in prose; each used list's effective format per used level (`numFmt`, `lvlText`, start value, after `lvlOverride`/`startOverride`) recorded in metadata, together with which list and level each item belongs to, so bullet/number/start changes and moves between lists or levels make companions stale; the recorded level is the paragraph's own `ilvl`, else the level the numbering definition associates with its paragraph style (`w:lvl/w:pStyle`), while prose indentation follows only the nearest `numPr`'s `ilvl`, so the two can differ; counter values and bullet glyphs are not reconstructed and trigger a warning; unresolvable formats (no numbering part, unknown list or level, `numStyleLink`) are recorded as `unknown` with a warning; custom formats such as `001, 002, …` record their pattern; bullet fonts, legal numbering, suffixes, and level restarts are not recorded |
 | Tables | Explicit table, row, and cell markers, including empty cells; nested tables and content-control wrappers; grid spans/vertical merge markers retained, no rendered grid/layout |
 | Footnotes/endnotes | Related parts with reference markers; separator notes omitted; IDs retained, so renumbering can produce diffs |
 | Headers/footers | Related parts shown as separate sections by part name; no page/section placement mapping |
@@ -51,10 +51,11 @@ destinations, field fingerprints, list formats, and image hashes. `lists` has on
 list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
 Word's `numId`, which can change on save), with the part where it is first used
 and the format, level text, and start value of each level its items use.
-`list_runs` records which list each list item belongs to, as runs of consecutive
-list items (other paragraphs in between are skipped) of the same list in the same
-part, so moving an item between lists is a metadata change; inserting an item
-changes only one count. `images` has one entry per image reference in
+`list_runs` records which list and level each list item belongs to, as runs of
+consecutive list items (other paragraphs in between are skipped) of the same list
+and level in the same part, so moving an item between lists, or between levels
+that its paragraph style selects without changing the prose indentation, is a
+metadata change; inserting an item changes only one count. `images` has one entry per image reference in
 traversal order with its story `part` and either `sha256`/`bytes` of the media
 part (internal) or `target` (external link); a dangling reference has a null
 `sha256`. Media file names are not recorded because Word renumbers them on save,

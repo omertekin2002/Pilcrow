@@ -560,6 +560,44 @@ class CLITests(unittest.TestCase):
                     self.assertNotEqual(after[1], before[1])
                     self.assertEqual(self.exported_lists()[0]["levels"][0]["format"], "decimal")
 
+    def test_swapping_styles_associated_with_different_levels_is_stale(self) -> None:
+        # Both styles share one numId and carry no ilvl, so prose and the used levels stay the same;
+        # only which item takes which level's format changes.
+        styles = f'<w:styles xmlns:w="{W}">' + "".join(
+            f'<w:style w:type="paragraph" w:styleId="{style}">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>' for style in ("Bulleted", "Numbered")
+        ) + "</w:styles>"
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+
+        def write(*applied: str) -> None:
+            body = "".join(paragraph(text, f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>')
+                           for text, style in zip(("Alpha.", "Beta.", "Gamma."), applied, strict=True))
+            self.write_lists(body, numbering(abstract_num("0", level(0, style="Bulleted"),
+                                                          level(1, "decimal", "%2.", style="Numbered")),
+                                             num("1", "0")),
+                             extra={"word/styles.xml": styles}, relationships=relationships)
+
+        def runs() -> list[dict[str, object]]:
+            return [{"level": run["level"], "items": run["items"]} for run in json.loads(self.exported()[1])["list_runs"]]
+
+        write("Bulleted", "Numbered", "Numbered")
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(before[0], b"- Alpha.\n\n- Beta.\n\n- Gamma.\n")
+        self.assertEqual(runs(), [{"level": 0, "items": 1}, {"level": 1, "items": 2}])
+        for applied in (("Numbered", "Bulleted", "Numbered"), ("Numbered", "Numbered", "Bulleted")):
+            with self.subTest(applied=applied):
+                write(*applied)
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0], "the swap must not alter the prose")
+                self.assertEqual(json.loads(after[1])["lists"], json.loads(before[1])["lists"])
+                self.assertNotEqual(after[1], before[1])
+                write("Bulleted", "Numbered", "Numbered")
+                self.cli("export", "essay.docx")
+                self.assertEqual(self.exported(), before)
+
     def test_direct_list_level_overrides_style_association(self) -> None:
         styles = (
             f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'
@@ -610,7 +648,8 @@ class CLITests(unittest.TestCase):
             {"list": 1, "part": "word/document.xml",
              "levels": [{"level": 1, "format": "decimal", "text": "%2.", "start": 1}]},
         ])
-        self.assertEqual(json.loads(meta)["list_runs"], [{"list": 1, "part": "word/document.xml", "items": 1}])
+        self.assertEqual(json.loads(meta)["list_runs"],
+                         [{"list": 1, "part": "word/document.xml", "level": 1, "items": 1}])
 
     def test_equivalent_start_spellings_do_not_churn_and_changed_starts_are_stale(self) -> None:
         body = list_item("Item.", "1")
@@ -741,11 +780,12 @@ class CLITests(unittest.TestCase):
         ])
         self.assertNotIn("word/numbering.xml", self.exported()[1].decode("utf-8"))
         self.assertEqual(json.loads(self.exported()[1])["list_runs"], [
-            {"list": 1, "part": "word/document.xml", "items": 1},
-            {"list": 2, "part": "word/document.xml", "items": 2},
-            {"list": 1, "part": "word/document.xml", "items": 1},
-            {"list": 1, "part": "word/header1.xml", "items": 1},
-            {"list": 3, "part": "word/header1.xml", "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 2, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 1, "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 1, "part": "word/header1.xml", "level": 0, "items": 1},
+            {"list": 3, "part": "word/header1.xml", "level": 0, "items": 1},
         ])
 
     def test_list_in_a_text_box_counts_after_its_anchoring_item(self) -> None:
@@ -770,10 +810,10 @@ class CLITests(unittest.TestCase):
         self.cli("export", "essay.docx")
         before = self.exported()
         self.assertEqual(json.loads(before[1])["list_runs"], [
-            {"list": 1, "part": "word/document.xml", "items": 1},
-            {"list": 2, "part": "word/document.xml", "items": 1},
-            {"list": 1, "part": "word/document.xml", "items": 1},
-            {"list": 2, "part": "word/document.xml", "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 1, "part": "word/document.xml", "level": 0, "items": 1},
+            {"list": 2, "part": "word/document.xml", "level": 0, "items": 1},
         ])
         for ids in (("1", "2", "2", "2"), ("1", "2", "2", "1")):
             with self.subTest(ids=ids):

@@ -428,11 +428,14 @@ class Reader:
         entry = self.lists.setdefault(key, {"list": len(self.lists) + 1, "part": self.part, "levels": {}})
         if level not in entry["levels"]:
             entry["levels"][level] = self.list_level(num_id, level)
+        # The level is part of a run: items of one list can take different formats from their levels
+        # without any difference in prose, when the level comes from the paragraph style.
+        run = {"list": entry["list"], "part": self.part, "level": level}
         last = self.list_runs[-1] if self.list_runs else None
-        if last is not None and last["list"] == entry["list"] and last["part"] == self.part:
+        if last is not None and all(last[key] == value for key, value in run.items()):
             last["items"] += 1
         else:
-            self.list_runs.append({"list": entry["list"], "part": self.part, "items": 1})
+            self.list_runs.append({**run, "items": 1})
 
     def list_level(self, num_id: str | None, level: int) -> dict[str, Any]:
         """Resolve w:num -> w:abstractNum -> w:lvl, applying w:lvlOverride."""
