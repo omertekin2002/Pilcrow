@@ -27,11 +27,13 @@ you are allowed to share. Do not use the only copy of important work.
    exit 0, because formatting is not compared. Keep Track Changes off for the next
    step. Word stores a tracked formatting change as a revision, which can add a
    "Tracked formatting or structure changes" warning to metadata and make `check`
-   exit 1 whether or not the image change is detected.
+   exit 1 whether or not the image change is detected. Then commit the DOCX and
+   companions in Desktop, so the next step's diff starts from here and not from
+   the commit in step 2.
 8. Replace an image, save, and run `check`: expect exit 1, for the image only.
-   Export and inspect the metadata diff. No prose update is required; only the
-   `images` entry should change, and coverage warnings should still make the
-   limitation clear. Inspect in Word.
+   Export and inspect the metadata diff against the commit from step 7. No prose
+   update is required; only the `images` entry should change, and coverage
+   warnings should still make the limitation clear. Inspect in Word.
 9. If using Zotero/fields, update citations/bibliography in Word before saving.
    Confirm saved display text appears in prose and code changes can affect the
    field fingerprints. Pilcrow does not refresh or verify the bibliography.
