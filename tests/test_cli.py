@@ -598,6 +598,55 @@ class CLITests(unittest.TestCase):
                 self.cli("export", "essay.docx")
                 self.assertEqual(self.exported(), before)
 
+    def test_style_associations_follow_level_overrides(self) -> None:
+        # A w:lvl inside w:lvlOverride replaces the abstract level, its w:pStyle association included.
+        styles = (
+            f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="Clause">'
+            '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>'
+        )
+        relationships = f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>'
+        body = paragraph("Clause item.", '<w:pPr><w:pStyle w:val="Clause"/></w:pPr>')
+
+        def override(ilvl: int, content: str) -> str:
+            return f'<w:lvlOverride w:ilvl="{ilvl}">{content}</w:lvlOverride>'
+
+        cases = {
+            # The association exists only on the override of level 1.
+            "override only": (abstract_num("0", level(0), level(1, "decimal", "%2.")),
+                              lambda fmt: override(1, level(1, fmt, "%2.", style="Clause"))),
+            # The override of level 0 drops the abstract association; the override of level 1 adds one.
+            "moved by overrides": (abstract_num("0", level(0, style="Clause"), level(1, "decimal", "%2.")),
+                                   lambda fmt: override(0, level(0)) + override(1, level(1, fmt, "%2.", style="Clause"))),
+            # An override without w:lvl leaves the abstract level, and its association, in place.
+            "start override keeps it": (abstract_num("0", level(0), level(1, "decimal", "%2.", style="Clause")),
+                                        lambda fmt: override(1, '<w:startOverride w:val="1"/>')
+                                        + override(2, level(2, fmt, "%3."))),
+        }
+        for name, (abstract, overrides) in cases.items():
+            with self.subTest(name):
+                def write(fmt: str, abstract: str = abstract, overrides: Any = overrides) -> None:
+                    self.write_lists(body, numbering(abstract, num("1", "0", overrides(fmt))),
+                                     extra={"word/styles.xml": styles}, relationships=relationships)
+
+                write("lowerRoman")
+                self.cli("export", "essay.docx")
+                before = self.exported()
+                self.assertEqual(before[0], b"- Clause item.\n")
+                recorded = self.exported_lists()[0]["levels"]
+                self.assertEqual([entry["level"] for entry in recorded], [1])
+                write("upperRoman")
+                if name == "start override keeps it":
+                    # Level 2 is unused, so its format is not recorded.
+                    self.assertEqual(recorded[0]["format"], "decimal")
+                    self.cli("check", "essay.docx")
+                    continue
+                self.assertEqual(recorded[0]["format"], "lowerRoman")
+                self.cli("check", "essay.docx", code=1)
+                self.cli("export", "essay.docx")
+                after = self.exported()
+                self.assertEqual(after[0], before[0])
+                self.assertEqual(self.exported_lists()[0]["levels"][0]["format"], "upperRoman")
+
     def test_direct_list_level_overrides_style_association(self) -> None:
         styles = (
             f'<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="NestedList">'

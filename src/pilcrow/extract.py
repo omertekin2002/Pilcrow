@@ -403,21 +403,39 @@ class Reader:
             definition = self.nums.get(num_id) if num_id is not None else None
             abstract_id = definition.find("w:abstractNumId", NS) if definition is not None else None
             abstract = None if abstract_id is None else self.abstract_nums.get(number_id(attr(abstract_id, "val")))
+            levels = {} if definition is None or abstract is None else self.effective_levels(definition, abstract)
             seen = set()
             # A derived paragraph style may inherit its numbering from a basedOn style.
             # Match the nearest style first, independent of numbering-level XML order.
-            while abstract is not None and style_id in self.styles and style_id not in seen:
+            while levels and style_id in self.styles and style_id not in seen:
                 seen.add(style_id)
-                for lvl in abstract.findall("w:lvl", NS):
+                for number, lvl in levels.items():
                     associated = lvl.find("w:pStyle", NS)
-                    level = decimal(attr(lvl, "ilvl"))
-                    if associated is not None and attr(associated, "val") == style_id and level is not None and level >= 0:
-                        return level
+                    if associated is not None and attr(associated, "val") == style_id:
+                        return number
                 based = self.styles[style_id].find("w:basedOn", NS)
                 style_id = attr(based, "val") if based is not None else ""
             ilvl = num.find("w:ilvl", NS)
         level = decimal(attr(ilvl, "val")) if ilvl is not None else None
         return level if level is not None and level >= 0 else 0
+
+    def effective_levels(self, num: Element, abstract: Element) -> dict[int, Element]:
+        """Each level's w:lvl once w:lvlOverride is applied, abstract levels first in document order."""
+        levels: dict[int, Element] = {}
+        for lvl in abstract.findall("w:lvl", NS):
+            number = decimal(attr(lvl, "ilvl"))
+            if number is not None and number >= 0:
+                levels.setdefault(number, lvl)
+        overridden = set()
+        for override in num.findall("w:lvlOverride", NS):
+            number = decimal(attr(override, "ilvl"))
+            if number is None or number < 0 or number in overridden:
+                continue  # the first override of a level is the one that applies
+            overridden.add(number)
+            replacement = override.find("w:lvl", NS)
+            if replacement is not None:  # replaces the whole level, style association included
+                levels[number] = replacement
+        return levels
 
     def record_list(self, props: list[Element], num: Element, level: int) -> None:
         """Fingerprint the effective format of one used list level, keyed by first use."""
@@ -447,9 +465,7 @@ class Reader:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
         override = next((o for o in num.findall("w:lvlOverride", NS) if decimal(attr(o, "ilvl")) == level), None)
-        lvl = override.find("w:lvl", NS) if override is not None else None
-        if lvl is None:
-            lvl = next((v for v in abstract.findall("w:lvl", NS) if decimal(attr(v, "ilvl")) == level), None)
+        lvl = self.effective_levels(num, abstract).get(level)
         if lvl is None:
             self.warn(UNKNOWN_LIST_NOTE)
             return unknown
