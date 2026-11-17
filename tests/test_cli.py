@@ -201,6 +201,45 @@ def make_docx(
             archive.writestr(info, content.encode("utf-8"))
 
 
+COMMENTS_REL = f'<Relationship Id="comments" Type="{R}/comments" Target="comments.xml"/>'
+COMMENT_NOTE = (
+    "Comment text, authors, and anchored text are recorded; "
+    "threads, dates, and resolution status are not compared."
+)
+UNANCHORED_COMMENT_NOTE = (
+    "Some comments are not anchored in any rendered part; "
+    "their anchor is recorded as null."
+)
+UNCLOSED_COMMENT_NOTE = (
+    "Some comment ranges are missing a start or an end; their anchors run "
+    "from the start or to the end of the story part."
+)
+
+
+def run(text: str) -> str:
+    return f'<w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r>'
+
+
+def start(comment: str) -> str:
+    return f'<w:commentRangeStart w:id="{comment}"/>'
+
+
+def end(comment: str) -> str:
+    """A range end followed by the reference run, as Word writes it."""
+    return f'<w:commentRangeEnd w:id="{comment}"/>' + reference(comment)
+
+
+def reference(comment: str) -> str:
+    return f'<w:r><w:commentReference w:id="{comment}"/></w:r>'
+
+
+def comments_part(comments: dict[str, str]) -> str:
+    """word/comments.xml with one comment by Ada per ID, in the given order."""
+    return f'<w:comments xmlns:w="{W}">' + "".join(
+        f'<w:comment w:id="{comment}" w:author="Ada">{paragraph(text)}</w:comment>'
+        for comment, text in comments.items()) + "</w:comments>"
+
+
 class CLITests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-test-")
@@ -1427,6 +1466,131 @@ class CLITests(unittest.TestCase):
         self.assertEqual(before[0], after[0])
         self.assertIn(b"Clarified, thank you.", after[1])
         self.assertNotEqual(before[1], after[1])
+
+    def write_commented(self, body: str, comments: dict[str, str] | None = None, *,
+                        extra: dict[str, str] | None = None, relationships: str = "") -> None:
+        make_docx(self.root / "essay.docx", body,
+                  extra={"word/comments.xml": comments_part(comments or {"1": "Note."}), **(extra or {})},
+                  relationships=COMMENTS_REL + relationships)
+
+    def comment_anchors(self) -> dict[str, tuple[str | None, str | None]]:
+        """Each exported comment's text -> (anchor, anchor_part)."""
+        review = json.loads(self.exported()[1])["review"]
+        return {item["text"]: (item["anchor"], item["anchor_part"]) for item in review if item["kind"] == "comment"}
+
+    def test_moving_or_resizing_a_comment_range_is_stale_in_metadata_only(self) -> None:
+        def write(before: str, anchored: str, after: str) -> None:
+            self.write_commented(f"<w:p>{run(before)}{start('1')}{run(anchored)}{end('1')}{run(after)}</w:p>")
+        write("The ", "first sentence.", " The second sentence.")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {"Note.": ("first sentence.", "word/document.xml")})
+        prose = self.exported()[0]
+        for text in [("The first sentence. The ", "second sentence.", ""),  # moved
+                     ("The ", "first sentence. The second", " sentence."),  # widened
+                     ("The first ", "sentence.", " The second sentence.")]:  # narrowed
+            before = self.exported()[1]
+            write(*text)
+            self.cli("check", "essay.docx", code=1)
+            self.cli("export", "essay.docx")
+            self.cli("check", "essay.docx")
+            self.assertEqual(self.exported()[0], prose)
+            self.assertNotEqual(self.exported()[1], before)
+            self.assertEqual(self.comment_anchors()["Note."][0], text[1].strip())
+
+    def test_renumbered_comment_ids_and_run_splits_do_not_churn(self) -> None:
+        self.write_commented(f"<w:p>{run('Keep ')}{start('1')}{run('this phrase')}{end('1')}{run(' here.')}</w:p>"
+                             f"<w:p>{start('2')}{run('Second.')}{end('2')}</w:p>",
+                             {"1": "First note.", "2": "Second note."})
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        # Word renumbers comments on save; split runs, proofing marks and bookmarks are save churn.
+        split = (f"<w:p>{run('Keep ')}{start('41')}<w:proofErr w:type=\"spellStart\"/>{run('thi')}{run('s ph')}"
+                 f'<w:bookmarkStart w:id="0" w:name="mark"/>{run("rase")}<w:bookmarkEnd w:id="0"/>'
+                 f"<w:proofErr w:type=\"spellEnd\"/>{end('41')}{run(' here.')}</w:p>"
+                 f"<w:p>{start('007')}<w:r><w:t>Sec</w:t><w:t>ond.</w:t></w:r>{end('7')}</w:p>")
+        self.write_commented(split, {"41": "First note.", "7": "Second note."})
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before)
+        meta = json.loads(before[1])
+        self.assertNotIn('"41"', before[1].decode())
+        self.assertIn(COMMENT_NOTE, meta["warnings"])
+        self.assertNotIn(UNANCHORED_COMMENT_NOTE, meta["warnings"])
+
+    def test_comment_anchors_use_the_accepted_view(self) -> None:
+        body = (f"<w:p>{start('1')}{run('Kept')}"
+                '<w:ins w:id="10" w:author="Ben"><w:r><w:t xml:space="preserve"> added</w:t></w:r></w:ins>'
+                '<w:del w:id="11" w:author="Ben"><w:r><w:delText xml:space="preserve"> removed</w:delText></w:r></w:del>'
+                '<w:r><w:tab/><w:t>after</w:t><w:br/><w:t>a break</w:t></w:r>'
+                f"{end('1')}</w:p>"
+                # A range that ends inside deleted text still closes.
+                f"<w:p>{start('2')}{run('Before deletion')}"
+                f'<w:del w:id="12" w:author="Ben"><w:r><w:delText>gone</w:delText></w:r><w:commentRangeEnd w:id="2"/></w:del>'
+                f"{reference('2')}{run(' outside.')}</w:p>")
+        self.write_commented(body, {"1": "Accepted.", "2": "Ends in a deletion."})
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {"Accepted.": ("Kept added after a break", "word/document.xml"),
+                                                  "Ends in a deletion.": ("Before deletion", "word/document.xml")})
+        self.assertNotIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
+
+    def test_overlapping_nested_multi_paragraph_cell_and_note_ranges(self) -> None:
+        footnotes = (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{run("Note ")}{start("6")}'
+                     f'{run("anchored text")}{end("6")}</w:p></w:footnote></w:footnotes>')
+        body = (f"<w:p>{start('1')}{run('Alpha ')}{start('2')}{run('beta ')}{end('1')}{run('gamma')}{end('2')}</w:p>"
+                f"<w:p>{start('3')}{run('Outer ')}{start('4')}{run('inner')}{end('4')}{run(' outer.')}{end('3')}</w:p>"
+                f"<w:p>{run('One ')}{start('5')}{run('paragraph')}</w:p>{paragraph('Next paragraph')}"
+                f"<w:p>{run('ends')}{end('5')}</w:p>"
+                f"<w:tbl><w:tr><w:tc><w:p>{run('Cell ')}{start('7')}{run('one')}</w:p></w:tc>"
+                f"<w:tc><w:p>{run('cell two')}{end('7')}</w:p></w:tc></w:tr></w:tbl>"
+                # Block-level markers between paragraphs, as Word writes for whole-paragraph ranges.
+                f"{start('8')}{paragraph('Whole paragraph.')}<w:commentRangeEnd w:id=\"8\"/>"
+                f"<w:p><w:r><w:footnoteReference w:id=\"1\"/></w:r>{reference('8')}</w:p>")
+        comments = {str(n): f"Comment {n}." for n in range(1, 9)}
+        self.write_commented(body, comments, extra={"word/footnotes.xml": footnotes},
+                             relationships=f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        self.cli("export", "essay.docx")
+        body_part = "word/document.xml"
+        self.assertEqual(self.comment_anchors(), {
+            "Comment 1.": ("Alpha beta", body_part),
+            "Comment 2.": ("beta gamma", body_part),
+            "Comment 3.": ("Outer inner outer.", body_part),
+            "Comment 4.": ("inner", body_part),
+            "Comment 5.": ("paragraph Next paragraph ends", body_part),
+            "Comment 6.": ("anchored text", "word/footnotes.xml"),
+            "Comment 7.": ("one cell two", body_part),
+            "Comment 8.": ("Whole paragraph.", body_part),
+        })
+        # Moving a comment from the body to a note with the same anchored text changes anchor_part.
+        footnotes = (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{run("Note ")}{start("1")}'
+                     f'{run("Alpha beta")}{end("1")}</w:p></w:footnote></w:footnotes>')
+        body = (f"<w:p>{run('Alpha ')}{run('beta')}</w:p>"
+                f"<w:p><w:r><w:footnoteReference w:id=\"1\"/></w:r></w:p>")
+        self.write_commented(body, {"1": "Comment 1."}, extra={"word/footnotes.xml": footnotes},
+                             relationships=f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {"Comment 1.": ("Alpha beta", "word/footnotes.xml")})
+
+    def test_point_unreferenced_and_unclosed_comments(self) -> None:
+        body = (f"<w:p>{run('Point here')}{reference('1')}{run(' and ')}{start('2')}{end('2')}{run('empty.')}</w:p>"
+                f"<w:p>{run('Unclosed ')}{start('4')}{run('to the end')}</w:p>{paragraph('of the body.')}")
+        self.write_commented(body, {"1": "Point.", "2": "Empty.", "3": "Nowhere.", "4": "Unclosed."})
+        result = self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {
+            "Point.": ("", "word/document.xml"),
+            "Empty.": ("", "word/document.xml"),
+            "Nowhere.": (None, None),
+            "Unclosed.": ("to the end of the body.", "word/document.xml"),
+        })
+        warnings = json.loads(self.exported()[1])["warnings"]
+        self.assertIn(UNANCHORED_COMMENT_NOTE, warnings)
+        self.assertIn(UNCLOSED_COMMENT_NOTE, warnings)
+        self.assertIn("null", result.stderr)
+        # An end without a start runs from the start of its part.
+        self.write_commented(f"{paragraph('From the start')}<w:p>{run('to here')}{end('1')}{run(' only.')}</w:p>")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {"Note.": ("From the start to here", "word/document.xml")})
+        self.assertIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
+        self.assertNotIn(UNANCHORED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
 
     def test_table_content_controls_and_cell_boundaries(self) -> None:
         body = '<w:tbl><w:sdt><w:sdtContent><w:tr><w:sdt><w:sdtContent><w:tc>'

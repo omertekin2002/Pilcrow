@@ -254,7 +254,11 @@ between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; th
 box's position, wrapping, and shape formatting are not compared. Images, charts,
 equations, and embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
-companions stale (size, position, cropping, and alt text are not compared). Formatting-only edits can
+companions stale (size, position, cropping, and alt text are not compared).
+Comments stay out of the prose; their text, author, and anchored text (the
+accepted text their range covers, and the part it is in) are recorded in metadata,
+so editing a comment or moving, widening, or narrowing its range makes companions
+stale (threads, dates, and resolved state are not compared). Formatting-only edits can
 leave both companions unchanged and still matter in Word.
 
 Upgrading from a version that left text box text out: documents with text boxes
@@ -271,6 +275,11 @@ Upgrading from a version that did not record image hashes: every document report
 stale companions once, because `.meta.json` now always has an `images` key
 (empty for documents without images). This ships with the list-format change
 above, so one `pilcrow export` and commit covers both.
+
+Upgrading from a version that did not record comment anchors: documents with
+comments report stale companions once, because each comment in `.meta.json` now
+has `anchor` and `anchor_part` keys. Run `pilcrow export` and commit the refreshed
+companions. Documents without comments are unaffected.
 
 Run the generated-fixture suite:
 

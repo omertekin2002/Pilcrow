@@ -45,12 +45,21 @@ UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numb
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
+COMMENT_NOTE = ("Comment text, authors, and anchored text are recorded; "
+                "threads, dates, and resolution status are not compared.")
+UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part; "
+                           "their anchor is recorded as null.")
+UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
+                         "from the start or to the end of the story part.")
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
 
 def w(name: str) -> str:
     return f"{{{W}}}{name}"
+
+
+COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
 
 
 def attr(node: Element, name: str, default: str = "") -> str:
@@ -98,7 +107,7 @@ class Reader:
         self.warnings: set[str] = {
             "Formatting and page layout are not compared; unchanged prose is not an identical document."
         }
-        self.review: list[dict[str, str]] = []
+        self.review: list[dict[str, str | None]] = []
         self.links: list[dict[str, str]] = []
         self.fields: list[dict[str, str]] = []
         self.styles: dict[str, Element] = {}
@@ -120,6 +129,15 @@ class Reader:
         self.features: Counter[str] = Counter()
         # Text boxes found while reading a paragraph, rendered as blocks after it.
         self.anchored: list[list[Element]] = []
+        # The current story part's rendered text in fragments, in the accepted view, so a
+        # comment range is the fragments between the offsets of its start and end markers.
+        self.story: list[str] = []
+        # Open comment range ID -> fragment offset of its start, for the current part.
+        self.open_ranges: dict[str, int] = {}
+        # Comment ID -> (anchored text, part holding the range start); the first range wins.
+        self.comment_ranges: dict[str, tuple[str, str]] = {}
+        # Comment ID -> part of its first w:commentReference, for comments without a range.
+        self.comment_refs: dict[str, str] = {}
 
     def xml(self, name: str) -> Element:
         try:
@@ -246,6 +264,36 @@ class Reader:
             self.images.append(entry)
             self.warn(IMAGE_NOTE)
 
+    def emit(self, text: str, anchored: str | None = None) -> str:
+        """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
+        if not self.unselected:
+            self.story.append(text if anchored is None else anchored)
+        return text
+
+    def comment_marker(self, node: Element) -> None:
+        """Track a comment range start/end or reference by its ID; the ID itself is not recorded."""
+        if self.unselected:
+            return
+        comment = number_id(attr(node, "id"))
+        if node.tag == w("commentReference"):
+            self.comment_refs.setdefault(comment, self.part)
+        elif node.tag == w("commentRangeStart"):
+            self.open_ranges.setdefault(comment, len(self.story))
+        else:
+            start = self.open_ranges.pop(comment, None)
+            if start is None:
+                self.warn(UNCLOSED_COMMENT_NOTE)
+            self.close_range(comment, start or 0)
+
+    def close_range(self, comment: str, start: int) -> None:
+        self.comment_ranges.setdefault(comment, (normalize("".join(self.story[start:])), self.part))
+
+    def skip_markers(self, node: Element) -> None:
+        """Track the comment markers in content that is not rendered, such as tracked deletions."""
+        for descendant in node.iter():
+            if descendant.tag in COMMENT_MARKERS:
+                self.comment_marker(descendant)
+
     def anchor(self, node: Element) -> tuple[str, list[str]]:
         """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
         text, boxes = self.anchor_boxes(node)
@@ -269,24 +317,28 @@ class Reader:
             self.review.append({"kind": local, "author": attr(node, "author"),
                                 "text": self.raw_text(node), "part": self.part})
             if local in {"del", "moveFrom"}:
+                self.skip_markers(node)
                 return ""
+        if tag in COMMENT_MARKERS:
+            self.comment_marker(node)
+            return ""
         if tag == w("t"):
             # XML source line wrapping is whitespace, unlike Word's explicit w:br.
-            return re.sub(r"\s", " ", node.text or "")
+            return self.emit(re.sub(r"\s", " ", node.text or ""))
         if tag == w("delText"):
             return ""
         if tag in {w("br"), w("cr")}:
-            return "\n"
+            return self.emit("\n", " ")
         if tag == w("tab"):
-            return " "
+            return self.emit(" ")
         if tag == w("noBreakHyphen"):
-            return "\u2011"
+            return self.emit("\u2011")
         if tag == w("softHyphen"):
-            return "\u00ad"
+            return self.emit("\u00ad")
         if tag in {w("footnoteReference"), w("endnoteReference")}:
             kind = "footnote" if tag == w("footnoteReference") else "endnote"
             self.features[kind + " references"] += 1
-            return f"[^{kind}-{attr(node, 'id')}]"
+            return self.emit(f"[^{kind}-{attr(node, 'id')}]")
         if tag == w("hyperlink"):
             rid = node.get(f"{{{R}}}id")
             rel = self.rels.get(rid)
@@ -324,7 +376,7 @@ class Reader:
         if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
-            return f"[Unsupported {local}]"
+            return self.emit(f"[Unsupported {local}]")
         if tag in {w("pPr"), w("rPr"), w("sdtPr"), w("sdtEndPr")}:
             return ""
         return "".join(self.inline(child) for child in node)
@@ -354,6 +406,7 @@ class Reader:
 
     def paragraph(self, node: Element) -> str:
         text, boxes = self.anchor_boxes(node)
+        self.emit("", " ")  # a paragraph boundary is a space in comment anchors
         # Render the paragraph before its boxes so list first use follows prose order.
         own = self.paragraph_text(node, text)
         return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
@@ -497,6 +550,9 @@ class Reader:
                 value = self.table(child)
             elif child.tag in {w("sectPr"), w("tcPr"), w("trPr"), w("tblPr"), w("tblGrid"), w("sdtPr"), w("sdtEndPr")}:
                 continue
+            elif child.tag in COMMENT_MARKERS:
+                self.comment_marker(child)  # block-level range markers, e.g. between paragraphs
+                continue
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
@@ -535,6 +591,8 @@ class Reader:
                 yield from self.table_items(child, tag)
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)
+            elif child.tag in COMMENT_MARKERS:
+                self.comment_marker(child)
 
     def table(self, node: Element) -> str:
         self.features["tables"] += 1
@@ -543,6 +601,7 @@ class Reader:
         for row in self.table_items(node, "tr"):
             if row.find("w:trPr/w:del", NS) is not None:
                 self.warn("Tracked table structure changes are only partially represented; inspect the DOCX.")
+                self.skip_markers(row)
                 continue
             lines.append("[Row]")
             for cell in self.table_items(row, "tc"):
@@ -595,8 +654,14 @@ class Reader:
 
     def render_part(self, part: str, tree: Element) -> str:
         self.part, self.rels = part, self.relationships(part)
+        self.story, self.open_ranges = [], {}
         self.audit(tree)
         value = self.blocks(tree)
+        if self.open_ranges:
+            self.warn(UNCLOSED_COMMENT_NOTE)
+            for comment, start in self.open_ranges.items():
+                self.close_range(comment, start)
+            self.open_ranges = {}
         if self.field_stack:
             self.warn("Unclosed field codes found; saved display text may be incomplete.")
             while self.field_stack:
@@ -631,6 +696,8 @@ class Reader:
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
                           if kind in {"footnotes", "endnotes", "comments", "header", "footer"} and not external})
+        # Comment entries keep their place in review; anchors are filled in once every story is read.
+        comments: list[tuple[str, dict[str, str | None]]] = []
         for kind, part in stories:
             if part not in self.names:
                 raise DocumentError(f"missing related part {part}")
@@ -639,9 +706,11 @@ class Reader:
             if kind == "comments":
                 self.audit(tree)
                 for comment in tree:
-                    self.review.append({"kind": "comment", "author": attr(comment, "author"),
-                                        "text": self.raw_text(comment), "part": part})
-                self.warn("Comment text and authors are recorded; anchors, threads, dates, and resolution status are not compared.")
+                    entry: dict[str, str | None] = {"kind": "comment", "author": attr(comment, "author"),
+                                                    "text": self.raw_text(comment), "part": part}
+                    self.review.append(entry)
+                    comments.append((number_id(attr(comment, "id")), entry))
+                self.warn(COMMENT_NOTE)
             elif kind in {"footnotes", "endnotes"}:
                 for note in tree:
                     if attr(note, "type") in {"separator", "continuationSeparator", "continuationNotice"}:
@@ -651,6 +720,14 @@ class Reader:
             else:
                 prose.append(f"## {kind.title()} ({part})\n\n" + self.render_part(part, tree))
                 self.warn("Headers and footers are shown by part; page/section placement is not reconstructed.")
+        for comment_id, entry in comments:
+            if comment_id in self.comment_ranges:
+                entry["anchor"], entry["anchor_part"] = self.comment_ranges[comment_id]
+            elif comment_id in self.comment_refs:  # a point comment
+                entry["anchor"], entry["anchor_part"] = "", self.comment_refs[comment_id]
+            else:
+                entry["anchor"] = entry["anchor_part"] = None
+                self.warn(UNANCHORED_COMMENT_NOTE)
         supported.update(self.media)
         for name in sorted(self.names):
             if name in supported or name.endswith("/") or name.endswith(".rels") or name == "[Content_Types].xml" or name.startswith("docProps/"):
