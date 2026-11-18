@@ -203,8 +203,8 @@ def make_docx(
 
 COMMENTS_REL = f'<Relationship Id="comments" Type="{R}/comments" Target="comments.xml"/>'
 COMMENT_NOTE = (
-    "Comment text, authors, and anchored text are recorded; "
-    "threads, dates, and resolution status are not compared."
+    "Comment text, authors, anchored text, replies, and resolved state are recorded; "
+    "dates and rich formatting are not compared."
 )
 UNANCHORED_COMMENT_NOTE = (
     "Some comments are not anchored in any rendered part; "
@@ -233,11 +233,36 @@ def reference(comment: str) -> str:
     return f'<w:r><w:commentReference w:id="{comment}"/></w:r>'
 
 
-def comments_part(comments: dict[str, str]) -> str:
-    """word/comments.xml with one comment by Ada per ID, in the given order."""
-    return f'<w:comments xmlns:w="{W}">' + "".join(
-        f'<w:comment w:id="{comment}" w:author="Ada">{paragraph(text)}</w:comment>'
+W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
+W15 = "http://schemas.microsoft.com/office/word/2012/wordml"
+
+
+def comments_part(comments: dict[str, str], para_ids: dict[str, str] | None = None) -> str:
+    """word/comments.xml with one comment by Ada per ID, in the given order.
+
+    ``para_ids`` gives a comment ID's paragraph the w14:paraId that w15:commentEx refers to.
+    """
+    def comment_paragraph(comment: str, text: str) -> str:
+        if para_ids is None or comment not in para_ids:
+            return paragraph(text)
+        return f'<w:p w14:paraId="{para_ids[comment]}" w14:textId="77777777">{run(text)}</w:p>'
+    return f'<w:comments xmlns:w="{W}" xmlns:w14="{W14}">' + "".join(
+        f'<w:comment w:id="{comment}" w:author="Ada">{comment_paragraph(comment, text)}</w:comment>'
         for comment, text in comments.items()) + "</w:comments>"
+
+
+COMMENTS_EXT_REL = ('<Relationship Id="commentsExtended" Type="http://schemas.microsoft.com/office/2011/'
+                    'relationships/commentsExtended" Target="commentsExtended.xml"/>')
+
+
+def comments_extended(*entries: tuple[str, str | None, str | None]) -> str:
+    """word/commentsExtended.xml with one w15:commentEx per (paraId, parent paraId, done)."""
+    def entry(para: str, parent: str | None, done: str | None) -> str:
+        parent_xml = f' w15:paraIdParent="{parent}"' if parent is not None else ""
+        done_xml = f' w15:done="{done}"' if done is not None else ""
+        return f'<w15:commentEx w15:paraId="{para}"{parent_xml}{done_xml}/>'
+    return (f'<w15:commentsEx xmlns:w15="{W15}" xmlns:mc="{MC}" mc:Ignorable="w15">'
+            + "".join(entry(*e) for e in entries) + "</w15:commentsEx>")
 
 
 class CLITests(unittest.TestCase):
@@ -1473,6 +1498,20 @@ class CLITests(unittest.TestCase):
                   extra={"word/comments.xml": comments_part(comments or {"1": "Note."}), **(extra or {})},
                   relationships=COMMENTS_REL + relationships)
 
+    def write_threaded(self, comments: dict[str, str], para_ids: dict[str, str],
+                       *entries: tuple[str, str | None, str | None], extended: bool = True) -> None:
+        """A body anchoring every comment, with a comments-extended part holding ``entries``."""
+        body = "".join(f"<w:p>{start(c)}{run(f'Passage {n}.')}{end(c)}</w:p>" for n, c in enumerate(comments))
+        make_docx(self.root / "essay.docx", body,
+                  extra={"word/comments.xml": comments_part(comments, para_ids),
+                         **({"word/commentsExtended.xml": comments_extended(*entries)} if extended else {})},
+                  relationships=COMMENTS_REL + (COMMENTS_EXT_REL if extended else ""))
+
+    def comment_threads(self) -> list[tuple[str, bool | None, int | None]]:
+        """Each exported comment's (text, resolved, reply_to), in review order."""
+        review = json.loads(self.exported()[1])["review"]
+        return [(item["text"], item["resolved"], item["reply_to"]) for item in review if item["kind"] == "comment"]
+
     def comment_anchors(self) -> dict[str, tuple[str | None, str | None]]:
         """Each exported comment's text -> (anchor, anchor_part)."""
         review = json.loads(self.exported()[1])["review"]
@@ -1591,6 +1630,120 @@ class CLITests(unittest.TestCase):
         self.assertEqual(self.comment_anchors(), {"Note.": ("From the start to here", "word/document.xml")})
         self.assertIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
         self.assertNotIn(UNANCHORED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
+
+    def test_resolving_a_comment_is_stale_in_metadata_only(self) -> None:
+        comments, ids = {"1": "First.", "2": "Second."}, {"1": "1A2B3C4D", "2": "0F0F0F0F"}
+        self.write_threaded(comments, ids, ("1A2B3C4D", None, "0"), ("0F0F0F0F", None, "0"))
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(self.comment_threads(), [("First.", False, None), ("Second.", False, None)])
+        meta = json.loads(before[1])
+        self.assertIn(COMMENT_NOTE, meta["warnings"])
+        self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
+        self.assertNotIn("1A2B3C4D", before[1].decode())
+        # Resolving one comment in Word only flips w15:done.
+        self.write_threaded(comments, ids, ("1A2B3C4D", None, "1"), ("0F0F0F0F", None, "0"))
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        self.cli("check", "essay.docx")
+        self.assertEqual(self.exported()[0], before[0])
+        self.assertEqual(self.comment_threads(), [("First.", True, None), ("Second.", False, None)])
+        # Other ST_OnOff spellings read the same; reopening is stale again.
+        self.write_threaded(comments, ids, ("1A2B3C4D", None, "true"), ("0F0F0F0F", None, "off"))
+        self.cli("check", "essay.docx")
+        self.write_threaded(comments, ids, ("1A2B3C4D", None, "0"), ("0F0F0F0F", None, "0"))
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before)
+
+    def test_replies_record_their_parent_position(self) -> None:
+        comments, ids = {"1": "First.", "2": "Second."}, {"1": "11111111", "2": "22222222"}
+        self.write_threaded(comments, ids, ("11111111", None, "0"), ("22222222", None, "0"))
+        self.cli("export", "essay.docx")
+        # Word writes a reply as a new comment whose commentEx names its parent's paraId.
+        comments, ids = {**comments, "3": "Reply."}, {**ids, "3": "33333333"}
+        self.write_threaded(comments, ids, ("11111111", None, "0"), ("22222222", None, "0"),
+                            ("33333333", "11111111", "0"))
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_threads(),
+                         [("First.", False, None), ("Second.", False, None), ("Reply.", False, 0)])
+        # Re-parenting the reply is stale too.
+        self.write_threaded(comments, ids, ("11111111", None, "0"), ("22222222", None, "0"),
+                            ("33333333", "22222222", "0"))
+        self.cli("check", "essay.docx", code=1)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_threads()[2], ("Reply.", False, 1))
+        self.cli("check", "essay.docx")
+
+    def test_renumbered_comment_and_paragraph_ids_do_not_churn(self) -> None:
+        self.write_threaded({"1": "First.", "2": "Reply."}, {"1": "11111111", "2": "22222222"},
+                            ("11111111", None, "1"), ("22222222", "11111111", "0"))
+        self.cli("export", "essay.docx")
+        before = self.exported()
+        self.assertEqual(self.comment_threads(), [("First.", True, None), ("Reply.", False, 0)])
+        # Word renumbers w:id and regenerates paraIds consistently across parts on re-save.
+        self.write_threaded({"40": "First.", "7": "Reply."}, {"40": "5e6f7a8b", "7": "0000ABCD"},
+                            ("5E6F7A8B", None, "1"), ("0000abcd", "5e6f7a8b", "0"))
+        self.cli("check", "essay.docx")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), before)
+        for raw in ("11111111", "22222222", "5E6F7A8B", "0000ABCD", "durableId"):
+            self.assertNotIn(raw, before[1].decode())
+
+    def test_comment_threads_use_the_last_paragraph_and_tolerate_gaps(self) -> None:
+        # Comments without a comments-extended part record unknown state, with no new warning.
+        self.write_threaded({"1": "First.", "2": "Second."}, {"1": "11111111", "2": "22222222"}, extended=False)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_threads(), [("First.", None, None), ("Second.", None, None)])
+        plain = json.loads(self.exported()[1])["warnings"]
+        # A commentEx refers to the last paragraph of a multi-paragraph comment, not the first.
+        comments = (f'<w:comments xmlns:w="{W}" xmlns:w14="{W14}">'
+                    f'<w:comment w:id="1" w:author="Ada"><w:p w14:paraId="0000000A">{run("Opening.")}</w:p>'
+                    f'<w:p w14:paraId="0000000B">{run("Closing.")}</w:p></w:comment>'
+                    f'<w:comment w:id="2" w:author="Ada"><w:p w14:paraId="0000000C">{run("Only.")}</w:p></w:comment>'
+                    f'<w:comment w:id="3" w:author="Ada">{paragraph("No paraId.")}</w:comment>'
+                    f'<w:comment w:id="4" w:author="Ada"><w:p w14:paraId="0000000D">{run("Self.")}</w:p></w:comment>'
+                    f'<w:comment w:id="5" w:author="Ada"><w:p w14:paraId="0000000E">{run("No done.")}</w:p></w:comment>'
+                    "</w:comments>")
+        extended = comments_extended(
+            ("0000000A", None, "1"),  # the first paragraph: no comment's last paragraph
+            ("0000000B", None, "0"),
+            ("0000000C", "FFFFFFFF", "1"),  # a dangling parent
+            ("0000000C", "0000000B", "0"),  # a duplicate entry: the first one wins
+            ("12345678", "0000000B", "1"),  # matches no comment
+            ("0000000D", "0000000D", "0"),  # its own parent
+            ("0000000E", "0000000B", None),
+        )
+        body = "".join(f"<w:p>{start(c)}{run(f'Passage {c}.')}{end(c)}</w:p>" for c in "12345")
+        make_docx(self.root / "essay.docx", body,
+                  extra={"word/comments.xml": comments, "word/commentsExtended.xml": extended},
+                  relationships=COMMENTS_REL + COMMENTS_EXT_REL)
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_threads(), [
+            ("Opening.Closing.", False, None), ("Only.", True, None), ("No paraId.", None, None),
+            ("Self.", False, None), ("No done.", False, 0)])
+        self.assertEqual(json.loads(self.exported()[1])["warnings"], plain)
+
+    def test_comments_extended_part_coverage_and_errors(self) -> None:
+        body = paragraph("No comments here.")
+        extended = {"word/commentsExtended.xml": comments_extended()}
+        # Not reached through the document's relationships, the part is still reported.
+        make_docx(self.root / "essay.docx", body, extra=extended)
+        self.cli("export", "essay.docx")
+        self.assertIn("Unrendered package part: word/commentsExtended.xml; changes to its content are not compared.",
+                      json.loads(self.exported()[1])["warnings"])
+        make_docx(self.root / "essay.docx", body, extra=extended, relationships=COMMENTS_EXT_REL)
+        self.cli("export", "essay.docx")
+        self.assertFalse([wn for wn in json.loads(self.exported()[1])["warnings"] if "Unrendered" in wn])
+        # A relationship to a missing or malformed part is an error, as for styles and numbering.
+        make_docx(self.root / "essay.docx", body, relationships=COMMENTS_EXT_REL)
+        result = self.cli("export", "essay.docx", code=2)
+        self.assertIn("missing related part word/commentsExtended.xml", result.stderr)
+        make_docx(self.root / "essay.docx", body, extra={"word/commentsExtended.xml": "<broken"},
+                  relationships=COMMENTS_EXT_REL)
+        result = self.cli("export", "essay.docx", code=2)
+        self.assertIn("cannot parse word/commentsExtended.xml", result.stderr)
 
     def test_table_content_controls_and_cell_boundaries(self) -> None:
         body = '<w:tbl><w:sdt><w:sdtContent><w:tr><w:sdt><w:sdtContent><w:tc>'
