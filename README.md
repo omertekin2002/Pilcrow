@@ -258,7 +258,11 @@ companions stale (size, position, cropping, and alt text are not compared).
 Comments stay out of the prose; their text, author, and anchored text (the
 accepted text their range covers, and the part it is in) are recorded in metadata,
 so editing a comment or moving, widening, or narrowing its range makes companions
-stale (threads, dates, and resolved state are not compared). Formatting-only edits can
+stale. From Word's comments-extended part, each comment also records whether it is
+`resolved` and, for a reply, `reply_to` (the position of its parent comment), so
+resolving, reopening, or replying to a comment makes companions stale too; both
+are `null` when the document does not say. Dates, rich formatting, and the
+`commentsIds.xml` and `commentsExtensible.xml` parts are not compared. Formatting-only edits can
 leave both companions unchanged and still matter in Word.
 
 Upgrading from a version that left text box text out: documents with text boxes
@@ -280,6 +284,13 @@ Upgrading from a version that did not record comment anchors: documents with
 comments report stale companions once, because each comment in `.meta.json` now
 has `anchor` and `anchor_part` keys. Run `pilcrow export` and commit the refreshed
 companions. Documents without comments are unaffected.
+
+Upgrading from a version that did not record comment threads: documents with
+comments report stale companions once, because each comment in `.meta.json` now
+has `resolved` and `reply_to` keys. Run `pilcrow export` and commit the refreshed
+companions. Documents without comments are unaffected. A document whose
+comments-extended relationship points to a missing part is now an error, like a
+missing styles part.
 
 Run the generated-fixture suite:
 

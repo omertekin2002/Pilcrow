@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+# Word 2010 paragraph IDs and the Word 2012 comments-extended part (reply threads, resolved state).
+W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
+W15 = "http://schemas.microsoft.com/office/word/2012/wordml"
 NS = {"w": W}
 # Image references: DrawingML blips (r:embed internal, r:link external), the SVG copy
 # Word stores in a blip's extension list, and legacy VML image data.
@@ -45,8 +48,8 @@ UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numb
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
-COMMENT_NOTE = ("Comment text, authors, and anchored text are recorded; "
-                "threads, dates, and resolution status are not compared.")
+COMMENT_NOTE = ("Comment text, authors, anchored text, replies, and resolved state are recorded; "
+                "dates and rich formatting are not compared.")
 UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part; "
                            "their anchor is recorded as null.")
 UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
@@ -75,6 +78,16 @@ def decimal(value: str) -> int | None:
     if match is None:
         return None
     return -int(match[2]) if match[1] == "-" else int(match[2])
+
+
+def para_id(value: str) -> str:
+    """One spelling per w14:paraId (ST_LongHexNumber), so "00ab" and "00AB" match."""
+    return value.strip(" \t\r\n").upper()
+
+
+def on_off(value: str) -> bool:
+    """Read an ST_OnOff value; anything other than a true spelling is false."""
+    return value.strip(" \t\r\n") in {"1", "true", "on"}
 
 
 def number_id(value: str) -> str:
@@ -107,7 +120,7 @@ class Reader:
         self.warnings: set[str] = {
             "Formatting and page layout are not compared; unchanged prose is not an identical document."
         }
-        self.review: list[dict[str, str | None]] = []
+        self.review: list[dict[str, str | int | bool | None]] = []
         self.links: list[dict[str, str]] = []
         self.fields: list[dict[str, str]] = []
         self.styles: dict[str, Element] = {}
@@ -160,6 +173,15 @@ class Reader:
                     raise DocumentError(f"relationship escapes package: {path}")
             result[rel.get("Id")] = (rel.get("Type", "").rsplit("/", 1)[-1], target, external)
         return result
+
+    def last_paragraph_id(self, comment: Element) -> str:
+        """The w14:paraId of a comment's last paragraph, which w15:commentEx refers to.
+
+        Paragraphs inside text boxes are not the comment's own paragraphs.
+        """
+        boxed = {p for box in comment.iter(w("txbxContent")) for p in box.iter(w("p"))}
+        own = [p for p in comment.iter(w("p")) if p not in boxed]
+        return para_id(own[-1].get(f"{{{W14}}}paraId", "")) if own else ""
 
     def warn(self, message: str) -> None:
         self.warnings.add(message)
@@ -677,6 +699,8 @@ class Reader:
             raise DocumentError("unsupported Word XML dialect or missing document body (Strict OOXML is not supported)")
         main_rels = self.relationships("word/document.xml")
         supported = {"word/document.xml"}
+        # Paragraph ID -> w15:commentEx (reply parent and resolved state); the first entry wins.
+        extended: dict[str, Element] = {}
         for kind, target, external in main_rels.values():
             if kind == "styles" and not external:
                 if target not in self.names:
@@ -692,12 +716,21 @@ class Reader:
                 for node in numbering.findall("w:abstractNum", NS):
                     self.abstract_nums.setdefault(number_id(attr(node, "abstractNumId")), node)
                 supported.add(target)
+            elif kind == "commentsExtended" and not external:
+                if target not in self.names:
+                    raise DocumentError(f"missing related part {target}")
+                for node in self.xml(target):
+                    key = para_id(node.get(f"{{{W15}}}paraId", ""))
+                    if node.tag == f"{{{W15}}}commentEx" and key:
+                        extended.setdefault(key, node)
+                supported.add(target)
         prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
                           if kind in {"footnotes", "endnotes", "comments", "header", "footer"} and not external})
-        # Comment entries keep their place in review; anchors are filled in once every story is read.
-        comments: list[tuple[str, dict[str, str | None]]] = []
+        # Comment entries keep their place in review; anchors and threads are filled in once
+        # every story is read. Each is (comment ID, entry, paraId of its last paragraph).
+        comments: list[tuple[str, dict[str, str | int | bool | None], str]] = []
         for kind, part in stories:
             if part not in self.names:
                 raise DocumentError(f"missing related part {part}")
@@ -706,10 +739,11 @@ class Reader:
             if kind == "comments":
                 self.audit(tree)
                 for comment in tree:
-                    entry: dict[str, str | None] = {"kind": "comment", "author": attr(comment, "author"),
-                                                    "text": self.raw_text(comment), "part": part}
+                    entry: dict[str, str | int | bool | None] = {
+                        "kind": "comment", "author": attr(comment, "author"),
+                        "text": self.raw_text(comment), "part": part}
                     self.review.append(entry)
-                    comments.append((number_id(attr(comment, "id")), entry))
+                    comments.append((number_id(attr(comment, "id")), entry, self.last_paragraph_id(comment)))
                 self.warn(COMMENT_NOTE)
             elif kind in {"footnotes", "endnotes"}:
                 for note in tree:
@@ -720,7 +754,18 @@ class Reader:
             else:
                 prose.append(f"## {kind.title()} ({part})\n\n" + self.render_part(part, tree))
                 self.warn("Headers and footers are shown by part; page/section placement is not reconstructed.")
-        for comment_id, entry in comments:
+        # A comment's position among all comments, by the paraId that w15:commentEx refers to.
+        # Raw comment IDs and paraIds change when Word re-saves, so neither is recorded.
+        positions: dict[str, int] = {}
+        for position, (_, _, key) in enumerate(comments):
+            if key:
+                positions.setdefault(key, position)
+        for position, (comment_id, entry, key) in enumerate(comments):
+            ex = extended.get(key) if key and positions.get(key) == position else None
+            # Without a matching w15:commentEx the state is unknown, never "not resolved".
+            entry["resolved"] = None if ex is None else on_off(ex.get(f"{{{W15}}}done", ""))
+            parent = None if ex is None else positions.get(para_id(ex.get(f"{{{W15}}}paraIdParent", "")))
+            entry["reply_to"] = parent if parent != position else None
             if comment_id in self.comment_ranges:
                 entry["anchor"], entry["anchor_part"] = self.comment_ranges[comment_id]
             elif comment_id in self.comment_refs:  # a point comment
