@@ -89,13 +89,15 @@ chapters/Methods and results.docx
 5. Commit the DOCX and both companions together through Desktop, then push and
    branch normally. Desktop's **History** view can show committed companion diffs.
 
-Pilcrow never stages, commits, pushes, switches branches, or merges. No direct
-DOCX text converter is installed. The CLI and an ordinary Git diff have been
+Pilcrow never stages, commits, pushes, switches branches, or merges. No DOCX
+text converter is installed unless you opt in (see
+[readable `git diff`](#readable-git-diff-optional)). The CLI and an ordinary Git diff have been
 tested; **the Microsoft Word / GitHub Desktop GUI workflow has not been tested in
 this Linux environment**. See [manual validation](docs/manual-validation.md).
 See an [actual generated prose and Git diff example](docs/example.md).
 Old commits without companions will not gain prose diffs automatically; there is
-no backfill or history rewriting.
+no backfill or history rewriting. The optional `git diff` driver below can show
+their prose on the command line.
 
 ## Scope and discovery
 
@@ -240,6 +242,38 @@ Word tracked-change authors (included in review metadata) are separate from Git
 authors. Neither proves an edit came from an AI. Companion metadata can contain
 comment authors and deleted text: review it before sharing, just as you would the
 DOCX. No automatic OOXML merging or sentence-lineage system is provided.
+
+## Readable `git diff` (optional)
+
+Git can also print a DOCX's prose itself in `git diff`, `git log -p` and
+`git show`, instead of "Binary files differ". Opt in with two steps from your
+document repository root:
+
+```sh
+pilcrow setup --textconv --root .
+git config diff.pilcrow.textconv "pilcrow textconv --"
+```
+
+The first adds `*.[dD][oO][cC][xX] diff=pilcrow` to Pilcrow's managed block in
+`.gitattributes` (commit it like the other rules); a later plain `pilcrow setup`
+keeps that line. The second is a one-time, per-clone Git setting that Pilcrow
+prints but never runs: Pilcrow does not edit Git config. Each collaborator who
+wants the readable diff runs it in their own clone. Optionally add
+`git config diff.pilcrow.cachetextconv true` so Git caches the converted text.
+Until the config is set, Git treats DOCX files exactly as before. The `--`
+lets file names that start with `-` convert too.
+
+`pilcrow textconv <file>` prints exactly what the file's `.prose.md` companion
+would contain and writes nothing. Coverage warnings go to stderr, so they can
+appear in the terminal alongside the diff. Because Git converts each revision on
+demand, this also works for history committed before you used Pilcrow, with no
+companions. It shows prose only: changes recorded in `.meta.json`, such as
+comments, list formats, images, and tracked-change authors, do not appear, so
+it does not replace companions, `pilcrow check`, or review in Word. Whether
+GitHub Desktop uses the driver is **untested**.
+
+To opt out, delete the `diff=pilcrow` line from the managed block by hand, or
+run `git config --unset diff.pilcrow.textconv`.
 
 ## Coverage and maintenance
 
