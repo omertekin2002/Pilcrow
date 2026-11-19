@@ -1631,6 +1631,30 @@ class CLITests(unittest.TestCase):
         self.assertIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
         self.assertNotIn(UNANCHORED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
 
+    def test_text_box_text_is_a_separate_story_for_comment_anchors(self) -> None:
+        def write(box: str) -> None:
+            # Comment 1 spans two body paragraphs; the first anchors a box holding comment 2.
+            self.write_commented(f"<w:p>{start('1')}{run('Body first.')}<w:r>{modern_text_box(box)}</w:r></w:p>"
+                                 f"<w:p>{run('Body last.')}{end('1')}</w:p>",
+                                 {"1": "Body.", "2": "Box."})
+        write(f"<w:p>{run('Box ')}{start('2')}{run('story.')}{end('2')}</w:p>")
+        self.cli("export", "essay.docx")
+        self.assertIn(b"[Text box]\n\nBox story.\n\n[/Text box]", self.exported()[0])
+        self.assertEqual(self.comment_anchors(), {"Body.": ("Body first. Body last.", "word/document.xml"),
+                                                  "Box.": ("story.", "word/document.xml")})
+        self.assertNotIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
+        before = self.exported()[1]
+        # Editing box text outside every range leaves both anchors, and the metadata, unchanged.
+        write(f"<w:p>{run('Edited box ')}{start('2')}{run('story.')}{end('2')}</w:p>")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported()[1], before)
+        # A range left open in a box runs to the end of the box, not into the body.
+        write(f"<w:p>{start('2')}{run('Open in the box')}</w:p>")
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.comment_anchors(), {"Body.": ("Body first. Body last.", "word/document.xml"),
+                                                  "Box.": ("Open in the box", "word/document.xml")})
+        self.assertIn(UNCLOSED_COMMENT_NOTE, json.loads(self.exported()[1])["warnings"])
+
     def test_resolving_a_comment_is_stale_in_metadata_only(self) -> None:
         comments, ids = {"1": "First.", "2": "Second."}, {"1": "1A2B3C4D", "2": "0F0F0F0F"}
         self.write_threaded(comments, ids, ("1A2B3C4D", None, "0"), ("0F0F0F0F", None, "0"))

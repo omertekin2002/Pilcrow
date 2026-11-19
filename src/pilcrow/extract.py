@@ -353,6 +353,14 @@ class Reader:
     def close_range(self, comment: str, start: int) -> None:
         self.comment_ranges.setdefault(comment, (normalize("".join(self.story[start:])), self.part))
 
+    def close_open_ranges(self) -> None:
+        """Close the ranges still open at the end of a story at that end, with a warning."""
+        if self.open_ranges:
+            self.warn(UNCLOSED_COMMENT_NOTE)
+            for comment, start in self.open_ranges.items():
+                self.close_range(comment, start)
+            self.open_ranges = {}
+
     def skip_markers(self, node: Element) -> None:
         """Track the comment markers in content that is not rendered, such as tracked deletions."""
         for descendant in node.iter():
@@ -373,7 +381,16 @@ class Reader:
     def text_box(self, box: Element) -> str:
         self.features["text boxes"] += 1
         self.warn(TEXT_BOX_NOTE)
-        return "\n\n".join(("[Text box]", self.blocks(box) or "(empty)", "[/Text box]"))
+        # A text box is its own story: a range open around its anchor does not cover its
+        # text, and a range inside it runs at most to the box's edges.
+        outer = self.story, self.open_ranges
+        self.story, self.open_ranges = [], {}
+        try:
+            value = self.blocks(box)
+            self.close_open_ranges()
+        finally:
+            self.story, self.open_ranges = outer
+        return "\n\n".join(("[Text box]", value or "(empty)", "[/Text box]"))
 
     def inline(self, node: Element) -> str:
         tag = node.tag
@@ -722,11 +739,7 @@ class Reader:
         self.story, self.open_ranges = [], {}
         self.audit(tree)
         value = self.blocks(tree)
-        if self.open_ranges:
-            self.warn(UNCLOSED_COMMENT_NOTE)
-            for comment, start in self.open_ranges.items():
-                self.close_range(comment, start)
-            self.open_ranges = {}
+        self.close_open_ranges()
         if self.field_stack:
             self.warn("Unclosed field codes found; saved display text may be incomplete.")
             while self.field_stack:
