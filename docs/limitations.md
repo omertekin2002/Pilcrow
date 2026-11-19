@@ -17,7 +17,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Footnotes/endnotes | Related parts with reference markers; separator notes omitted; IDs retained, so renumbering can produce diffs |
 | Headers/footers | Related parts shown as separate sections by part name; no page/section placement mapping |
 | Tracked text | Include `ins` and `moveTo`, omit `del` and `moveFrom`; separate kind, author, and text records, without dates or revision IDs |
-| Comments | Text and author in metadata; anchors, dates, threaded replies, rich formatting, and resolved state not compared |
+| Comments | Text, author, and anchor in metadata, never in prose; `anchor` is the text between a comment's `w:commentRangeStart` and `w:commentRangeEnd` in the accepted view (insertions included, deletions omitted, tabs, line breaks, and paragraph boundaries as single spaces), matched by comment ID in the body, notes, headers/footers, and text boxes, and `anchor_part` is the part holding the range start, so moving, widening, narrowing, or re-attaching a range makes companions stale while Word's comment renumbering, run splits, proofing marks, and bookmarks do not; a reference without a range (or an empty range) records `""`, a comment never referenced in a rendered part records `null` with one coverage warning, and a range missing its start or end runs from the start or to the end of its part with one warning; a text box is a separate story, so a range around its anchor does not cover the box's text and a range inside a box runs at most to the box's edges; from the comments-extended part (`word/commentsExtended.xml`, reached through the document's relationship) each comment records `resolved` (`w15:done`) and `reply_to` (the 0-based position, in comments-part order, of the comment named by `w15:paraIdParent`), matched through the `w14:paraId` of the comment's last paragraph, so resolving, reopening, replying, and re-parenting make companions stale while Word's regenerated comment IDs and paraIds do not; both are `null` when there is no comments-extended part or matching `w15:commentEx`, and `reply_to` is `null` for a top-level comment or a parent that matches no comment; raw IDs, paraIds, and durable IDs are never recorded; dates, rich formatting, `commentsIds.xml`, and `commentsExtensible.xml` not compared |
 | Hyperlinks | Accepted visible text in prose; label and destination in metadata, without fetching the URL |
 | Fields/citations | Saved display text in prose; normalized instruction fingerprint and first command token in metadata; never recalculate fields or manage Zotero |
 | Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
@@ -97,9 +97,18 @@ are retained literally and may themselves contain sensitive or local paths.
 
 ## Operational limits
 
-Packages are limited to 4096 entries, 64 MiB total uncompressed, and 16 MiB per
-part to bound memory. Large image-heavy documents may exceed these deliberately
-conservative defaults. Duplicate ZIP entries and XML entity expansion are rejected.
+Packages are limited to 4096 entries and 1 GiB total uncompressed (Word's own
+documented ceiling for a document with graphics is 512 MB), which bounds
+decompression work. Parts that Pilcrow parses into memory (XML and `.rels`) are
+limited to 16 MiB each and 64 MiB in total, so a `word/document.xml` over 16 MiB
+is rejected. They are inflated no further than the size the package declares
+for them, so a part that inflates past it fails its CRC check without using more
+memory. Images are hashed in 1 MiB chunks without holding them in memory, so
+large or numerous images count only toward the 1 GiB total. A package over a
+limit is an error (exit 2) naming the part or the limit it exceeded. Parts must
+use the stored or deflate ZIP methods, the only ones OPC allows and the only
+ones read with bounded memory. Duplicate ZIP entries and XML entity expansion
+are rejected.
 Output/source symlink paths are rejected to avoid writing through unexpected
 paths. Export checks source stat information before/after reading; it is not a
 cross-process lock. Save completely before export, and rerun after a concurrent
@@ -119,11 +128,14 @@ reports any existing companions as orphans. Empty discovery can succeed with
    save-without-editing and Zotero documents, before claiming GUI compatibility.
 2. Tune sentence segmentation against collaborators' languages and abbreviation
    conventions; keep fixtures for every regression.
-3. Decide whether reconstructed list counters, comment anchors, or field-code previews
+3. Decide whether reconstructed list counters, comment dates, or field-code previews
    justify more metadata. Avoid a dump of all OOXML.
 4. Improve tracked structural revisions, note-reference validation, complex tables,
    and relationship/path canonicalization only as actual documents require it.
-5. Consider opt-in textconv and refresh-only watching after the primary workflow is
-   reliable. Desktop executable discovery needs its own validation.
+5. Opt-in textconv exists (`pilcrow setup --textconv` plus a one-time
+   `git config diff.pilcrow.textconv "pilcrow textconv --"`); it shows prose only,
+   not metadata, and is untested in GitHub Desktop, where executable discovery
+   needs its own validation. Consider refresh-only watching after the primary
+   workflow is reliable.
 6. If Word XML is wanted later, build a distinct dialect-detecting adapter. Do not
    treat arbitrary XML as Word input. Automatic document merging stays separate.

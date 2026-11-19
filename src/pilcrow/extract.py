@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
 
@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+# Word 2010 paragraph IDs and the Word 2012 comments-extended part (reply threads, resolved state).
+W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
+W15 = "http://schemas.microsoft.com/office/word/2012/wordml"
 NS = {"w": W}
 # Image references: DrawingML blips (r:embed internal, r:link external), the SVG copy
 # Word stores in a blip's extension list, and legacy VML image data.
@@ -45,12 +48,40 @@ UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numb
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
+COMMENT_NOTE = ("Comment text, authors, anchored text, replies, and resolved state are recorded; "
+                "dates and rich formatting are not compared.")
+UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part; "
+                           "their anchor is recorded as null.")
+UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
+                         "from the start or to the end of the story part.")
+MIB = 1024 * 1024
+# Package safety limits. Parsed parts (XML and .rels) are read whole into memory, so they
+# have tight caps; media is hashed in fixed-size chunks, so only the package-wide total
+# applies to it, which bounds decompression time. Word's own documented ceiling for a
+# document with graphics is 512 MB.
+MAX_ENTRIES = 4096
+MAX_PACKAGE_BYTES = 1024 * MIB
+MAX_PARSED_PART_BYTES = 16 * MIB
+MAX_PARSED_TOTAL_BYTES = 64 * MIB
+HASH_CHUNK_BYTES = 1 * MIB
+# The only ZIP methods OPC allows, and the only ones zipfile decompresses with bounded
+# output: it inflates a whole BZIP2, LZMA or Zstandard chunk at once, so a small
+# compressed part could expand to gigabytes in memory before any limit applies.
+BOUNDED_COMPRESSION = frozenset({ZIP_STORED, ZIP_DEFLATED})
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
 
 def w(name: str) -> str:
     return f"{{{W}}}{name}"
+
+
+COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
+
+
+def size_label(size: int) -> str:
+    """A byte limit in the unit it is written in: "16 MiB", "1 GiB"."""
+    return f"{size // 1024 // MIB} GiB" if size % (1024 * MIB) == 0 else f"{size // MIB} MiB"
 
 
 def attr(node: Element, name: str, default: str = "") -> str:
@@ -66,6 +97,16 @@ def decimal(value: str) -> int | None:
     if match is None:
         return None
     return -int(match[2]) if match[1] == "-" else int(match[2])
+
+
+def para_id(value: str) -> str:
+    """One spelling per w14:paraId (ST_LongHexNumber), so "00ab" and "00AB" match."""
+    return value.strip(" \t\r\n").upper()
+
+
+def on_off(value: str) -> bool:
+    """Read an ST_OnOff value; anything other than a true spelling is false."""
+    return value.strip(" \t\r\n") in {"1", "true", "on"}
 
 
 def number_id(value: str) -> str:
@@ -98,7 +139,7 @@ class Reader:
         self.warnings: set[str] = {
             "Formatting and page layout are not compared; unchanged prose is not an identical document."
         }
-        self.review: list[dict[str, str]] = []
+        self.review: list[dict[str, str | int | bool | None]] = []
         self.links: list[dict[str, str]] = []
         self.fields: list[dict[str, str]] = []
         self.styles: dict[str, Element] = {}
@@ -120,16 +161,58 @@ class Reader:
         self.features: Counter[str] = Counter()
         # Text boxes found while reading a paragraph, rendered as blocks after it.
         self.anchored: list[list[Element]] = []
+        # The current story part's rendered text in fragments, in the accepted view, so a
+        # comment range is the fragments between the offsets of its start and end markers.
+        self.story: list[str] = []
+        # Open comment range ID -> fragment offset of its start, for the current part.
+        self.open_ranges: dict[str, int] = {}
+        # Comment ID -> (anchored text, part holding the range start); the first range wins.
+        self.comment_ranges: dict[str, tuple[str, str]] = {}
+        # Comment ID -> part of its first w:commentReference, for comments without a range.
+        self.comment_refs: dict[str, str] = {}
+        # Uncompressed bytes of every part parsed so far, bounded by MAX_PARSED_TOTAL_BYTES.
+        self.parsed_bytes = 0
+        # Story part -> its relationships, parsed once however many notes render from it.
+        self.part_rels: dict[str, Relationships] = {}
 
     def xml(self, name: str) -> Element:
+        # Reading at most the declared size bounds memory, so check that size first. Reading
+        # exactly that many bytes, not to the end, also bounds each inflate step: ZipFile.read
+        # inflates a whole deflate stream in one step, so a part declaring a small size could
+        # expand to gigabytes before being cut to its size and failing its CRC check.
+        size = self.package.getinfo(name).file_size if name in self.names else 0
+        if size > MAX_PARSED_PART_BYTES:
+            raise DocumentError(f"{name} is {size} bytes uncompressed; parsed parts are limited to "
+                                f"{size_label(MAX_PARSED_PART_BYTES)} each")
+        self.parsed_bytes += size
+        if self.parsed_bytes > MAX_PARSED_TOTAL_BYTES:
+            raise DocumentError(f"cannot parse {name}: parsed parts exceed the "
+                                f"{size_label(MAX_PARSED_TOTAL_BYTES)} total safety limit")
         try:
-            return ET.fromstring(self.package.read(name))
+            with self.package.open(name) as stream:
+                data = stream.read(size)
+            return ET.fromstring(data)
         except Exception as exc:
             raise DocumentError(f"cannot parse {name}: {exc}") from exc
 
+    def hash_part(self, name: str) -> tuple[str, int]:
+        """SHA-256 and size of a part, read in fixed-size chunks so memory stays bounded."""
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self.package.open(name) as stream:
+                while chunk := stream.read(HASH_CHUNK_BYTES):
+                    digest.update(chunk)
+                    size += len(chunk)
+        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
+            raise DocumentError(f"cannot read {name}: {exc}") from exc
+        return digest.hexdigest(), size
+
     def relationships(self, part: str) -> Relationships:
+        if part in self.part_rels:
+            return self.part_rels[part]
         path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
-        result: Relationships = {}
+        result: Relationships = self.part_rels.setdefault(part, {})
         if path not in self.names:
             return result
         for rel in self.xml(path):
@@ -142,6 +225,15 @@ class Reader:
                     raise DocumentError(f"relationship escapes package: {path}")
             result[rel.get("Id")] = (rel.get("Type", "").rsplit("/", 1)[-1], target, external)
         return result
+
+    def last_paragraph_id(self, comment: Element) -> str:
+        """The w14:paraId of a comment's last paragraph, which w15:commentEx refers to.
+
+        Paragraphs inside text boxes are not the comment's own paragraphs.
+        """
+        boxed = {p for box in comment.iter(w("txbxContent")) for p in box.iter(w("p"))}
+        own = [p for p in comment.iter(w("p")) if p not in boxed]
+        return para_id(own[-1].get(f"{{{W14}}}paraId", "")) if own else ""
 
     def warn(self, message: str) -> None:
         self.warnings.add(message)
@@ -231,11 +323,7 @@ class Reader:
                     entry["target"] = rel[1]  # never fetched, like hyperlinks
                 elif rel is not None and rel[1] in self.names:
                     if rel[1] not in self.media:
-                        try:
-                            data = self.package.read(rel[1])
-                        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
-                            raise DocumentError(f"cannot read {rel[1]}: {exc}") from exc
-                        self.media[rel[1]] = (hashlib.sha256(data).hexdigest(), len(data))
+                        self.media[rel[1]] = self.hash_part(rel[1])
                     entry["sha256"], entry["bytes"] = self.media[rel[1]]
                 else:
                     self.warn(MISSING_IMAGE_NOTE)
@@ -245,6 +333,44 @@ class Reader:
                 entry["sha256"] = None
             self.images.append(entry)
             self.warn(IMAGE_NOTE)
+
+    def emit(self, text: str, anchored: str | None = None) -> str:
+        """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
+        if not self.unselected:
+            self.story.append(text if anchored is None else anchored)
+        return text
+
+    def comment_marker(self, node: Element) -> None:
+        """Track a comment range start/end or reference by its ID; the ID itself is not recorded."""
+        if self.unselected:
+            return
+        comment = number_id(attr(node, "id"))
+        if node.tag == w("commentReference"):
+            self.comment_refs.setdefault(comment, self.part)
+        elif node.tag == w("commentRangeStart"):
+            self.open_ranges.setdefault(comment, len(self.story))
+        else:
+            start = self.open_ranges.pop(comment, None)
+            if start is None:
+                self.warn(UNCLOSED_COMMENT_NOTE)
+            self.close_range(comment, start or 0)
+
+    def close_range(self, comment: str, start: int) -> None:
+        self.comment_ranges.setdefault(comment, (normalize("".join(self.story[start:])), self.part))
+
+    def close_open_ranges(self) -> None:
+        """Close the ranges still open at the end of a story at that end, with a warning."""
+        if self.open_ranges:
+            self.warn(UNCLOSED_COMMENT_NOTE)
+            for comment, start in self.open_ranges.items():
+                self.close_range(comment, start)
+            self.open_ranges = {}
+
+    def skip_markers(self, node: Element) -> None:
+        """Track the comment markers in content that is not rendered, such as tracked deletions."""
+        for descendant in node.iter():
+            if descendant.tag in COMMENT_MARKERS:
+                self.comment_marker(descendant)
 
     def anchor(self, node: Element) -> tuple[str, list[str]]:
         """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
@@ -260,7 +386,16 @@ class Reader:
     def text_box(self, box: Element) -> str:
         self.features["text boxes"] += 1
         self.warn(TEXT_BOX_NOTE)
-        return "\n\n".join(("[Text box]", self.blocks(box) or "(empty)", "[/Text box]"))
+        # A text box is its own story: a range open around its anchor does not cover its
+        # text, and a range inside it runs at most to the box's edges.
+        outer = self.story, self.open_ranges
+        self.story, self.open_ranges = [], {}
+        try:
+            value = self.blocks(box)
+            self.close_open_ranges()
+        finally:
+            self.story, self.open_ranges = outer
+        return "\n\n".join(("[Text box]", value or "(empty)", "[/Text box]"))
 
     def inline(self, node: Element) -> str:
         tag = node.tag
@@ -269,24 +404,28 @@ class Reader:
             self.review.append({"kind": local, "author": attr(node, "author"),
                                 "text": self.raw_text(node), "part": self.part})
             if local in {"del", "moveFrom"}:
+                self.skip_markers(node)
                 return ""
+        if tag in COMMENT_MARKERS:
+            self.comment_marker(node)
+            return ""
         if tag == w("t"):
             # XML source line wrapping is whitespace, unlike Word's explicit w:br.
-            return re.sub(r"\s", " ", node.text or "")
+            return self.emit(re.sub(r"\s", " ", node.text or ""))
         if tag == w("delText"):
             return ""
         if tag in {w("br"), w("cr")}:
-            return "\n"
+            return self.emit("\n", " ")
         if tag == w("tab"):
-            return " "
+            return self.emit(" ")
         if tag == w("noBreakHyphen"):
-            return "\u2011"
+            return self.emit("\u2011")
         if tag == w("softHyphen"):
-            return "\u00ad"
+            return self.emit("\u00ad")
         if tag in {w("footnoteReference"), w("endnoteReference")}:
             kind = "footnote" if tag == w("footnoteReference") else "endnote"
             self.features[kind + " references"] += 1
-            return f"[^{kind}-{attr(node, 'id')}]"
+            return self.emit(f"[^{kind}-{attr(node, 'id')}]")
         if tag == w("hyperlink"):
             rid = node.get(f"{{{R}}}id")
             rel = self.rels.get(rid)
@@ -324,7 +463,7 @@ class Reader:
         if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
-            return f"[Unsupported {local}]"
+            return self.emit(f"[Unsupported {local}]")
         if tag in {w("pPr"), w("rPr"), w("sdtPr"), w("sdtEndPr")}:
             return ""
         return "".join(self.inline(child) for child in node)
@@ -354,6 +493,7 @@ class Reader:
 
     def paragraph(self, node: Element) -> str:
         text, boxes = self.anchor_boxes(node)
+        self.emit("", " ")  # a paragraph boundary is a space in comment anchors
         # Render the paragraph before its boxes so list first use follows prose order.
         own = self.paragraph_text(node, text)
         return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
@@ -497,6 +637,9 @@ class Reader:
                 value = self.table(child)
             elif child.tag in {w("sectPr"), w("tcPr"), w("trPr"), w("tblPr"), w("tblGrid"), w("sdtPr"), w("sdtEndPr")}:
                 continue
+            elif child.tag in COMMENT_MARKERS:
+                self.comment_marker(child)  # block-level range markers, e.g. between paragraphs
+                continue
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
@@ -535,6 +678,8 @@ class Reader:
                 yield from self.table_items(child, tag)
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)
+            elif child.tag in COMMENT_MARKERS:
+                self.comment_marker(child)
 
     def table(self, node: Element) -> str:
         self.features["tables"] += 1
@@ -543,6 +688,7 @@ class Reader:
         for row in self.table_items(node, "tr"):
             if row.find("w:trPr/w:del", NS) is not None:
                 self.warn("Tracked table structure changes are only partially represented; inspect the DOCX.")
+                self.skip_markers(row)
                 continue
             lines.append("[Row]")
             for cell in self.table_items(row, "tc"):
@@ -595,8 +741,10 @@ class Reader:
 
     def render_part(self, part: str, tree: Element) -> str:
         self.part, self.rels = part, self.relationships(part)
+        self.story, self.open_ranges = [], {}
         self.audit(tree)
         value = self.blocks(tree)
+        self.close_open_ranges()
         if self.field_stack:
             self.warn("Unclosed field codes found; saved display text may be incomplete.")
             while self.field_stack:
@@ -612,6 +760,8 @@ class Reader:
             raise DocumentError("unsupported Word XML dialect or missing document body (Strict OOXML is not supported)")
         main_rels = self.relationships("word/document.xml")
         supported = {"word/document.xml"}
+        # Paragraph ID -> w15:commentEx (reply parent and resolved state); the first entry wins.
+        extended: dict[str, Element] = {}
         for kind, target, external in main_rels.values():
             if kind == "styles" and not external:
                 if target not in self.names:
@@ -627,10 +777,21 @@ class Reader:
                 for node in numbering.findall("w:abstractNum", NS):
                     self.abstract_nums.setdefault(number_id(attr(node, "abstractNumId")), node)
                 supported.add(target)
+            elif kind == "commentsExtended" and not external:
+                if target not in self.names:
+                    raise DocumentError(f"missing related part {target}")
+                for node in self.xml(target):
+                    key = para_id(node.get(f"{{{W15}}}paraId", ""))
+                    if node.tag == f"{{{W15}}}commentEx" and key:
+                        extended.setdefault(key, node)
+                supported.add(target)
         prose = [self.render_part("word/document.xml", body)]
         # All supported related stories are distinct; never combine headers with body prose.
         stories = sorted({(kind, target) for kind, target, external in main_rels.values()
                           if kind in {"footnotes", "endnotes", "comments", "header", "footer"} and not external})
+        # Comment entries keep their place in review; anchors and threads are filled in once
+        # every story is read. Each is (comment ID, entry, paraId of its last paragraph).
+        comments: list[tuple[str, dict[str, str | int | bool | None], str]] = []
         for kind, part in stories:
             if part not in self.names:
                 raise DocumentError(f"missing related part {part}")
@@ -639,9 +800,12 @@ class Reader:
             if kind == "comments":
                 self.audit(tree)
                 for comment in tree:
-                    self.review.append({"kind": "comment", "author": attr(comment, "author"),
-                                        "text": self.raw_text(comment), "part": part})
-                self.warn("Comment text and authors are recorded; anchors, threads, dates, and resolution status are not compared.")
+                    entry: dict[str, str | int | bool | None] = {
+                        "kind": "comment", "author": attr(comment, "author"),
+                        "text": self.raw_text(comment), "part": part}
+                    self.review.append(entry)
+                    comments.append((number_id(attr(comment, "id")), entry, self.last_paragraph_id(comment)))
+                self.warn(COMMENT_NOTE)
             elif kind in {"footnotes", "endnotes"}:
                 for note in tree:
                     if attr(note, "type") in {"separator", "continuationSeparator", "continuationNotice"}:
@@ -651,6 +815,25 @@ class Reader:
             else:
                 prose.append(f"## {kind.title()} ({part})\n\n" + self.render_part(part, tree))
                 self.warn("Headers and footers are shown by part; page/section placement is not reconstructed.")
+        # A comment's position among all comments, by the paraId that w15:commentEx refers to.
+        # Raw comment IDs and paraIds change when Word re-saves, so neither is recorded.
+        positions: dict[str, int] = {}
+        for position, (_, _, key) in enumerate(comments):
+            if key:
+                positions.setdefault(key, position)
+        for position, (comment_id, entry, key) in enumerate(comments):
+            ex = extended.get(key) if key and positions.get(key) == position else None
+            # Without a matching w15:commentEx the state is unknown, never "not resolved".
+            entry["resolved"] = None if ex is None else on_off(ex.get(f"{{{W15}}}done", ""))
+            parent = None if ex is None else positions.get(para_id(ex.get(f"{{{W15}}}paraIdParent", "")))
+            entry["reply_to"] = parent if parent != position else None
+            if comment_id in self.comment_ranges:
+                entry["anchor"], entry["anchor_part"] = self.comment_ranges[comment_id]
+            elif comment_id in self.comment_refs:  # a point comment
+                entry["anchor"], entry["anchor_part"] = "", self.comment_refs[comment_id]
+            else:
+                entry["anchor"] = entry["anchor_part"] = None
+                self.warn(UNANCHORED_COMMENT_NOTE)
         supported.update(self.media)
         for name in sorted(self.names):
             if name in supported or name.endswith("/") or name.endswith(".rels") or name == "[Content_Types].xml" or name.startswith("docProps/"):
@@ -676,10 +859,16 @@ def extract(path: Path) -> Extraction:
         before = path.stat()
         with ZipFile(path) as package:
             infos = package.infolist()
-            if len(infos) > 4096 or sum(i.file_size for i in infos) > 64 * 1024 * 1024:
-                raise DocumentError("package exceeds safety limits (4096 entries / 64 MiB uncompressed)")
-            if any(i.file_size > 16 * 1024 * 1024 for i in infos):
-                raise DocumentError("package part exceeds 16 MiB safety limit")
+            if len(infos) > MAX_ENTRIES:
+                raise DocumentError(f"package has {len(infos)} entries; the safety limit is {MAX_ENTRIES}")
+            total = sum(i.file_size for i in infos)
+            if total > MAX_PACKAGE_BYTES:
+                raise DocumentError(f"package is {total} bytes uncompressed; the safety limit is "
+                                    f"{size_label(MAX_PACKAGE_BYTES)}")
+            for info in infos:
+                if info.compress_type not in BOUNDED_COMPRESSION:
+                    raise DocumentError(f"{info.filename} uses ZIP compression method {info.compress_type}; "
+                                        "DOCX packages may use only stored or deflate")
             if len({i.filename for i in infos}) != len(infos):
                 raise DocumentError("duplicate ZIP entries")
             result = Reader(package).extract()
