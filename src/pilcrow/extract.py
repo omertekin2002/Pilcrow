@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
 
@@ -54,6 +54,20 @@ UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part;
                            "their anchor is recorded as null.")
 UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
                          "from the start or to the end of the story part.")
+MIB = 1024 * 1024
+# Package safety limits. Parsed parts (XML and .rels) are read whole into memory, so they
+# have tight caps; media is hashed in fixed-size chunks, so only the package-wide total
+# applies to it, which bounds decompression time. Word's own documented ceiling for a
+# document with graphics is 512 MB.
+MAX_ENTRIES = 4096
+MAX_PACKAGE_BYTES = 1024 * MIB
+MAX_PARSED_PART_BYTES = 16 * MIB
+MAX_PARSED_TOTAL_BYTES = 64 * MIB
+HASH_CHUNK_BYTES = 1 * MIB
+# The only ZIP methods OPC allows, and the only ones zipfile decompresses with bounded
+# output: it inflates a whole BZIP2, LZMA or Zstandard chunk at once, so a small
+# compressed part could expand to gigabytes in memory before any limit applies.
+BOUNDED_COMPRESSION = frozenset({ZIP_STORED, ZIP_DEFLATED})
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
@@ -63,6 +77,11 @@ def w(name: str) -> str:
 
 
 COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
+
+
+def size_label(size: int) -> str:
+    """A byte limit in the unit it is written in: "16 MiB", "1 GiB"."""
+    return f"{size // 1024 // MIB} GiB" if size % (1024 * MIB) == 0 else f"{size // MIB} MiB"
 
 
 def attr(node: Element, name: str, default: str = "") -> str:
@@ -151,16 +170,44 @@ class Reader:
         self.comment_ranges: dict[str, tuple[str, str]] = {}
         # Comment ID -> part of its first w:commentReference, for comments without a range.
         self.comment_refs: dict[str, str] = {}
+        # Uncompressed bytes of every part parsed so far, bounded by MAX_PARSED_TOTAL_BYTES.
+        self.parsed_bytes = 0
+        # Story part -> its relationships, parsed once however many notes render from it.
+        self.part_rels: dict[str, Relationships] = {}
 
     def xml(self, name: str) -> Element:
+        # Reading never returns more than the declared size, so checking it first bounds memory.
+        size = self.package.getinfo(name).file_size if name in self.names else 0
+        if size > MAX_PARSED_PART_BYTES:
+            raise DocumentError(f"{name} is {size} bytes uncompressed; parsed parts are limited to "
+                                f"{size_label(MAX_PARSED_PART_BYTES)} each")
+        self.parsed_bytes += size
+        if self.parsed_bytes > MAX_PARSED_TOTAL_BYTES:
+            raise DocumentError(f"cannot parse {name}: parsed parts exceed the "
+                                f"{size_label(MAX_PARSED_TOTAL_BYTES)} total safety limit")
         try:
             return ET.fromstring(self.package.read(name))
         except Exception as exc:
             raise DocumentError(f"cannot parse {name}: {exc}") from exc
 
+    def hash_part(self, name: str) -> tuple[str, int]:
+        """SHA-256 and size of a part, read in fixed-size chunks so memory stays bounded."""
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with self.package.open(name) as stream:
+                while chunk := stream.read(HASH_CHUNK_BYTES):
+                    digest.update(chunk)
+                    size += len(chunk)
+        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
+            raise DocumentError(f"cannot read {name}: {exc}") from exc
+        return digest.hexdigest(), size
+
     def relationships(self, part: str) -> Relationships:
+        if part in self.part_rels:
+            return self.part_rels[part]
         path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
-        result: Relationships = {}
+        result: Relationships = self.part_rels.setdefault(part, {})
         if path not in self.names:
             return result
         for rel in self.xml(path):
@@ -271,11 +318,7 @@ class Reader:
                     entry["target"] = rel[1]  # never fetched, like hyperlinks
                 elif rel is not None and rel[1] in self.names:
                     if rel[1] not in self.media:
-                        try:
-                            data = self.package.read(rel[1])
-                        except Exception as exc:  # e.g. zlib.error for corrupt compressed data
-                            raise DocumentError(f"cannot read {rel[1]}: {exc}") from exc
-                        self.media[rel[1]] = (hashlib.sha256(data).hexdigest(), len(data))
+                        self.media[rel[1]] = self.hash_part(rel[1])
                     entry["sha256"], entry["bytes"] = self.media[rel[1]]
                 else:
                     self.warn(MISSING_IMAGE_NOTE)
@@ -798,10 +841,16 @@ def extract(path: Path) -> Extraction:
         before = path.stat()
         with ZipFile(path) as package:
             infos = package.infolist()
-            if len(infos) > 4096 or sum(i.file_size for i in infos) > 64 * 1024 * 1024:
-                raise DocumentError("package exceeds safety limits (4096 entries / 64 MiB uncompressed)")
-            if any(i.file_size > 16 * 1024 * 1024 for i in infos):
-                raise DocumentError("package part exceeds 16 MiB safety limit")
+            if len(infos) > MAX_ENTRIES:
+                raise DocumentError(f"package has {len(infos)} entries; the safety limit is {MAX_ENTRIES}")
+            total = sum(i.file_size for i in infos)
+            if total > MAX_PACKAGE_BYTES:
+                raise DocumentError(f"package is {total} bytes uncompressed; the safety limit is "
+                                    f"{size_label(MAX_PACKAGE_BYTES)}")
+            for info in infos:
+                if info.compress_type not in BOUNDED_COMPRESSION:
+                    raise DocumentError(f"{info.filename} uses ZIP compression method {info.compress_type}; "
+                                        "DOCX packages may use only stored or deflate")
             if len({i.filename for i in infos}) != len(infos):
                 raise DocumentError("duplicate ZIP entries")
             result = Reader(package).extract()

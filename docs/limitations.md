@@ -97,9 +97,16 @@ are retained literally and may themselves contain sensitive or local paths.
 
 ## Operational limits
 
-Packages are limited to 4096 entries, 64 MiB total uncompressed, and 16 MiB per
-part to bound memory. Large image-heavy documents may exceed these deliberately
-conservative defaults. Duplicate ZIP entries and XML entity expansion are rejected.
+Packages are limited to 4096 entries and 1 GiB total uncompressed (Word's own
+documented ceiling for a document with graphics is 512 MB), which bounds
+decompression work. Parts that Pilcrow parses into memory (XML and `.rels`) are
+limited to 16 MiB each and 64 MiB in total, so a `word/document.xml` over 16 MiB
+is rejected. Images are hashed in 1 MiB chunks without holding them in memory, so
+large or numerous images count only toward the 1 GiB total. A package over a
+limit is an error (exit 2) naming the part or the limit it exceeded. Parts must
+use the stored or deflate ZIP methods, the only ones OPC allows and the only
+ones read with bounded memory. Duplicate ZIP entries and XML entity expansion
+are rejected.
 Output/source symlink paths are rejected to avoid writing through unexpected
 paths. Export checks source stat information before/after reading; it is not a
 cross-process lock. Save completely before export, and rerun after a concurrent
