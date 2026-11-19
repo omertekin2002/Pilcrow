@@ -17,6 +17,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 try:
     from . import test_cli as cli_tests
     from .test_cli import (
+        PKG_R,
         R,
         W,
         anchored,
@@ -29,6 +30,7 @@ try:
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
     import test_cli as cli_tests  # type: ignore[no-redef]
     from test_cli import (  # type: ignore[no-redef]
+        PKG_R,
         R,
         W,
         anchored,
@@ -149,6 +151,17 @@ class SafetyLimitTests(LimitTestCase):
         # Each header declares 15 MiB: under the per-part cap, 75 MiB together.
         declare_sizes(self.root / "essay.docx", dict.fromkeys(headers, 15 * MIB))
         self.rejected("cannot parse word/header", "64 MiB total")
+
+    def test_a_story_parts_relationships_count_once_however_many_notes_it_has(self) -> None:
+        notes = "".join(f'<w:footnote w:id="{n}">{paragraph(f"Note {n}.")}</w:footnote>' for n in range(1, 1101))
+        # 64 KiB of relationships, which 1100 separate parses would charge as 70 MiB.
+        note_rels = f'<Relationships xmlns="{PKG_R}">{image_rel("unused", "media/none.png")}{" " * 64 * 1024}</Relationships>'
+        make_docx(self.root / "essay.docx", paragraph("Prose."),
+                  extra={"word/footnotes.xml": f'<w:footnotes xmlns:w="{W}">{notes}</w:footnotes>',
+                         "word/_rels/footnotes.xml.rels": note_rels},
+                  relationships=f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        self.cli("export", "essay.docx")
+        self.assertIn(b"Note 1100.", self.exported()[0])
 
     def test_a_package_over_1_gib_uncompressed_is_rejected(self) -> None:
         make_docx(self.root / "essay.docx", anchored("Figure:", picture("rId5")),

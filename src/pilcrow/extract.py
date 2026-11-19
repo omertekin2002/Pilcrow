@@ -168,6 +168,8 @@ class Reader:
         self.comment_refs: dict[str, str] = {}
         # Uncompressed bytes of every part parsed so far, bounded by MAX_PARSED_TOTAL_BYTES.
         self.parsed_bytes = 0
+        # Story part -> its relationships, parsed once however many notes render from it.
+        self.part_rels: dict[str, Relationships] = {}
 
     def xml(self, name: str) -> Element:
         # Reading never returns more than the declared size, so checking it first bounds memory.
@@ -198,8 +200,10 @@ class Reader:
         return digest.hexdigest(), size
 
     def relationships(self, part: str) -> Relationships:
+        if part in self.part_rels:
+            return self.part_rels[part]
         path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
-        result: Relationships = {}
+        result: Relationships = self.part_rels.setdefault(part, {})
         if path not in self.names:
             return result
         for rel in self.xml(path):
