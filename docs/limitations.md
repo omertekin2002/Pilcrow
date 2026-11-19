@@ -123,7 +123,10 @@ reports any existing companions as orphans. Empty discovery can succeed with
    justify more metadata. Avoid a dump of all OOXML.
 4. Improve tracked structural revisions, note-reference validation, complex tables,
    and relationship/path canonicalization only as actual documents require it.
-5. Consider opt-in textconv and refresh-only watching after the primary workflow is
-   reliable. Desktop executable discovery needs its own validation.
+5. Opt-in textconv exists (`pilcrow setup --textconv` plus a one-time
+   `git config diff.pilcrow.textconv "pilcrow textconv"`); it shows prose only,
+   not metadata, and is untested in GitHub Desktop, where executable discovery
+   needs its own validation. Consider refresh-only watching after the primary
+   workflow is reliable.
 6. If Word XML is wanted later, build a distinct dialect-detecting adapter. Do not
    treat arbitrary XML as Word input. Automatic document merging stays separate.

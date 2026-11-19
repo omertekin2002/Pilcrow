@@ -7,7 +7,15 @@ from pathlib import Path
 
 from . import __version__
 from .extract import DocumentError, extract
-from .files import companions, no_symlinks, orphaned, select, setup, write_if_changed
+from .files import (
+    TEXTCONV_CONFIG,
+    companions,
+    no_symlinks,
+    orphaned,
+    select,
+    setup,
+    write_if_changed,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -21,7 +29,30 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--all", action="store_true", help="discover DOCX files recursively within --root")
     command = commands.add_parser("setup", help="opt in to LF text and conservative merge rules in .gitattributes")
     command.add_argument("--root", type=Path, default=Path.cwd())
+    command.add_argument("--textconv", action="store_true",
+                         help="also mark DOCX files diff=pilcrow so git diff can show their prose (needs a one-time git config)")
+    command = commands.add_parser("textconv", help="print one DOCX's prose to stdout (a Git textconv driver)")
+    command.add_argument("path", type=Path, help="any DOCX file, such as the temporary file Git passes")
     return result
+
+
+def textconv(path: Path) -> int:
+    """Print exactly the bytes of the prose companion; never write files.
+
+    Git passes temporary copies of old revisions with arbitrary names outside
+    any repository, so no scope, discovery, extension, or symlink rules apply.
+    """
+    try:
+        result = extract(path)
+    except (OSError, DocumentError) as exc:
+        print(f"error: {path}: {exc}", file=sys.stderr)
+        return 2
+    for warning in result.metadata["warnings"]:
+        print(f"warning: {path}: {warning}", file=sys.stderr)
+    # Raw UTF-8 bytes, not the console encoding, so output is identical on Windows.
+    sys.stdout.buffer.write(result.outputs()[".prose.md"])
+    sys.stdout.buffer.flush()
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -30,14 +61,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     args = parser().parse_args(argv)
+    if args.command == "textconv":
+        return textconv(args.path)
     root = args.root.resolve()
     if not root.is_dir():
         print(f"error: --root is not an existing directory: {root}", file=sys.stderr)
         return 2
     try:
         if args.command == "setup":
-            updated = setup(root)
+            updated, diff_driver = setup(root, args.textconv)
             print(f"{'Updated' if updated else 'Unchanged'} {root / '.gitattributes'}; review and commit through Git.")
+            if diff_driver:
+                print("DOCX files are marked diff=pilcrow. Pilcrow does not change Git config; to make git diff show"
+                      f" their prose, run once in this repository:\n  {TEXTCONV_CONFIG}\n"
+                      "Optionally cache the converted text: git config diff.pilcrow.cachetextconv true")
             return 0
         if bool(args.paths) == args.all:
             raise ValueError("specify DOCX paths OR --all; use --root to choose discovery/output scope")

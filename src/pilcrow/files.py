@@ -150,15 +150,26 @@ def write_if_changed(path: Path, content: bytes, root: Path) -> bool:
 
 START = b"# BEGIN Pilcrow generated review rules"
 END = b"# END Pilcrow generated review rules"
-RULES = b"\n".join([
-    START,
-    b"*.[dD][oO][cC][xX] -merge",
-    b".pilcrow/** text eol=lf -merge",
-    END,
-]) + b"\n"
+TEXTCONV = b"*.[dD][oO][cC][xX] diff=pilcrow"
+TEXTCONV_CONFIG = 'git config diff.pilcrow.textconv "pilcrow textconv"'
 
 
-def setup(root: Path) -> bool:
+def rules(textconv: bool) -> bytes:
+    return b"\n".join([
+        START,
+        b"*.[dD][oO][cC][xX] -merge",
+        *([TEXTCONV] if textconv else []),
+        b".pilcrow/** text eol=lf -merge",
+        END,
+    ]) + b"\n"
+
+
+def setup(root: Path, textconv: bool = False) -> tuple[bool, bool]:
+    """Write the managed block; return whether the file changed and whether it opts in to textconv.
+
+    The textconv line is added only on request, but a block that already has it
+    keeps it, so re-running a plain setup never silently drops the opt-in.
+    """
     path = root / ".gitattributes"
     no_symlinks(path, root)
     old = path.read_bytes() if path.exists() else b""
@@ -167,11 +178,12 @@ def setup(root: Path) -> bool:
             raise ValueError("malformed Pilcrow block in .gitattributes; repair it before setup")
         start = old.index(START)
         end = old.index(END) + len(END)
+        textconv = textconv or TEXTCONV in (line.strip() for line in old[start:end].splitlines())
         if old[end:end+2] == b"\r\n":
             end += 2
         elif old[end:end+1] == b"\n":
             end += 1
-        new = old[:start] + RULES + old[end:]
+        new = old[:start] + rules(textconv) + old[end:]
     else:
-        new = old + (b"\n" if old and not old.endswith(b"\n") else b"") + RULES
-    return write_if_changed(path, new, root)
+        new = old + (b"\n" if old and not old.endswith(b"\n") else b"") + rules(textconv)
+    return write_if_changed(path, new, root), textconv
