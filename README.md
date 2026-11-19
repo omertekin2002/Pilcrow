@@ -251,7 +251,7 @@ document repository root:
 
 ```sh
 pilcrow setup --textconv --root .
-git config diff.pilcrow.textconv "pilcrow textconv"
+git config diff.pilcrow.textconv "pilcrow textconv --"
 ```
 
 The first adds `*.[dD][oO][cC][xX] diff=pilcrow` to Pilcrow's managed block in
@@ -260,7 +260,8 @@ keeps that line. The second is a one-time, per-clone Git setting that Pilcrow
 prints but never runs: Pilcrow does not edit Git config. Each collaborator who
 wants the readable diff runs it in their own clone. Optionally add
 `git config diff.pilcrow.cachetextconv true` so Git caches the converted text.
-Until the config is set, Git treats DOCX files exactly as before.
+Until the config is set, Git treats DOCX files exactly as before. The `--`
+lets file names that start with `-` convert too.
 
 `pilcrow textconv <file>` prints exactly what the file's `.prose.md` companion
 would contain and writes nothing. Coverage warnings go to stderr, so they can

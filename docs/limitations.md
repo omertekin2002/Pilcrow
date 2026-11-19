@@ -124,7 +124,7 @@ reports any existing companions as orphans. Empty discovery can succeed with
 4. Improve tracked structural revisions, note-reference validation, complex tables,
    and relationship/path canonicalization only as actual documents require it.
 5. Opt-in textconv exists (`pilcrow setup --textconv` plus a one-time
-   `git config diff.pilcrow.textconv "pilcrow textconv"`); it shows prose only,
+   `git config diff.pilcrow.textconv "pilcrow textconv --"`); it shows prose only,
    not metadata, and is untested in GitHub Desktop, where executable discovery
    needs its own validation. Consider refresh-only watching after the primary
    workflow is reliable.

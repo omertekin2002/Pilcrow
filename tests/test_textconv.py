@@ -62,7 +62,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
 BEGIN = "# BEGIN Pilcrow generated review rules"
 FINISH = "# END Pilcrow generated review rules"
 DIFF_LINE = "*.[dD][oO][cC][xX] diff=pilcrow"
-CONFIG_COMMAND = 'git config diff.pilcrow.textconv "pilcrow textconv"'
+CONFIG_COMMAND = 'git config diff.pilcrow.textconv "pilcrow textconv --"'
 
 
 def rich_documents() -> dict[str, tuple[str, dict[str, str], str]]:
@@ -215,6 +215,11 @@ class TextconvTests(unittest.TestCase):
         self.pilcrow("textconv", code=2)
         self.pilcrow("textconv", "essay.docx", "other.docx", code=2)
         self.pilcrow("textconv", "essay.docx", "--root", self.root, code=2)
+        # "--" ends options, so a name starting with "-" is still a path.
+        shutil.copyfile(self.root / "essay.docx", self.root / "-essay.docx")
+        self.pilcrow("textconv", "-essay.docx", code=2)
+        self.assertEqual(self.pilcrow("textconv", "--", "-essay.docx").stdout,
+                         self.pilcrow("textconv", "essay.docx").stdout)
 
     def attributes(self) -> str:
         return (self.root / ".gitattributes").read_bytes().decode("utf-8")
@@ -269,6 +274,8 @@ class TextconvTests(unittest.TestCase):
         self.init_git()
         source = self.root / "essay.docx"
         make_docx(source, paragraph("Opening sentence. The cat sat on the mat.") + paragraph("Closing line."))
+        dashed = self.root / "-dashed.docx"
+        make_docx(dashed, paragraph("Dashed before."))
         config_before = (self.root / ".git" / "config").read_bytes()
         setup = self.pilcrow("setup", "--textconv")
         self.assertIn(CONFIG_COMMAND.encode(), setup.stdout)
@@ -278,6 +285,7 @@ class TextconvTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "Add essay without companions")
         make_docx(source, paragraph("Opening sentence. The dog sat on the mat.") + paragraph("Closing line."))
+        make_docx(dashed, paragraph("Dashed after."))
 
         # Without the Git config, the attribute alone changes nothing.
         diff = self.git("diff", "--", "essay.docx")
@@ -286,11 +294,15 @@ class TextconvTests(unittest.TestCase):
 
         # Quote the interpreter for Git's shell; forward slashes also work on Windows.
         python = Path(sys.executable).as_posix()
-        self.git("config", "diff.pilcrow.textconv", f"'{python}' -m pilcrow textconv")
+        self.git("config", "diff.pilcrow.textconv", f"'{python}' -m pilcrow textconv --")
         diff = self.git("diff", "--", "essay.docx")
         self.assertIn("-The cat sat on the mat.\n", diff)
         self.assertIn("+The dog sat on the mat.\n", diff)
         self.assertNotIn("Opening sentence.\n", [line[1:] + "\n" for line in diff.splitlines() if line[:1] in "+-"])
+        # Git passes a working-tree name unchanged; one starting with "-" must not abort the diff.
+        dashed_diff = self.git("diff", "--", "-dashed.docx")
+        self.assertIn("-Dashed before.\n", dashed_diff)
+        self.assertIn("+Dashed after.\n", dashed_diff)
         self.git("commit", "-qam", "Edit essay")
         log = self.git("log", "-p", "--", "essay.docx")
         self.assertIn("+The dog sat on the mat.\n", log)

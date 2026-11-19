@@ -151,7 +151,8 @@ def write_if_changed(path: Path, content: bytes, root: Path) -> bool:
 START = b"# BEGIN Pilcrow generated review rules"
 END = b"# END Pilcrow generated review rules"
 TEXTCONV = b"*.[dD][oO][cC][xX] diff=pilcrow"
-TEXTCONV_CONFIG = 'git config diff.pilcrow.textconv "pilcrow textconv"'
+# "--" keeps a file name that starts with "-" from being read as an option.
+TEXTCONV_CONFIG = 'git config diff.pilcrow.textconv "pilcrow textconv --"'
 
 
 def rules(textconv: bool) -> bytes:
