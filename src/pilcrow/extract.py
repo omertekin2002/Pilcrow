@@ -176,7 +176,10 @@ class Reader:
         self.part_rels: dict[str, Relationships] = {}
 
     def xml(self, name: str) -> Element:
-        # Reading never returns more than the declared size, so checking it first bounds memory.
+        # Reading at most the declared size bounds memory, so check that size first. Reading
+        # exactly that many bytes, not to the end, also bounds each inflate step: ZipFile.read
+        # inflates a whole deflate stream in one step, so a part declaring a small size could
+        # expand to gigabytes before being cut to its size and failing its CRC check.
         size = self.package.getinfo(name).file_size if name in self.names else 0
         if size > MAX_PARSED_PART_BYTES:
             raise DocumentError(f"{name} is {size} bytes uncompressed; parsed parts are limited to "
@@ -186,7 +189,9 @@ class Reader:
             raise DocumentError(f"cannot parse {name}: parsed parts exceed the "
                                 f"{size_label(MAX_PARSED_TOTAL_BYTES)} total safety limit")
         try:
-            return ET.fromstring(self.package.read(name))
+            with self.package.open(name) as stream:
+                data = stream.read(size)
+            return ET.fromstring(data)
         except Exception as exc:
             raise DocumentError(f"cannot parse {name}: {exc}") from exc
 

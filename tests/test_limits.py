@@ -144,6 +144,21 @@ class SafetyLimitTests(LimitTestCase):
         make_docx(self.root / "essay.docx", paragraph("Prose."), relationships=" " * (17 * MIB))
         self.rejected("word/_rels/document.xml.rels is ", "16 MiB")
 
+    def test_a_part_inflating_past_its_declared_size_is_rejected_without_inflating_it(self) -> None:
+        from pilcrow.extract import DocumentError, extract
+        make_docx(self.root / "essay.docx", paragraph("a" * (16 * MIB)))
+        # A hostile header declares 64 KiB for a stream that inflates to 16 MiB.
+        declare_sizes(self.root / "essay.docx", {"word/document.xml": 64 * 1024})
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(DocumentError, "cannot parse word/document.xml: Bad CRC-32"):
+                extract(self.root / "essay.docx")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * MIB, f"peak traced memory {peak} bytes reading a part declared as 64 KiB")
+        self.rejected("cannot parse word/document.xml")
+
     def test_parsed_parts_over_64_mib_in_total_are_rejected(self) -> None:
         headers = {f"word/header{n}.xml": header(f"Header {n}.") for n in range(5)}
         rels = "".join(HEADER_REL.format(rid=f"h{n}", R=R, target=f"header{n}.xml") for n in range(5))

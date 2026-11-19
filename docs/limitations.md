@@ -101,7 +101,9 @@ Packages are limited to 4096 entries and 1 GiB total uncompressed (Word's own
 documented ceiling for a document with graphics is 512 MB), which bounds
 decompression work. Parts that Pilcrow parses into memory (XML and `.rels`) are
 limited to 16 MiB each and 64 MiB in total, so a `word/document.xml` over 16 MiB
-is rejected. Images are hashed in 1 MiB chunks without holding them in memory, so
+is rejected. They are inflated no further than the size the package declares
+for them, so a part that inflates past it fails its CRC check without using more
+memory. Images are hashed in 1 MiB chunks without holding them in memory, so
 large or numerous images count only toward the 1 GiB total. A package over a
 limit is an error (exit 2) naming the part or the limit it exceeded. Parts must
 use the stored or deflate ZIP methods, the only ones OPC allows and the only
