@@ -12,7 +12,7 @@ import tempfile
 import tracemalloc
 import unittest
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_LZMA, ZipFile, ZipInfo
 
 try:
     from . import test_cli as cli_tests
@@ -175,6 +175,21 @@ class SafetyLimitTests(LimitTestCase):
             for n in range(4096 - len(archive.namelist()) + 1):
                 archive.writestr(f"customXml/item{n}.xml", "")
         self.rejected("package has 4097 entries", "4096")
+
+    def test_compression_methods_without_bounded_output_are_rejected(self) -> None:
+        for method, module in ((ZIP_BZIP2, "bz2"), (ZIP_LZMA, "lzma")):
+            with self.subTest(module=module):
+                try:
+                    __import__(module)
+                except ImportError:
+                    self.skipTest(f"{module} unavailable in this Python")
+                make_docx(self.root / "essay.docx", anchored("Figure:", picture("rId5")),
+                          relationships=image_rel("rId5", "media/image1.png"))
+                with ZipFile(self.root / "essay.docx", "a") as archive:
+                    info = ZipInfo("word/media/image1.png", date_time=(2020, 1, 2, 3, 4, 6))
+                    info.compress_type = method
+                    archive.writestr(info, b"\0" * MIB)
+                self.rejected(f"word/media/image1.png uses ZIP compression method {method}", "stored or deflate")
 
     def test_packages_at_the_limits_are_accepted(self) -> None:
         make_docx(self.root / "essay.docx", paragraph("Prose."), extra={"word/media/image1.png": "unused"})

@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
 
@@ -64,6 +64,10 @@ MAX_PACKAGE_BYTES = 1024 * MIB
 MAX_PARSED_PART_BYTES = 16 * MIB
 MAX_PARSED_TOTAL_BYTES = 64 * MIB
 HASH_CHUNK_BYTES = 1 * MIB
+# The only ZIP methods OPC allows, and the only ones zipfile decompresses with bounded
+# output: it inflates a whole BZIP2, LZMA or Zstandard chunk at once, so a small
+# compressed part could expand to gigabytes in memory before any limit applies.
+BOUNDED_COMPRESSION = frozenset({ZIP_STORED, ZIP_DEFLATED})
 # Relationship Id -> (type suffix, target, is external).
 Relationships: TypeAlias = dict[str | None, tuple[str, str, bool]]
 
@@ -843,6 +847,10 @@ def extract(path: Path) -> Extraction:
             if total > MAX_PACKAGE_BYTES:
                 raise DocumentError(f"package is {total} bytes uncompressed; the safety limit is "
                                     f"{size_label(MAX_PACKAGE_BYTES)}")
+            for info in infos:
+                if info.compress_type not in BOUNDED_COMPRESSION:
+                    raise DocumentError(f"{info.filename} uses ZIP compression method {info.compress_type}; "
+                                        "DOCX packages may use only stored or deflate")
             if len({i.filename for i in infos}) != len(infos):
                 raise DocumentError("duplicate ZIP entries")
             result = Reader(package).extract()
