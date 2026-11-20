@@ -203,6 +203,53 @@ The action installs Pilcrow from the tagged source into a private virtual
 environment and fails with Pilcrow's exit code: 1 for missing, stale or orphan
 companions, 2 for errors.
 
+### Review report in the job summary (optional)
+
+The action can also write a review of each DOCX the push or pull request changed
+to the workflow run's job summary, so a reviewer can see what changed without
+checking the branch out. It is off by default (`summary: none`): without the
+input, the action only runs the check, exactly as above. Releases before the one
+that ships this input ignore it.
+
+```yaml
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0       # the summary compares with the base commit, so fetch it
+      - uses: omertekin2002/Pilcrow@v0.1.3
+        with:
+          summary: outline     # none (default), outline or full
+          # base: <revision>   # optional; default: the pull request's base, or the push's previous commit
+```
+
+- `outline` publishes **no document text**. For each changed document it lists
+  the path, its status (changed, no supported changes, added, removed, or could
+  not be read) and the report sections that differ, each with its count of
+  described lines, such as `` `report.docx` — changed: Prose changed, Comments (2) ``.
+- `full` publishes each changed document's complete
+  [`pilcrow review --format markdown`](#review-a-change-in-words) report, comparing
+  the document at `base` with `HEAD`. **The report includes document text (prose,
+  comments, tracked changes, link targets), and anyone who can view the workflow
+  run can read it**, which for a public repository means anyone. The summary
+  repeats this warning at the top. Choose `outline` when the text must not leave
+  the repository.
+
+The new side is always `HEAD`. For a `pull_request` event, actions/checkout checks
+out the merge commit, so the summary shows what the pull request changes. Only
+DOCX files within `root` are listed, with the same lock-file and excluded-folder
+rules as `pilcrow check --all`. A renamed document is listed as removed and
+added, and an added or removed one has no report.
+
+The summary step is read-only and never fails the job: it runs even when the
+check fails, and the action's outcome stays the check's. When the base is missing
+(the first push of a new branch) or not in the checkout (the default shallow
+`fetch-depth: 1` clone), the summary explains why there is no review and the step
+adds a warning annotation. One unreadable document gets a warning while the
+others are still reported. GitHub limits a job summary to 1 MiB, so once the
+reports reach about 900 KB, the remaining documents are listed as `report
+omitted: summary size limit`. The action's `summary-file` output is the path of
+the Markdown file it wrote, for later steps that want to post or check it.
+
 ## Branches and conflicts
 
 Opt in to conservative merge rules once, from your document repository root:
@@ -378,6 +425,9 @@ outside a Git repository, an unknown revision, and a revision whose name starts
 with `-`. A file added or deleted in the commit has no other side to compare, so
 it reports an error. `git difftool` ignores the exit code unless you pass
 `--trust-exit-code`.
+
+In CI, the GitHub Action can publish these reports for every changed document in
+the job summary; see [Review report in the job summary](#review-report-in-the-job-summary-optional).
 
 ## Coverage and maintenance
 

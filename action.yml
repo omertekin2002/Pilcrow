@@ -11,6 +11,25 @@ inputs:
     description: Python version used to run Pilcrow (3.10 or later).
     required: false
     default: "3.12"
+  summary:
+    description: >-
+      Write a review of each changed DOCX to the job summary: "none" (no summary),
+      "outline" (paths, statuses and which report sections changed; no document text) or
+      "full" (each document's `pilcrow review --format markdown` report, which includes
+      document text visible to anyone who can view the workflow run).
+    required: false
+    default: "none"
+  base:
+    description: >-
+      Revision to compare from when `summary` is set; the new side is always HEAD.
+      The checkout must include it (for example `fetch-depth: 0` on actions/checkout).
+    required: false
+    default: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+outputs:
+  summary-file:
+    description: Path of the Markdown summary file, when `summary` is set (also appended to the job summary).
+    value: ${{ steps.summary.outputs.file }}
 
 runs:
   using: composite
@@ -49,3 +68,25 @@ runs:
         PILCROW_PYTHON: ${{ steps.install.outputs.python }}
         PILCROW_ROOT: ${{ inputs.root }}
       run: '"$PILCROW_PYTHON" -m pilcrow check --all --root "$PILCROW_ROOT"'
+
+    # Runs after a failed check too; the action's outcome stays the check's. Problems with the
+    # base or a document become a warning in the summary, never a failure.
+    - id: summary
+      name: Summarize changed documents
+      if: always() && steps.install.outcome == 'success' && inputs.summary != 'none'
+      shell: bash
+      env:
+        PILCROW_PYTHON: ${{ steps.install.outputs.python }}
+        PILCROW_ROOT: ${{ inputs.root }}
+        PILCROW_BASE: ${{ inputs.base }}
+        PILCROW_MODE: ${{ inputs.summary }}
+      run: |
+        case "$PILCROW_MODE" in
+          outline|full) ;;
+          *) echo "::error::summary must be none, outline or full, not '$PILCROW_MODE'"; exit 2 ;;
+        esac
+        file="$RUNNER_TEMP/pilcrow-summary-$$-$RANDOM.md"
+        # "--option=value", so a value that starts with "-" is not read as an option.
+        "$PILCROW_PYTHON" -m pilcrow.summary --base="$PILCROW_BASE" --root="$PILCROW_ROOT" --mode="$PILCROW_MODE" --output="$file"
+        cat "$file" >> "$GITHUB_STEP_SUMMARY"
+        echo "file=$file" >> "$GITHUB_OUTPUT"

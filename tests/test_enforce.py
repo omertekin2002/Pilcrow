@@ -84,6 +84,22 @@ class FixtureRepoTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("report.docx", result.stdout + result.stderr)
 
+    def test_commit_adds_an_edited_fresh_document(self) -> None:
+        script = PROJECT / "scripts" / "make_fixture_repo.py"
+        for args in ((), ("--commit",)):
+            made = self.run_python(script, self.root, *args)
+            self.assertEqual(made.returncode, 0, made.stderr)
+        log = subprocess.run(["git", "-C", str(self.root), "log", "--format=%s"],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(len(log.stdout.splitlines()), 2)
+        status = subprocess.run(["git", "-C", str(self.root), "status", "--porcelain"],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(status.stdout, "")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        prose = (self.root / ".pilcrow" / "report.docx.prose.md").read_text(encoding="utf-8")
+        self.assertIn("now says something else", prose)
+
     def test_refuses_a_non_empty_directory(self) -> None:
         self.root.mkdir()
         (self.root / "keep.txt").write_text("x", encoding="utf-8")

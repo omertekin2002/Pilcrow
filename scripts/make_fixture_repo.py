@@ -4,6 +4,7 @@ Usage (Pilcrow must be importable by this Python, e.g. after ``pip install .``):
 
     python scripts/make_fixture_repo.py DIR           # fresh: DOCX + exported companions, committed
     python scripts/make_fixture_repo.py DIR --stale   # edit and stage the DOCX without re-exporting
+    python scripts/make_fixture_repo.py DIR --commit  # edit the DOCX, re-export and commit it
 
 The DOCX is generated deterministically; no binary fixture is checked in.
 """
@@ -81,12 +82,24 @@ def make_stale(root: Path) -> None:
     run(*GIT, "add", DOCUMENT, cwd=root)
 
 
+def make_commit(root: Path) -> None:
+    """A second commit with an edited DOCX and fresh companions, for the Action's job summary."""
+    if not (root / DOCUMENT).is_file():
+        raise SystemExit(f"{root}: run without --commit first")
+    write_docx(root / DOCUMENT, STALE_TEXT)
+    run(sys.executable, "-m", "pilcrow", "export", "--all", "--root", ".", cwd=root)
+    run(*GIT, "add", "--all", cwd=root)
+    run(*GIT, "commit", "--quiet", "-m", "Edit the fixture report and re-export its companions", cwd=root)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("directory", type=Path)
-    parser.add_argument("--stale", action="store_true", help="edit and stage the DOCX without re-exporting")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--stale", action="store_true", help="edit and stage the DOCX without re-exporting")
+    mode.add_argument("--commit", action="store_true", help="edit the DOCX, re-export and commit it")
     args = parser.parse_args(argv)
-    (make_stale if args.stale else make_fresh)(args.directory)
+    (make_stale if args.stale else make_commit if args.commit else make_fresh)(args.directory)
 
 
 if __name__ == "__main__":
