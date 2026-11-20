@@ -68,6 +68,26 @@ lexically. Internal part paths come from the package; no machine paths, save
 counters, revision dates, or export timestamps are added. Hyperlink destinations
 are retained literally and may themselves contain sensitive or local paths.
 
+## The review report
+
+`pilcrow review` compares the same two views the companions hold, the prose and
+the metadata above, and describes their differences; it adds no new extraction.
+It claims no more than they do: formatting, layout, and unrendered content can
+differ while the report says "No supported prose or review changes detected".
+Metadata entries are matched by aligning their full content, so an entry that
+moved is reported as removed and added. A field change inside an aligned block
+(a link target, an image hash, a list level's format) is described at that
+position. Comments are worded as resolved, reopened, re-anchored, or edited only
+when every other recorded field, including author, text, anchor and the parent
+of a reply, identifies exactly one comment on each side, and resolved or
+reopened only when both states are known; otherwise they fall back to removed
+and added, or to a notice that the category changed. A reply is matched by its
+parent's author, text, and anchor rather than its recorded position, so inserting
+an earlier comment does not change it; when several comments share that identity,
+the position is compared too, so moving a reply between them is still reported.
+An image whose media part goes missing or appears is listed as removed and added.
+Long texts are shortened to 80 characters for display.
+
 ## Normalization and sentence lines
 
 - UTF-8, LF endings, terminal newline. Unicode, punctuation, numbers, and negations

@@ -275,6 +275,38 @@ GitHub Desktop uses the driver is **untested**.
 To opt out, delete the `diff=pilcrow` line from the managed block by hand, or
 run `git config --unset diff.pilcrow.textconv`.
 
+## Review a change in words
+
+`pilcrow review OLD.docx NEW.docx` prints a plain-language report of what
+changed between two DOCX files. It is read-only: it extracts both files in
+memory, writes nothing (no `.pilcrow/` companions), and never runs Git. To review
+a committed change, let Git hand it the two versions:
+
+```sh
+git difftool -y -x 'pilcrow review' HEAD~1 -- report.docx
+```
+
+The report starts with a unified diff of the prose (the `.prose.md` text, capped
+at 2,000 lines), then one section per kind of review metadata that differs:
+comments, tracked changes, hyperlinks, fields, images, lists, and coverage
+warnings. Entries are matched by content, not by position, and described in
+words, for example `~ resolved comment by Ada on "first sentence.": "Please
+clarify."`, `~ link "Report": https://old.example → https://new.example`, or
+`~ list 1 level 0: bullet → decimal`. A comment is called resolved, reopened,
+re-anchored, or edited only when its author, text, and anchor identify exactly
+one comment on each side; otherwise the report says it was removed and added.
+When something changed, the coverage warnings of both files are listed once.
+
+The report shows only what Pilcrow's extraction supports: formatting, layout,
+and anything else outside the prose and `.meta.json` are not compared, so "No
+supported prose or review changes detected" is not a claim that the documents
+are identical. Like `textconv`, it accepts any file name, because Git passes
+temporary copies. Exit codes follow `diff`: 0 when nothing supported differs,
+1 when the report lists differences, and 2 when an input is missing, unreadable,
+or malformed (the error names that file and nothing is printed on stdout). A file
+added or deleted in the commit has no other side to compare, so it reports an
+error. `git difftool` ignores the exit code unless you pass `--trust-exit-code`.
+
 ## Coverage and maintenance
 
 See [coverage, normalization, and backlog](docs/limitations.md). The prose retains
@@ -332,8 +364,9 @@ Run the generated-fixture suite:
 python -m unittest discover -s tests -v
 ```
 
-The implementation has four small modules: `prose.py` (segmentation), `extract.py`
-(OOXML coverage), `files.py` (scope and writes), and `cli.py` (commands). Tests
+The implementation has five small modules: `prose.py` (segmentation), `extract.py`
+(OOXML coverage), `files.py` (scope and writes), `review.py` (the change report), and
+`cli.py` (commands). Tests
 include temporary Git repositories and failure cases. Generated fixtures do not
 establish complete Microsoft Word compatibility. No real/private document corpus
 was available for this implementation.
