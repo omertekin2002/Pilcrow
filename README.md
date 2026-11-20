@@ -279,8 +279,28 @@ run `git config --unset diff.pilcrow.textconv`.
 
 `pilcrow review OLD.docx NEW.docx` prints a plain-language report of what
 changed between two DOCX files. It is read-only: it extracts both files in
-memory, writes nothing (no `.pilcrow/` companions), and never runs Git. To review
-a committed change, let Git hand it the two versions:
+memory and writes nothing (no `.pilcrow/` companions).
+
+To review a committed change, name the revision with `--rev`, as in `git diff`:
+
+```sh
+pilcrow review --rev HEAD report.docx              # last commit → working copy
+pilcrow review --rev HEAD~1 --rev HEAD report.docx # one commit → the next
+pilcrow review --rev main --rev feature report.docx
+```
+
+With one `--rev`, the old side is `report.docx` as committed at that revision
+and the new side is the file in your working copy. With two, both sides come
+from Git and the working copy is not read. The header names both sides, such as
+`Review: HEAD~1:report.docx → report.docx`. The path is relative to the current
+directory, like `git show HEAD:./report.docx`. The old side is extracted from
+the **committed DOCX itself**, not from companions committed with it, so it needs
+no `.pilcrow/` files and works for history from before you used Pilcrow.
+Pilcrow reads it with read-only Git commands (`rev-parse` and `cat-file`): it
+never stages, checks out, or writes a file, not even a temporary one, and it
+checks the committed file's size against the package limit before reading it.
+
+Alternatively, let `git difftool` hand it the two versions as temporary files:
 
 ```sh
 git difftool -y -x 'pilcrow review' HEAD~1 -- report.docx
@@ -303,9 +323,12 @@ supported prose or review changes detected" is not a claim that the documents
 are identical. Like `textconv`, it accepts any file name, because Git passes
 temporary copies. Exit codes follow `diff`: 0 when nothing supported differs,
 1 when the report lists differences, and 2 when an input is missing, unreadable,
-or malformed (the error names that file and nothing is printed on stdout). A file
-added or deleted in the commit has no other side to compare, so it reports an
-error. `git difftool` ignores the exit code unless you pass `--trust-exit-code`.
+or malformed (the error names that input, such as `error: HEAD~1:report.docx: …`,
+and nothing is printed on stdout). With `--rev`, that also covers running
+outside a Git repository, an unknown revision, and a revision whose name starts
+with `-`. A file added or deleted in the commit has no other side to compare, so
+it reports an error. `git difftool` ignores the exit code unless you pass
+`--trust-exit-code`.
 
 ## Coverage and maintenance
 

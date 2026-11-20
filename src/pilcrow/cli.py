@@ -6,12 +6,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .extract import DocumentError, extract
+from .extract import MAX_PACKAGE_BYTES, DocumentError, extract
 from .files import (
     TEXTCONV_CONFIG,
     companions,
     no_symlinks,
     orphaned,
+    revision_blob,
     select,
     setup,
     write_if_changed,
@@ -34,9 +35,17 @@ def parser() -> argparse.ArgumentParser:
                          help="also mark DOCX files diff=pilcrow so git diff can show their prose (needs a one-time git config)")
     command = commands.add_parser("textconv", help="print one DOCX's prose to stdout (a Git textconv driver)")
     command.add_argument("path", type=Path, help="any DOCX file, such as the temporary file Git passes")
-    command = commands.add_parser("review", help="describe prose and review changes between two DOCX files in words (read-only)")
-    command.add_argument("old", type=Path, help="the earlier DOCX, such as the temporary file git difftool passes")
-    command.add_argument("new", type=Path, help="the later DOCX")
+    command = commands.add_parser(
+        "review", help="describe prose and review changes between two DOCX files in words (read-only)",
+        usage="%(prog)s OLD NEW\n       %(prog)s --rev REV [--rev REV] PATH",
+        description="Compare OLD with NEW; or PATH at REV with the PATH in the work tree; "
+                    "or PATH at the first REV with PATH at the second, without reading the work tree.")
+    command.add_argument("paths", type=Path, nargs="+", metavar="PATH",
+                         help="OLD and NEW (any DOCX files, such as the temporary ones git difftool passes), "
+                              "or with --rev one DOCX path relative to the current directory")
+    command.add_argument("--rev", action="append", default=[], metavar="REV",
+                         help="read PATH as committed at this Git revision; give it once or twice, as in git diff")
+    command.set_defaults(usage_error=command.error)  # report usage errors with the review usage
     return result
 
 
@@ -59,23 +68,34 @@ def textconv(path: Path) -> int:
     return 0
 
 
-def review_command(old: Path, new: Path) -> int:
-    """Print a report of what changed from ``old`` to ``new``; never write files or run Git.
+def review_command(paths: list[Path], revisions: list[str]) -> int:
+    """Print a report of what changed from the old side to the new one; never write files.
 
-    Like textconv, no scope, discovery, extension, or symlink rules apply, because
-    git difftool passes temporary copies with arbitrary names. Exit codes follow diff:
-    0 no supported differences, 1 differences reported, 2 an input failed.
+    Each side is a DOCX file, or with ``--rev`` the DOCX blob committed at a
+    revision, read with read-only Git plumbing. Like textconv, no scope,
+    discovery, extension, or symlink rules apply, because git difftool passes
+    temporary copies with arbitrary names. Exit codes follow diff: 0 no
+    supported differences, 1 differences reported, 2 an input failed.
     """
+    sides: list[tuple[str, Path, str | None]]
+    if revisions:
+        (path,) = paths
+        sides = [(f"{rev}:{path}", path, rev) for rev in revisions]
+        if len(sides) == 1:
+            sides.append((str(path), path, None))
+    else:
+        sides = [(str(path), path, None) for path in paths]
     results = []
-    for path in (old, new):
+    for label, path, rev in sides:
         try:
-            results.append(extract(path))
-        except (OSError, DocumentError) as exc:
-            print(f"error: {path}: {exc}", file=sys.stderr)
+            results.append(extract(path if rev is None else revision_blob(path, rev, MAX_PACKAGE_BYTES)))
+        except (OSError, ValueError) as exc:  # DocumentError is a ValueError
+            print(f"error: {label}: {exc}", file=sys.stderr)
     if len(results) != 2:
         return 2  # no partial report
     report, changed = review(results[0], results[1])
     # Raw UTF-8 bytes, not the console encoding, so output is identical on Windows.
+    old, new = sides[0][0], sides[1][0]
     sys.stdout.buffer.write(f"Review: {old} → {new}\n\n{report}".encode("utf-8", "backslashreplace"))
     sys.stdout.buffer.flush()
     return 1 if changed else 0
@@ -90,7 +110,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "textconv":
         return textconv(args.path)
     if args.command == "review":
-        return review_command(args.old, args.new)
+        if len(args.rev) > 2:
+            args.usage_error("give --rev at most twice")
+        if len(args.paths) != (1 if args.rev else 2):
+            args.usage_error(f"{'--rev takes one PATH' if args.rev else 'give OLD and NEW, or --rev REV PATH'}, "
+                             f"not {len(args.paths)}")
+        return review_command(args.paths, args.rev)
     root = args.root.resolve()
     if not root.is_dir():
         print(f"error: --root is not an existing directory: {root}", file=sys.stderr)

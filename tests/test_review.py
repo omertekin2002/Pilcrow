@@ -402,5 +402,177 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((repo / ".pilcrow").exists())
 
 
+class RevisionReviewTests(unittest.TestCase):
+    """`pilcrow review --rev`: the old side, or both, read from Git with read-only plumbing."""
+
+    def setUp(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-review-rev-")
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        self.outside = base / "outside"  # not in any repository: GIT_CEILING_DIRECTORIES stops the search
+        self.outside.mkdir()
+        # An empty temporary directory for every process, to show nothing is written there.
+        self.tmp = base / "tmp"
+        self.tmp.mkdir()
+        self.env = {**os.environ, "TMPDIR": str(self.tmp), "TEMP": str(self.tmp), "TMP": str(self.tmp),
+                    "GIT_CEILING_DIRECTORIES": str(base)}
+        self.env["PYTHONPATH"] = os.pathsep.join((str(PROJECT / "src"), self.env.get("PYTHONPATH", "")))
+        for args in (("init", "-q"), ("config", "user.name", "Pilcrow Test"),
+                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false")):
+            self.git(*args)
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=self.repo, env=self.env, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.decode("utf-8")
+
+    def commit(self, message: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def pilcrow(self, *args: str | Path, code: int, cwd: Path | None = None,
+                limit: int | None = None) -> subprocess.CompletedProcess[bytes]:
+        command = [sys.executable, "-m", "pilcrow"]
+        if limit is not None:  # lower the package size limit in the child process
+            command = [sys.executable, "-c", "import sys; import pilcrow.cli as cli; "
+                       f"cli.MAX_PACKAGE_BYTES = {limit}; sys.exit(cli.main(sys.argv[1:]))"]
+        result = subprocess.run([*command, *(str(arg) for arg in args)], cwd=cwd or self.repo, env=self.env,
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, code, f"args={args!r}\nstdout={result.stdout!r}\nstderr={result.stderr!r}")
+        return result
+
+    def state(self) -> tuple[object, ...]:
+        """The work tree, the index and the temporary directory, read without refreshing the index."""
+        index = self.repo / ".git" / "index"
+        status = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain"], cwd=self.repo,
+                                env=self.env, capture_output=True, timeout=60).stdout
+        return tree(self.repo), index.stat().st_mtime_ns, status, tree(self.tmp)
+
+    def threaded(self, path: Path, text: str, done: str) -> None:
+        comments, ids = {"1": "Please check."}, {"1": "11111111"}
+        body = paragraph(text) + f"<w:p>{start('1')}{run('A commented passage.')}{end('1')}</w:p>"
+        make_docx(path, body,
+                  extra={"word/comments.xml": comments_part(comments, ids),
+                         "word/commentsExtended.xml": comments_extended(("11111111", None, done))},
+                  relationships=COMMENTS_REL + COMMENTS_EXT_REL)
+
+    def test_an_unchanged_work_tree_reports_no_changes(self) -> None:
+        make_docx(self.repo / "report.docx", paragraph("A sentence."))
+        self.commit("first")
+        before = self.state()
+        result = self.pilcrow("review", "--rev", "HEAD", "report.docx", code=0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout.decode("utf-8"),
+                         f"Review: HEAD:report.docx → report.docx\n\nProse: no changes\n\n{CAVEAT}\n")
+        self.assertEqual(self.state(), before)
+
+    def test_work_tree_edits_match_a_review_of_two_files(self) -> None:
+        document = self.repo / "report.docx"
+        self.threaded(document, "The cat sat. It was warm.", "0")
+        self.commit("first")
+        committed = Path(self.temp.name) / "old.docx"
+        shutil.copy(document, committed)
+        self.threaded(document, "The dog sat. It was warm.", "1")  # edit the prose and resolve the comment
+        before = self.state()
+        result = self.pilcrow("review", "--rev", "HEAD", "report.docx", code=1)
+        self.assertEqual(self.state(), before)
+        header, body = result.stdout.split(b"\n", 1)
+        self.assertEqual(header.decode("utf-8"), "Review: HEAD:report.docx → report.docx")
+        files = self.pilcrow("review", committed, "report.docx", code=1)
+        self.assertEqual(body, files.stdout.split(b"\n", 1)[1])
+        self.assertIn(b"-The cat sat.", body)
+        self.assertIn(b"~ resolved comment by Ada", body)
+
+    def test_two_revisions_ignore_the_work_tree(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(document, paragraph("The dog sat."))
+        self.commit("second")
+        make_docx(document, paragraph("An uncommitted edit."))
+        before = self.state()
+        report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", "report.docx", code=1).stdout.decode("utf-8")
+        self.assertTrue(report.startswith("Review: HEAD~1:report.docx → HEAD:report.docx\n\n"), report)
+        self.assertIn("-The cat sat.", report)
+        self.assertIn("+The dog sat.", report)
+        self.assertNotIn("uncommitted", report)
+        self.assertEqual(self.state(), before)
+        # The work-tree file is not read at all, so it need not exist.
+        document.unlink()
+        self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "report.docx", code=0)
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "feature", "HEAD~1")
+        report = self.pilcrow("review", "--rev", branch, "--rev", "feature", "report.docx", code=1).stdout.decode("utf-8")
+        self.assertTrue(report.startswith(f"Review: {branch}:report.docx → feature:report.docx\n\n"), report)
+        self.assertIn("-The dog sat.", report)
+
+    def test_subdirectories_spaces_and_unicode(self) -> None:
+        folder = self.repo / "drafts and notes" / "İstanbul"
+        document = folder / "résumé final.docx"
+        make_docx(document, paragraph("Old wording."))
+        make_docx(self.repo / "résumé final.docx", paragraph("A different file at the top."))
+        self.commit("first")
+        make_docx(document, paragraph("New wording."))
+        relative = Path("drafts and notes") / "İstanbul" / "résumé final.docx"
+        for cwd, path in ((self.repo, relative), (folder, Path("résumé final.docx")),
+                          (folder.parent, Path("İstanbul") / "résumé final.docx"),
+                          (self.outside, document)):
+            with self.subTest(cwd=cwd.name, path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD", path, cwd=cwd, code=1).stdout.decode("utf-8")
+                self.assertTrue(report.startswith(f"Review: HEAD:{path} → {path}\n\n"), report)
+                self.assertIn("-Old wording.", report)
+                self.assertIn("+New wording.", report)
+        # From a subdirectory, a bare name means the file there, not the one at the top of the repository.
+        self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "résumé final.docx", cwd=folder, code=0)
+        report = self.pilcrow("review", "--rev", "HEAD", "résumé final.docx", cwd=folder, code=1).stdout
+        self.assertNotIn(b"A different file", report)
+
+    def test_errors_name_the_input_print_no_report_and_write_nothing(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("First."))
+        self.commit("first")
+        make_docx(self.repo / "added.docx", paragraph("Added later."))
+        (self.repo / "folder.docx").mkdir()
+        make_docx(self.repo / "folder.docx" / "inner.docx", paragraph("Inside."))
+        self.commit("second")
+        shutil.copy(document, self.outside / "report.docx")
+        size = int(self.git("cat-file", "-s", "HEAD:report.docx"))
+        before = self.state()
+        cases: list[tuple[tuple[str, ...], Path, int | None, bytes]] = [
+            (("--rev", "HEAD", "report.docx"), self.outside, None, b"error: HEAD:report.docx: not a git repository"),
+            (("--rev", "no-such-revision", "report.docx"), self.repo, None,
+             b"error: no-such-revision:report.docx: unknown revision"),
+            (("--rev", "HEAD~1", "added.docx"), self.repo, None, b"error: HEAD~1:added.docx: no such file at HEAD~1"),
+            (("--rev", "HEAD", "folder.docx"), self.repo, None, b"error: HEAD:folder.docx: not a file at HEAD"),
+            (("--rev=-c", "report.docx"), self.repo, None, b'error: -c:report.docx: a revision must not start with "-"'),
+            (("--rev=--output=x", "report.docx"), self.repo, None, b"error: --output=x:report.docx: a revision must"),
+            (("--rev", "HEAD", "report.docx"), self.repo, size - 1,
+             f"error: HEAD:report.docx: file is {size} bytes at HEAD; the safety limit is {size - 1} bytes".encode()),
+            (("--rev", "HEAD", "report.docx", "report.docx"), self.repo, None, b"--rev takes one PATH, not 2"),
+            (("--rev", "HEAD", "--rev", "HEAD", "--rev", "HEAD", "report.docx"), self.repo, None,
+             b"give --rev at most twice"),
+        ]
+        for args, cwd, limit, message in cases:
+            with self.subTest(args=args, limit=limit):
+                result = self.pilcrow("review", *args, cwd=cwd, limit=limit, code=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(message, result.stderr)
+                self.assertNotIn(b"Traceback", result.stderr)
+                self.assertEqual(self.state(), before)
+        self.assertFalse((self.repo / "x").exists())
+        # A malformed committed DOCX is an error too, with the same label.
+        (self.repo / "broken.docx").write_bytes(b"not a zip")
+        self.commit("third")
+        result = self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "broken.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"error: HEAD:broken.docx: cannot read DOCX", result.stderr)
+        # The limit is on the committed blob's size: a blob exactly at the limit still reads.
+        self.pilcrow("review", "--rev", "HEAD", "report.docx", limit=size, code=0)
+
+
 if __name__ == "__main__":
     unittest.main()

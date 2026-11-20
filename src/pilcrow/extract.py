@@ -6,6 +6,7 @@ This is a prose view, not a Word renderer. All omissions are reported in metadat
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import posixpath
 import re
@@ -13,7 +14,7 @@ from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from defusedxml import ElementTree as ET
@@ -854,25 +855,36 @@ class Reader:
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 
-def extract(path: Path) -> Extraction:
+def read_package(file: Path | BinaryIO) -> Extraction:
+    with ZipFile(file) as package:
+        infos = package.infolist()
+        if len(infos) > MAX_ENTRIES:
+            raise DocumentError(f"package has {len(infos)} entries; the safety limit is {MAX_ENTRIES}")
+        total = sum(i.file_size for i in infos)
+        if total > MAX_PACKAGE_BYTES:
+            raise DocumentError(f"package is {total} bytes uncompressed; the safety limit is "
+                                f"{size_label(MAX_PACKAGE_BYTES)}")
+        for info in infos:
+            if info.compress_type not in BOUNDED_COMPRESSION:
+                raise DocumentError(f"{info.filename} uses ZIP compression method {info.compress_type}; "
+                                    "DOCX packages may use only stored or deflate")
+        if len({i.filename for i in infos}) != len(infos):
+            raise DocumentError("duplicate ZIP entries")
+        return Reader(package).extract()
+
+
+def extract(source: Path | bytes) -> Extraction:
+    """Extract a DOCX file, or a DOCX already read into memory, such as a Git blob.
+
+    The same package limits apply to both. Only a file can change while it is
+    read, so only a file is checked for that.
+    """
     try:
-        before = path.stat()
-        with ZipFile(path) as package:
-            infos = package.infolist()
-            if len(infos) > MAX_ENTRIES:
-                raise DocumentError(f"package has {len(infos)} entries; the safety limit is {MAX_ENTRIES}")
-            total = sum(i.file_size for i in infos)
-            if total > MAX_PACKAGE_BYTES:
-                raise DocumentError(f"package is {total} bytes uncompressed; the safety limit is "
-                                    f"{size_label(MAX_PACKAGE_BYTES)}")
-            for info in infos:
-                if info.compress_type not in BOUNDED_COMPRESSION:
-                    raise DocumentError(f"{info.filename} uses ZIP compression method {info.compress_type}; "
-                                        "DOCX packages may use only stored or deflate")
-            if len({i.filename for i in infos}) != len(infos):
-                raise DocumentError("duplicate ZIP entries")
-            result = Reader(package).extract()
-        after = path.stat()
+        if isinstance(source, bytes):
+            return read_package(io.BytesIO(source))
+        before = source.stat()
+        result = read_package(source)
+        after = source.stat()
         if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
             raise DocumentError("document changed while reading; finish saving and retry")
         return result
