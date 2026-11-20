@@ -251,6 +251,27 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("Prose: no changes", report)
         self.assertEqual(self.section(report, "Images"), ["~ image 1 (word/document.xml) replaced"])
 
+    def test_an_image_with_embedded_and_linked_copies(self) -> None:
+        # Word can keep an embedded copy (r:embed) and an external link (r:link) for one image.
+        both = picture("rId5").replace('r:embed="rId5"', 'r:embed="rId5" r:link="rId6"')
+
+        def write(path: Path, data: str, target: str) -> None:
+            make_docx(path, anchored("Figure:", both), extra={"word/media/image1.png": data},
+                      relationships=image_rel("rId5", "media/image1.png") + image_rel("rId6", target, external=True))
+        write(self.old, "first picture", "https://example.invalid/a.png")
+        write(self.new, "second picture", "https://example.invalid/a.png")
+        self.assertEqual(self.section(self.review(), "Images"), ["~ image 1 (word/document.xml) replaced"])
+        write(self.new, "first picture", "https://example.invalid/b.png")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ["~ image 1 (word/document.xml) link changed: https://example.invalid/a.png → https://example.invalid/b.png"])
+        write(self.new, "second picture", "https://example.invalid/b.png")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ["~ image 1 (word/document.xml) replaced; link changed: https://example.invalid/a.png → https://example.invalid/b.png"])
+        make_docx(self.old, paragraph("Figure:"))
+        (line,) = self.section(self.review(), "Images")
+        self.assertRegex(line, r"^\+ added image 1 \(word/document\.xml\): 14 bytes, sha256 [0-9a-f]{12}, "
+                               r"linked to https://example\.invalid/b\.png$")
+
     def test_bullet_to_number_list_format_change(self) -> None:
         body = list_item("First.", "1") + list_item("Second.", "1")
         for path, lvl in ((self.old, level(0, "bullet", "•")), (self.new, level(0, "decimal", "%1."))):

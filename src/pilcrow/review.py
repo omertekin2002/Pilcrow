@@ -207,21 +207,25 @@ def change_field(old: Entry, new: Entry, _: int, j: int) -> str | None:
 
 
 def describe_image(entry: Entry, position: int) -> str:
+    # An image can hold both an embedded copy (sha256/bytes) and an external link (target).
+    sources = []
+    if "sha256" in entry:
+        sha = entry["sha256"]
+        sources.append("with a missing media part" if sha is None else f"{entry.get('bytes')} bytes, sha256 {sha[:12]}")
     if "target" in entry:
-        source = f"linked to {entry['target']}"
-    elif entry.get("sha256") is None:
-        source = "with a missing media part"
-    else:
-        source = f"{entry.get('bytes')} bytes, sha256 {entry['sha256'][:12]}"
-    return f"image {position + 1} ({entry.get('part')}): {source}"
+        sources.append(f"linked to {entry['target']}")
+    return f"image {position + 1} ({entry.get('part')}): {', '.join(sources) or 'no source'}"
 
 
 def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
     if old.get("part") != new.get("part"):
         return None
-    if "target" in old and "target" in new:
-        return f"~ image {j + 1} ({new.get('part')}) link changed: {old['target']} → {new['target']}"
-    return f"~ image {j + 1} ({new.get('part')}) replaced"
+    details = []
+    if (old.get("sha256"), old.get("bytes")) != (new.get("sha256"), new.get("bytes")):
+        details.append("replaced")
+    if old.get("target") != new.get("target"):
+        details.append(f"link changed: {old.get('target') or '(none)'} → {new.get('target') or '(none)'}")
+    return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details)
 
 
 def describe_level(level: Entry) -> str:
