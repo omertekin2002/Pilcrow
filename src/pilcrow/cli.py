@@ -16,6 +16,7 @@ from .files import (
     setup,
     write_if_changed,
 )
+from .review import review
 
 
 def parser() -> argparse.ArgumentParser:
@@ -33,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
                          help="also mark DOCX files diff=pilcrow so git diff can show their prose (needs a one-time git config)")
     command = commands.add_parser("textconv", help="print one DOCX's prose to stdout (a Git textconv driver)")
     command.add_argument("path", type=Path, help="any DOCX file, such as the temporary file Git passes")
+    command = commands.add_parser("review", help="describe prose and review changes between two DOCX files in words (read-only)")
+    command.add_argument("old", type=Path, help="the earlier DOCX, such as the temporary file git difftool passes")
+    command.add_argument("new", type=Path, help="the later DOCX")
     return result
 
 
@@ -55,6 +59,28 @@ def textconv(path: Path) -> int:
     return 0
 
 
+def review_command(old: Path, new: Path) -> int:
+    """Print a report of what changed from ``old`` to ``new``; never write files or run Git.
+
+    Like textconv, no scope, discovery, extension, or symlink rules apply, because
+    git difftool passes temporary copies with arbitrary names. Exit codes follow diff:
+    0 no supported differences, 1 differences reported, 2 an input failed.
+    """
+    results = []
+    for path in (old, new):
+        try:
+            results.append(extract(path))
+        except (OSError, DocumentError) as exc:
+            print(f"error: {path}: {exc}", file=sys.stderr)
+    if len(results) != 2:
+        return 2  # no partial report
+    report, changed = review(results[0], results[1])
+    # Raw UTF-8 bytes, not the console encoding, so output is identical on Windows.
+    sys.stdout.buffer.write(f"Review: {old} → {new}\n\n{report}".encode("utf-8", "backslashreplace"))
+    sys.stdout.buffer.flush()
+    return 1 if changed else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # A piped stdout on Windows uses the ANSI code page; escape file names it
     # cannot encode, as stderr already does, instead of failing the document.
@@ -63,6 +89,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "textconv":
         return textconv(args.path)
+    if args.command == "review":
+        return review_command(args.old, args.new)
     root = args.root.resolve()
     if not root.is_dir():
         print(f"error: --root is not an existing directory: {root}", file=sys.stderr)
