@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from .extract import Extraction
@@ -19,6 +21,9 @@ MAX_DIFF_LINES = 2000
 MAX_TEXT = 80
 BODY = "word/document.xml"
 CAVEAT = "No supported prose or review changes detected (not a complete document comparison)."
+CLOSING = "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison)."
+COVERAGE = "Coverage warnings (either side)"
+FORMATS = ("text", "markdown")
 TRACKED = {"ins": "tracked insertion", "del": "tracked deletion",
            "moveFrom": "tracked move source", "moveTo": "tracked move destination"}
 
@@ -47,11 +52,12 @@ def where(part: str | None) -> str:
     return "" if part in (None, BODY) else f" in {part}"
 
 
-def prose_section(old: str, new: str) -> list[str]:
+def prose_diff(old: str, new: str) -> list[str]:
+    """The unified prose diff, cut at MAX_DIFF_LINES with a note; empty when the prose is unchanged."""
     if old == new:
-        return ["Prose: no changes"]
+        return []
     diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), "OLD", "NEW", n=3, lineterm=""))
-    lines = ["Prose:", *diff[:MAX_DIFF_LINES]]
+    lines = diff[:MAX_DIFF_LINES]
     if len(diff) > MAX_DIFF_LINES:
         lines.append(f"… {len(diff) - MAX_DIFF_LINES} more diff lines omitted")
     return lines
@@ -303,15 +309,34 @@ def change_run(old: Entry, new: Entry, _: int, __: int) -> str | None:
     return None
 
 
-def notice(title: str, lines: list[str], differs: bool) -> list[str]:
+@dataclass
+class Section:
+    """One metadata section: a title and its lines, each a self-contained statement."""
+
+    title: str
+    lines: list[str]
+    inline: bool = False  # a single summary line, printed as "Title: line" in text
+
+
+@dataclass
+class Report:
+    """What changed, independent of how it is printed."""
+
+    diff: list[str]  # the prose diff with its cap note; empty when the prose is unchanged
+    sections: list[Section]
+    warnings: list[str]  # coverage warnings of either side, sorted
+    changed: bool
+
+
+def notice(title: str, lines: list[str], differs: bool) -> Section | None:
     if lines:
-        return [f"{title}:", *lines]
+        return Section(title, lines)
     # The data differs but no entry could be described: never report "no changes".
-    return [f"{title}: metadata changed (could not match entries one-to-one)"] if differs else []
+    return Section(title, ["metadata changed (could not match entries one-to-one)"], inline=True) if differs else None
 
 
-def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
-    """Return the report body (everything after the header line) and whether anything differs."""
+def build(old: Extraction, new: Extraction) -> Report:
+    """Compare two extractions; render the result with ``text`` or ``markdown``."""
     a, b = old.metadata, new.metadata
     old_review, new_review = a.get("review", []), b.get("review", [])
     old_comments = [e for e in old_review if e.get("kind") == "comment"]
@@ -319,7 +344,7 @@ def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
     old_tracked = [e for e in old_review if e.get("kind") != "comment"]
     new_tracked = [e for e in new_review if e.get("kind") != "comment"]
     old_warnings, new_warnings = a.get("warnings", []), b.get("warnings", [])
-    sections = [
+    found = [
         notice("Comments", comments_section(old_comments, new_comments), old_comments != new_comments),
         notice("Tracked changes", entries_section(old_tracked, new_tracked, describe_tracked),
                old_tracked != new_tracked),
@@ -338,18 +363,94 @@ def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
                old_warnings != new_warnings),
     ]
     known = {"review", "hyperlinks", "fields", "images", "lists", "list_runs", "warnings"}
-    sections += [[f"Metadata: {key} changed"] for key in sorted((a.keys() | b.keys()) - known)
-                 if a.get(key) != b.get(key)]
-    sections = [s for s in sections if s]
-    prose = prose_section(old.prose, new.prose)
+    sections = [s for s in found if s is not None]
+    sections += [Section("Metadata", [f"{key} changed"], inline=True)
+                 for key in sorted((a.keys() | b.keys()) - known) if a.get(key) != b.get(key)]
     changed = bool(sections) or old.prose != new.prose
-    blocks = [prose, *sections]
-    if changed:
-        warnings = sorted(set(old_warnings) | set(new_warnings))
-        if warnings:
-            blocks.append(["Coverage warnings (either side):", *(f"  {w}" for w in warnings)])
-        blocks.append(["Only the prose and review metadata Pilcrow extracts are compared"
-                       " (not a complete document comparison)."])
+    return Report(prose_diff(old.prose, new.prose), sections,
+                  sorted(set(old_warnings) | set(new_warnings)), changed)
+
+
+def text(report: Report) -> str:
+    """The plain-text report body (everything after the header line)."""
+    blocks = [["Prose:", *report.diff] if report.diff else ["Prose: no changes"]]
+    blocks += [[f"{s.title}: {s.lines[0]}"] if s.inline else [f"{s.title}:", *s.lines] for s in report.sections]
+    if report.changed:
+        if report.warnings:
+            blocks.append([f"{COVERAGE}:", *(f"  {w}" for w in report.warnings)])
+        blocks.append([CLOSING])
     else:
         blocks.append([CAVEAT])
-    return "\n\n".join("\n".join(block) for block in blocks) + "\n", changed
+    return "\n\n".join("\n".join(block) for block in blocks) + "\n"
+
+
+def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
+    """Return the plain-text report body (everything after the header line) and whether anything differs."""
+    report = build(old, new)
+    return text(report), report.changed
+
+
+# Markdown
+
+# Characters escaped wherever they appear: emphasis, code, links and images, headings
+# (including a closing "#" sequence), tables, GFM strikethrough, and math. ":" and "@"
+# (and the dot of "www.") stop GFM's autolink extension from taking a URL or address
+# with its escapes still in it; GitHub then links the unescaped text it renders.
+MARKDOWN_SPECIAL = frozenset("\\`*_[]!#|~$:@")
+WWW = re.compile(r"\b(www)\.", re.IGNORECASE)
+# Raw HTML and entity references are written as entities.
+MARKDOWN_ENTITIES = {"<": "&lt;", ">": "&gt;", "&": "&amp;"}
+LINE_BREAK = re.compile(r"\r\n?|\n")
+
+
+def one_line(value: str) -> str:
+    """``value`` with CommonMark line endings replaced by spaces, so it cannot start a new block."""
+    return LINE_BREAK.sub(" ", value)
+
+
+def escape(value: str) -> str:
+    """``value`` as inline Markdown text that renders literally on one line."""
+    value = one_line(value).strip()
+    result = "".join(MARKDOWN_ENTITIES.get(c) or ("\\" + c if c in MARKDOWN_SPECIAL else c) for c in value)
+    result = WWW.sub(r"\1\\.", result)
+    # A leading marker would start a list, quote or setext underline: escape it too.
+    return re.sub(r"^([-+=>])|^(\d+)([.)])", lambda m: f"\\{m[1]}" if m[1] else f"{m[2]}\\{m[3]}", result)
+
+
+def longest_backticks(value: str) -> int:
+    return max((len(run) for run in re.findall(r"`+", value)), default=0)
+
+
+def code(value: str) -> str:
+    """``value`` as a code span: delimited by a longer backtick run than any inside it."""
+    value = one_line(value)
+    ticks = "`" * (longest_backticks(value) + 1)
+    pad = " " if value[:1] in ("`", " ") or value[-1:] in ("`", " ") else ""
+    return f"{ticks}{pad}{value}{pad}{ticks}"
+
+
+def bullet(line: str) -> str:
+    """A list item for one text-format line, with its -/~/+ marker kept visible."""
+    if line[:2] in ("- ", "~ ", "+ "):
+        return f"- `{line[0]}` {escape(line[2:])}"
+    return f"- {escape(line)}"
+
+
+def markdown(report: Report, old: str, new: str) -> str:
+    """The whole report, header included, as CommonMark that renders document text literally."""
+    blocks = [f"## Review: {code(old)} → {code(new)}"]
+    if report.diff:
+        # A fence longer than any backtick run inside cannot be closed by document text.
+        fence = "`" * max(3, longest_backticks("\n".join(report.diff)) + 1)
+        blocks += ["### Prose", "\n".join([f"{fence}diff", *report.diff, fence])]
+    else:
+        blocks.append("Prose: no changes")
+    for section in report.sections:
+        blocks += [f"### {escape(section.title)}", "\n".join(map(bullet, section.lines))]
+    if report.changed:
+        if report.warnings:
+            blocks += [f"### {escape(COVERAGE)}", "\n".join(f"- {escape(w)}" for w in report.warnings)]
+        blocks.append(escape(CLOSING))
+    else:
+        blocks.append(escape(CAVEAT))
+    return "\n\n".join(blocks) + "\n"
