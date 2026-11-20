@@ -528,6 +528,24 @@ class RevisionReviewTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertIn(f"error: HEAD:{Path('old notes') / 'gone.docx'}: no such file at HEAD".encode(), result.stderr)
 
+    def test_a_folder_now_symlinked_elsewhere_keeps_its_own_history(self) -> None:
+        for relative in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx"):
+            make_docx(self.repo / relative, paragraph("The committed docs version."))
+            make_docx(self.repo / "other" / relative.relative_to("docs"), paragraph("The other folder's version."))
+        self.commit("first")
+        shutil.rmtree(self.repo / "docs")
+        try:
+            (self.repo / "docs").symlink_to("other", target_is_directory=True)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                # Old: docs/... as committed. New: the working copy, read through the symlink.
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The other folder's version.", report)
+
     def test_subdirectories_spaces_and_unicode(self) -> None:
         folder = self.repo / "drafts and notes" / "İstanbul"
         document = folder / "résumé final.docx"

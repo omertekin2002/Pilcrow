@@ -40,15 +40,26 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
     to the current directory, and its size is checked before it is read. Git
     runs from the nearest directory on the path that exists, so a document
     whose folder was since deleted, or is left out of a sparse checkout, still
-    resolves.
+    resolves. The rest of the path is looked up in the committed tree, not the
+    work tree.
     """
     if revision.startswith("-"):
         raise ValueError('a revision must not start with "-"')
     if not path.parents:  # "." or a filesystem root: a directory, never a committed file
         raise ValueError("expected the path of a file")
     directory = next((parent for parent in path.parents if parent.is_dir()), path.parents[-1])
+    top = Path(os.fsdecode((git_output(directory, "rev-parse", "--show-toplevel") or b"").strip())).resolve()
+    # Git would follow a folder on the path that is now a symlink, and read the history of the
+    # folder it points to. Run it from above the outermost such folder inside the repository.
+    outermost = None
+    for folder in (directory, *directory.parents):  # a relative path stops at the current directory
+        if folder.resolve() == top:
+            break
+        if folder.is_symlink():
+            outermost = folder
+    if outermost is not None:
+        directory = outermost.parent
     name = path.relative_to(directory).as_posix()
-    git_output(directory, "rev-parse", "--show-prefix")  # not a repository, or a missing directory
     # Neither argument can start with "-": the revision is checked above, and the second starts with a hash.
     tree = git_output(directory, "rev-parse", "--verify", "--quiet", f"{revision}^{{tree}}")
     if tree is None:
