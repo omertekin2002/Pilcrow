@@ -18,6 +18,69 @@ def git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
         return None
 
 
+def git_output(directory: Path, *args: str) -> bytes | None:
+    """Run one read-only Git command; return stdout, or None if it exited 1 with no message."""
+    result = git(directory, *args)
+    if result is None:
+        raise ValueError("Git is not installed or not on PATH")
+    if result.returncode == 0:
+        return result.stdout
+    message = os.fsdecode(result.stderr).strip().splitlines()
+    if result.returncode == 1 and not message:
+        return None
+    detail = message[-1] if message else f"git {args[0]} exited with {result.returncode}"
+    raise ValueError(detail.removeprefix("fatal: "))
+
+
+def revision_blob(path: Path, revision: str, limit: int) -> bytes:
+    """Read ``path`` as it is at ``revision`` without writing anything.
+
+    Only read-only plumbing runs: the index, work tree and temporary directory
+    are never touched. The path resolves like ``git show REV:./path``, relative
+    to the current directory, and its size is checked before it is read. Git
+    runs from the nearest directory on the path that exists, so a document
+    whose folder was since deleted, or is left out of a sparse checkout, still
+    resolves. The rest of the path is looked up in the committed tree, not the
+    work tree.
+    """
+    if revision.startswith("-"):
+        raise ValueError('a revision must not start with "-"')
+    if not path.parents:  # "." or a filesystem root: a directory, never a committed file
+        raise ValueError("expected the path of a file")
+    directory = next((parent for parent in path.parents if parent.is_dir()), path.parents[-1])
+    top = Path(os.fsdecode((git_output(directory, "rev-parse", "--show-toplevel") or b"").strip())).resolve()
+    # Git would follow a folder on the path that is now a symlink, and read the history of the
+    # folder it points to. Run it from above the outermost such folder inside the repository.
+    outermost = None
+    for folder in (directory, *directory.parents):  # a relative path stops at the current directory
+        if folder.resolve() == top:
+            break
+        if folder.is_symlink():
+            outermost = folder
+    if outermost is not None:
+        directory = outermost.parent
+    name = path.relative_to(directory).as_posix()
+    # Neither argument can start with "-": the revision is checked above, and the second starts with a hash.
+    tree = git_output(directory, "rev-parse", "--verify", "--quiet", f"{revision}^{{tree}}")
+    if tree is None:
+        raise ValueError(f"unknown revision {revision!r}")
+    # The tree, not the revision again, so a branch that moves meanwhile cannot mix two commits.
+    blob = git_output(directory, "rev-parse", "--verify", "--quiet", f"{tree.decode('ascii').strip()}:./{name}")
+    if blob is None:
+        raise ValueError(f"no such file at {revision}")
+    oid = blob.decode("ascii").strip()
+    kind = (git_output(directory, "cat-file", "-t", oid) or b"").strip()
+    if kind != b"blob":
+        raise ValueError(f"not a file at {revision}")
+    size = int(git_output(directory, "cat-file", "-s", oid) or b"0")
+    if size > limit:
+        raise ValueError(f"file is {size} bytes at {revision}; the safety limit is {limit} bytes")
+    content = git_output(directory, "cat-file", "blob", oid) or b""
+    if len(content) != size:
+        raise ValueError(f"Git returned {len(content)} bytes for a {size}-byte file")
+    return content
+
+
 def eligible(path: Path) -> bool:
     return (path.suffix.lower() == ".docx" and not path.name.startswith("~$")
             and not any(p in EXCLUDED for p in path.parts))
