@@ -37,11 +37,15 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
 
     Only read-only plumbing runs: the index, work tree and temporary directory
     are never touched. The path resolves like ``git show REV:./path``, relative
-    to the directory that holds it, and its size is checked before it is read.
+    to the current directory, and its size is checked before it is read. Git
+    runs from the nearest directory on the path that exists, so a document
+    whose folder was since deleted, or is left out of a sparse checkout, still
+    resolves.
     """
     if revision.startswith("-"):
         raise ValueError('a revision must not start with "-"')
-    directory, name = path.parent, path.name
+    directory = next((parent for parent in path.parents if parent.is_dir()), path.parents[-1])
+    name = path.relative_to(directory).as_posix()
     git_output(directory, "rev-parse", "--show-prefix")  # not a repository, or a missing directory
     # Neither argument can start with "-": the revision is checked above, and the second starts with a hash.
     tree = git_output(directory, "rev-parse", "--verify", "--quiet", f"{revision}^{{tree}}")

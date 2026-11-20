@@ -510,6 +510,24 @@ class RevisionReviewTests(unittest.TestCase):
         self.assertTrue(report.startswith(f"Review: {branch}:report.docx → feature:report.docx\n\n"), report)
         self.assertIn("-The dog sat.", report)
 
+    def test_two_revisions_need_no_folder_in_the_work_tree(self) -> None:
+        # A later commit or a sparse checkout may have removed the document's folders.
+        nested = Path("old notes") / "drafts" / "report.docx"
+        make_docx(self.repo / nested, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(self.repo / nested, paragraph("The dog sat."))
+        self.commit("second")
+        shutil.rmtree(self.repo / "old notes")
+        for path in (nested, self.repo / nested):
+            with self.subTest(path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertTrue(report.startswith(f"Review: HEAD~1:{path} → HEAD:{path}\n\n"), report)
+                self.assertIn("-The cat sat.", report)
+                self.assertIn("+The dog sat.", report)
+        result = self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", Path("old notes") / "gone.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(f"error: HEAD:{Path('old notes') / 'gone.docx'}: no such file at HEAD".encode(), result.stderr)
+
     def test_subdirectories_spaces_and_unicode(self) -> None:
         folder = self.repo / "drafts and notes" / "İstanbul"
         document = folder / "résumé final.docx"
