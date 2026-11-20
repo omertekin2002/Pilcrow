@@ -249,10 +249,59 @@ class SummaryTests(unittest.TestCase):
         self.commit("second")
         for mode in ("outline", "full"):
             text, printed = self.summarize(base, mode)
-            self.assertIn("- `bad.docx` — could not be read: ", text)
+            if mode == "outline":  # the reason can quote package contents: only the warning has it
+                self.assertIn("- `bad.docx` — could not be read\n", text)
+            else:
+                self.assertIn("- `bad.docx` — could not be read: ", text)
             self.assertTrue(printed.startswith("::warning::Pilcrow could not read bad.docx: "), printed)
             self.assertIn("good.docx", text)
             self.assertIn("Prose changed" if mode == "outline" else "+After.", text)
+
+    def test_an_unexpected_error_is_reported_like_a_read_error(self) -> None:
+        make_docx(self.repo / "a.docx", paragraph("One."))
+        make_docx(self.repo / "b.docx", paragraph("One."))
+        base = self.commit("first")
+        make_docx(self.repo / "a.docx", paragraph("Two."))
+        make_docx(self.repo / "b.docx", paragraph("Two."))
+        self.commit("second")
+        real = summary.build
+
+        def flaky(old: object, new: object) -> object:
+            if flaky.calls == 0:  # type: ignore[attr-defined]
+                flaky.calls = 1  # type: ignore[attr-defined]
+                raise KeyError("boom")
+            return real(old, new)  # type: ignore[arg-type]
+        flaky.calls = 0  # type: ignore[attr-defined]
+        with patch.object(summary, "build", flaky):
+            text, printed = self.summarize(base, "outline")
+        self.assertIn("- `a.docx` — could not be read\n", text)
+        self.assertIn("::warning::Pilcrow could not read a.docx: 'boom'", printed)
+        self.assertIn("- `b.docx` — changed: Prose changed", text)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "needs a file system that accepts non-UTF-8 names")
+    def test_a_non_utf8_file_name(self) -> None:
+        name = os.fsdecode(b"bad\xff name.docx")
+        make_docx(self.repo / name, paragraph("One."))
+        base = self.commit("first")
+        make_docx(self.repo / name, paragraph("Two."))
+        self.commit("second")
+        for mode in ("outline", "full"):
+            text, _ = self.summarize(base, mode)
+            self.assertIn("bad\\xff name.docx", text)
+            self.assertIn("Prose changed" if mode == "outline" else "+Two.", text)
+
+    def test_a_non_ascii_name_with_a_narrow_console_encoding(self) -> None:
+        name = "café 😀.docx"
+        (self.repo / name).write_bytes(b"not a zip")
+        base = self.commit("first")
+        (self.repo / name).write_bytes(b"still not a zip")
+        self.commit("second")
+        env = {**self.env, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run([sys.executable, "-m", "pilcrow.summary", f"--base={base}", "--root=.", "--mode=full",
+                                 f"--output={self.output}"], cwd=self.repo, env=env, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"::warning::Pilcrow could not read caf\xe9 \\U0001f600.docx: ", result.stdout)
+        self.assertIn(f"- `{name}` — could not be read: ", self.output.read_text(encoding="utf-8"))
 
     def test_a_size_limit_omits_later_reports(self) -> None:
         for name in "abcd":
@@ -312,7 +361,8 @@ class ActionManifestTests(unittest.TestCase):
         self.assertIn("default: ${{ github.event.pull_request.base.sha || github.event.before }}", text)
         steps = text.split("\n    - ")
         (step,) = [s for s in steps if "pilcrow.summary" in s]
-        self.assertIn("if: always() && steps.install.outcome == 'success' && inputs.summary != 'none'", step)
+        self.assertIn("if: always() && steps.install.outcome == 'success' && inputs.summary != 'none'"
+                      " && inputs.summary != ''", step)
         self.assertLess(text.index("name: Check companions"), text.index("pilcrow.summary"))
         self.assertIn("value: ${{ steps.summary.outputs.file }}", text)
 

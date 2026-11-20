@@ -73,7 +73,7 @@ runs:
     # base or a document become a warning in the summary, never a failure.
     - id: summary
       name: Summarize changed documents
-      if: always() && steps.install.outcome == 'success' && inputs.summary != 'none'
+      if: always() && steps.install.outcome == 'success' && inputs.summary != 'none' && inputs.summary != ''
       shell: bash
       env:
         PILCROW_PYTHON: ${{ steps.install.outputs.python }}
@@ -81,12 +81,16 @@ runs:
         PILCROW_BASE: ${{ inputs.base }}
         PILCROW_MODE: ${{ inputs.summary }}
       run: |
-        case "$PILCROW_MODE" in
+        mode=$(printf '%s' "$PILCROW_MODE" | tr '[:upper:]' '[:lower:]')
+        case "$mode" in
           outline|full) ;;
           *) echo "::error::summary must be none, outline or full, not '$PILCROW_MODE'"; exit 2 ;;
         esac
         file="$RUNNER_TEMP/pilcrow-summary-$$-$RANDOM.md"
         # "--option=value", so a value that starts with "-" is not read as an option.
-        "$PILCROW_PYTHON" -m pilcrow.summary --base="$PILCROW_BASE" --root="$PILCROW_ROOT" --mode="$PILCROW_MODE" --output="$file"
-        cat "$file" >> "$GITHUB_STEP_SUMMARY"
-        echo "file=$file" >> "$GITHUB_OUTPUT"
+        if "$PILCROW_PYTHON" -m pilcrow.summary --base="$PILCROW_BASE" --root="$PILCROW_ROOT" --mode="$mode" --output="$file"; then
+          cat "$file" >> "$GITHUB_STEP_SUMMARY"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Pilcrow could not write the job summary (exit code $?); the check result is unaffected."
+        fi

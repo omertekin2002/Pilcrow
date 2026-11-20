@@ -102,9 +102,15 @@ jobs:
         run: python scripts/make_fixture_repo.py "$FIXTURE"
 
       - name: Action passes when companions are fresh
+        id: fresh-action
         uses: ./
         with:
           root: ../pilcrow-fixture
+
+      - name: Without the summary input, no summary is written
+        env:
+          SUMMARY_FILE: ${{ steps.fresh-action.outputs.summary-file }}
+        run: test -z "$SUMMARY_FILE"
 
       - name: Hook passes when companions are fresh
         working-directory: ${{ env.FIXTURE }}

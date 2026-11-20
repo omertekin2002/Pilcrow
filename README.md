@@ -208,15 +208,15 @@ companions, 2 for errors.
 The action can also write a review of each DOCX the push or pull request changed
 to the workflow run's job summary, so a reviewer can see what changed without
 checking the branch out. It is off by default (`summary: none`): without the
-input, the action only runs the check, exactly as above. Releases before the one
-that ships this input ignore it.
+input, the action only runs the check, exactly as above. The `summary` and `base`
+inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8`.
 
 ```yaml
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0       # the summary compares with the base commit, so fetch it
-      - uses: omertekin2002/Pilcrow@v0.1.3
+      - uses: omertekin2002/Pilcrow@v0.1.8
         with:
           summary: outline     # none (default), outline or full
           # base: <revision>   # optional; default: the pull request's base, or the push's previous commit
@@ -224,7 +224,8 @@ that ships this input ignore it.
 
 - `outline` publishes **no document text**. For each changed document it lists
   the path, its status (changed, no supported changes, added, removed, or could
-  not be read) and the report sections that differ, each with its count of
+  not be read; why a document could not be read goes only to a warning
+  annotation) and the report sections that differ, each with its count of
   described lines, such as `` `report.docx` — changed: Prose changed, Comments (2) ``.
 - `full` publishes each changed document's complete
   [`pilcrow review --format markdown`](#review-a-change-in-words) report, comparing
@@ -240,7 +241,8 @@ DOCX files within `root` are listed, with the same lock-file and excluded-folder
 rules as `pilcrow check --all`. A renamed document is listed as removed and
 added, and an added or removed one has no report.
 
-The summary step is read-only and never fails the job: it runs even when the
+The summary step is read-only and never fails the job (only a `summary` value
+other than `none`, `outline` or `full` does): it runs even when the
 check fails, and the action's outcome stays the check's. When the base is missing
 (the first push of a new branch) or not in the checkout (the default shallow
 `fetch-depth: 1` clone), the summary explains why there is no review and the step

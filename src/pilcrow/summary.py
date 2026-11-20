@@ -50,6 +50,15 @@ class Document:
     error: str | None = None
 
 
+def shown(value: str) -> str:
+    """``value`` as valid Unicode: bytes of a file name that are not UTF-8 become backslash escapes."""
+    return os.fsencode(value).decode("utf-8", "backslashreplace")
+
+
+def size(text: str) -> int:
+    return len(text.encode("utf-8", "backslashreplace"))
+
+
 def annotate(message: str) -> None:
     """Print a GitHub Actions warning annotation, escaped so it stays one command."""
     value = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -85,9 +94,9 @@ def compare(root: Path, path: str, base: str, head: str) -> Document:
     """Read ``path`` at both revisions and compare them; a read error is reported, not raised."""
     try:
         old, new = (extract(revision_blob(root / path, rev, MAX_PACKAGE_BYTES)) for rev in (base, head))
-    except (OSError, ValueError) as exc:  # DocumentError is a ValueError
-        return Document(path, "could not be read", error=str(exc))
-    report = build(old, new)
+        report = build(old, new)
+    except Exception as exc:  # any failure, not only DocumentError: one document must never stop the others
+        return Document(path, "could not be read", error=shown(str(exc)) or type(exc).__name__)
     return Document(path, "changed" if report.changed else "no supported changes", report)
 
 
@@ -99,9 +108,10 @@ def sections(report: Report) -> list[str]:
     return (["Prose changed"] if report.diff else []) + [f"{title} ({n})" for title, n in counts.items()]
 
 
-def outline(document: Document) -> str:
-    line = f"- {code(document.path)} — {document.status}"
-    if document.error is not None:
+def outline(document: Document, detail: bool) -> str:
+    """One list item; read errors are detailed only when ``detail`` (they can quote package contents)."""
+    line = f"- {code(shown(document.path))} — {document.status}"
+    if document.error is not None and detail:
         return f"{line}: {escape(document.error)}"
     if document.report is not None and document.report.changed:
         return f"{line}: {', '.join(sections(document.report))}"
@@ -110,8 +120,9 @@ def outline(document: Document) -> str:
 
 def block(document: Document, mode: str, base: str, head: str) -> str:
     if mode == "full" and document.report is not None:
-        return markdown(document.report, f"{base}:{document.path}", f"{head}:{document.path}").rstrip("\n")
-    return outline(document)
+        path = shown(document.path)
+        return markdown(document.report, f"{base}:{path}", f"{head}:{path}").rstrip("\n")
+    return outline(document, mode == "full")
 
 
 def header(mode: str, root: str, base: str, head: str) -> list[str]:
@@ -141,7 +152,7 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
         if old is None:
             hint = "The checkout is shallow. " if shallow(root) else ""
             hint += "Fetch history that reaches the base, for example with {} on actions/checkout."
-            return problem(f"the base revision {code(base)} is not in this checkout. " + hint.format(code("fetch-depth: 0")),
+            return problem(f"the base revision {code(shown(base))} is not in this checkout. " + hint.format(code("fetch-depth: 0")),
                            f"the base revision {base} is not in this checkout. " + hint.format("fetch-depth: 0"))
         listing = changed(root, old, head)
     except ValueError as exc:  # Git missing, not a repository, or a failed diff
@@ -151,7 +162,7 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
     if not listing:
         return "\n\n".join([*lines, "No DOCX documents changed."]) + "\n"
     blocks: list[str] = []
-    size = len("\n\n".join(lines).encode("utf-8"))
+    used = size("\n\n".join(lines))
     over = False
     for index, (status, path) in enumerate(listing):
         if not over:
@@ -162,21 +173,21 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
             else:
                 document = compare(root, path, old, head)
                 if document.error is not None:
-                    annotate(f"Pilcrow could not read {path}: {document.error}")
+                    annotate(f"Pilcrow could not read {shown(path)}: {document.error}")
             text = block(document, mode, short_base, short_head)
-            cost = len(text.encode("utf-8")) + 2
-            if size + cost <= BUDGET:
+            cost = size(text) + 2
+            if used + cost <= BUDGET:
                 blocks.append(text)
-                size += cost
+                used += cost
                 continue
             over = True
-        text = f"- {code(path)} — {OMITTED}"
-        cost = len(text.encode("utf-8")) + 2
-        if size + cost > LIMIT:
+        text = f"- {code(shown(path))} — {OMITTED}"
+        cost = size(text) + 2
+        if used + cost > LIMIT:
             blocks.append(f"- {len(listing) - index} more changed documents not listed: summary size limit")
             break
         blocks.append(text)
-        size += cost
+        used += cost
     if over:
         annotate("Pilcrow summary: some reports were omitted to stay under the job summary size limit.")
     # Outline lines form one list; full reports are separate blocks.
@@ -190,6 +201,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", default=".", help="document repository root (default: current directory)")
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--output", type=Path, required=True, help="the Markdown file to write")
+    # A piped stdout on Windows uses the ANSI code page; escape what it cannot encode, as the CLI does.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     args = parser.parse_args(argv)
     root = Path(os.path.abspath(args.root))
     if not root.is_dir():
@@ -198,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         content = summarize(root, args.base, args.mode, args.root)
     try:
-        args.output.write_text(content, encoding="utf-8", newline="\n")
+        args.output.write_text(content, encoding="utf-8", errors="backslashreplace", newline="\n")
     except OSError as exc:
         print(f"error: {args.output}: {exc}", file=sys.stderr)
         return 2
