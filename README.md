@@ -353,6 +353,11 @@ mypy
 `ruff check .` lints `src/`, `tests/` and `scripts/`; `mypy` type-checks
 `src/pilcrow` in strict mode.
 
+To look for slow paths, `python scripts/benchmark.py` generates a 500-page DOCX
+(lists, tables, comments and tracked changes) and one very long paragraph in a
+temporary directory, then prints how long extraction takes for each. It uses only the
+standard library; `--help` lists the size options. It is a manual tool, not a CI gate.
+
 ## Releases
 
 Every pull request runs `.github/workflows/ci.yml`: the test suite on Linux, macOS
