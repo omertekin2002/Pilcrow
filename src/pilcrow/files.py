@@ -44,6 +44,8 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
     """
     if revision.startswith("-"):
         raise ValueError('a revision must not start with "-"')
+    if not path.parents:  # "." or a filesystem root: a directory, never a committed file
+        raise ValueError("expected the path of a file")
     directory = next((parent for parent in path.parents if parent.is_dir()), path.parents[-1])
     name = path.relative_to(directory).as_posix()
     git_output(directory, "rev-parse", "--show-prefix")  # not a repository, or a missing directory
