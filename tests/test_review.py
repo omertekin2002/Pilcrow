@@ -6,6 +6,7 @@ Run with ``python -m unittest discover -s tests -v`` from the project root.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -64,6 +65,49 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
     from test_textconv import tree  # type: ignore[no-redef]
 
 CAVEAT = "No supported prose or review changes detected (not a complete document comparison)."
+MARKERS = {"- ", "~ ", "+ "}
+
+
+def assert_same_report(test: unittest.TestCase, text: str, markdown: str) -> None:
+    """Check that a Markdown report says what the text report says, block for block.
+
+    The header becomes a heading, the prose diff sits unchanged in a fenced diff block,
+    and each metadata section is a subheading with one bullet per text line, its
+    -/~/+ marker in a code span.
+    """
+    blocks = text.rstrip("\n").split("\n\n")
+    header = blocks.pop(0)
+    old, new = header.removeprefix("Review: ").split(" → ")
+    md = markdown.rstrip("\n").split("\n\n")
+    test.assertEqual(md.pop(0), f"## Review: `{old}` → `{new}`")
+    prose = blocks.pop(0)
+    if prose == "Prose: no changes":
+        test.assertEqual(md.pop(0), prose)
+    else:
+        # Unified diff lines are never empty (a blank context line is " "), so the
+        # diff and its fence are one block, like the text's "Prose:" block.
+        test.assertEqual(md.pop(0), "### Prose")
+        fenced = md.pop(0).split("\n")
+        fence = fenced[-1]
+        test.assertEqual(set(fence), {"`"})
+        test.assertGreaterEqual(len(fence), 3)
+        test.assertGreater(len(fence), max((len(run) for run in re.findall("`+", prose)), default=0))
+        test.assertEqual(fenced, [f"{fence}diff", *prose.split("\n")[1:], fence])
+    test.assertEqual(md.pop(), blocks.pop())  # the closing caveat has nothing to escape
+    for block in blocks:
+        first, *lines = block.split("\n")
+        if lines:
+            title = first.removesuffix(":")
+        else:  # a one-line section such as "Metadata: key changed"
+            title, inline = first.split(": ", 1)
+            lines = [inline]
+        test.assertEqual(md.pop(0), f"### {title}")
+        bullets = md.pop(0).split("\n")
+        test.assertEqual(len(bullets), len(lines), block)
+        for line, item in zip(lines, bullets, strict=True):
+            prefix = f"- `{line[0]}` " if line[:2] in MARKERS else "- "
+            test.assertTrue(item.startswith(prefix), item)
+    test.assertEqual(md, [])
 
 
 class ReviewTests(unittest.TestCase):
@@ -85,11 +129,18 @@ class ReviewTests(unittest.TestCase):
         return result
 
     def review(self, code: int = 1) -> str:
-        """Review old.docx -> new.docx by relative name and return the report."""
+        """Review old.docx -> new.docx by relative name and return the report.
+
+        Every review is also printed as Markdown, which must reach the same verdict
+        and say the same things (see ``assert_same_report``).
+        """
         result = self.pilcrow("review", "old.docx", "new.docx", code=code)
         self.assertEqual(result.stderr, b"")
         report = result.stdout.decode("utf-8")
         self.assertTrue(report.startswith("Review: old.docx → new.docx\n\n"), report)
+        markdown = self.pilcrow("review", "--format", "markdown", "old.docx", "new.docx", code=code)
+        self.assertEqual(markdown.stderr, b"")
+        assert_same_report(self, report, markdown.stdout.decode("utf-8"))
         return report
 
     def section(self, report: str, title: str) -> list[str]:
@@ -340,6 +391,96 @@ class ReviewTests(unittest.TestCase):
         make_docx(self.new, field * 3999 + paragraph("Old ending."))
         self.assertEqual(self.section(self.review(), "Fields"), ["- removed field 4000 (PAGE) in word/document.xml"])
 
+    # Markdown
+
+    def markdown(self, old: str = "old.docx", new: str = "new.docx", code: int = 1) -> str:
+        result = self.pilcrow("review", "--format", "markdown", old, new, code=code)
+        self.assertEqual(result.stderr, b"")
+        return result.stdout.decode("utf-8")
+
+    def test_text_is_the_default_format_and_unchanged(self) -> None:
+        make_docx(self.old, paragraph("Opening sentence. The cat sat on the mat."))
+        make_docx(self.new, paragraph("Opening sentence. The dog sat on the mat."))
+        changed = ("Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+                   " Opening sentence.\n-The cat sat on the mat.\n+The dog sat on the mat.\n\n"
+                   "Coverage warnings (either side):\n"
+                   "  Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+                   "Only the prose and review metadata Pilcrow extracts are compared"
+                   " (not a complete document comparison).\n")
+        unchanged = f"Review: old.docx → old.docx\n\nProse: no changes\n\n{CAVEAT}\n"
+        for new, code, expected in (("new.docx", 1, changed), ("old.docx", 0, unchanged)):
+            default = self.pilcrow("review", "old.docx", new, code=code).stdout
+            self.assertEqual(default, expected.encode("utf-8"))
+            self.assertEqual(self.pilcrow("review", "--format", "text", "old.docx", new, code=code).stdout, default)
+            self.assertEqual(self.pilcrow("review", "old.docx", new, "--format=text", code=code).stdout, default)
+
+    def test_markdown_report_shape(self) -> None:
+        make_docx(self.old, paragraph("Opening sentence. The cat sat on the mat."))
+        make_docx(self.new, paragraph("Opening sentence. The dog sat on the mat."))
+        self.assertEqual(self.markdown(), (
+            "## Review: `old.docx` → `new.docx`\n\n### Prose\n\n```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            " Opening sentence.\n-The cat sat on the mat.\n+The dog sat on the mat.\n```\n\n"
+            "### Coverage warnings (either side)\n\n"
+            "- Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+            "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n"))
+        self.assertEqual(self.markdown("old.docx", "old.docx", code=0),
+                         f"## Review: `old.docx` → `old.docx`\n\nProse: no changes\n\n{CAVEAT}\n")
+
+    def test_an_invalid_format_is_a_usage_error(self) -> None:
+        make_docx(self.old, paragraph("Prose."))
+        result = self.pilcrow("review", "--format", "html", "old.docx", "old.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        for word in (b"--format", b"html", b"text", b"markdown", b"usage:"):
+            self.assertIn(word, result.stderr)
+
+    def test_the_diff_fence_is_longer_than_any_backtick_run_in_the_prose(self) -> None:
+        make_docx(self.old, paragraph("Code: ``` here.") + paragraph("Before."))
+        make_docx(self.new, paragraph("Code: ```` here.") + paragraph("```") + paragraph("````"))
+        text = self.review()  # also checks the fenced block holds exactly the text diff
+        report = self.markdown()
+        lines = report.split("\n")
+        opening = lines.index("`````diff")
+        closing = lines.index("`````", opening)
+        self.assertEqual(lines[opening + 1:closing], self.section(text, "Prose"))
+        self.assertIn("+````", lines[opening + 1:closing])
+        # Nothing inside could close a fence of five backticks.
+        self.assertFalse(any(set(line.strip()) == {"`"} and len(line.strip()) >= 5 for line in lines[opening + 1:closing]))
+
+    def test_hostile_document_text_is_escaped_outside_the_diff(self) -> None:
+        hostile = "# heading *emphasis* [link](x) ![img](x) <script> &amp; | `tick"
+        link = f'<w:p><w:hyperlink r:id="link">{run(hostile)}</w:hyperlink></w:p>'
+        make_docx(self.old, paragraph("Body."))
+        make_docx(self.new, f"<w:p>{start('1')}{run('Body.')}{end('1')}</w:p>{link}"
+                  '<w:p><w:ins w:id="7" w:author="Mallory &lt;b&gt;|*x*"><w:r><w:t>Inserted.</w:t></w:r></w:ins></w:p>',
+                  extra={"word/comments.xml": comments_part({"1": hostile})},
+                  relationships=COMMENTS_REL + f'<Relationship Id="link" Type="{R}/hyperlink" '
+                                               'Target="https://example.invalid/a_b*c" TargetMode="External"/>')
+        self.review()
+        report = self.markdown()
+        fence = report.index("```diff\n")
+        outside = report[:fence] + report[report.index("\n```\n", fence) + 5:]
+        escaped = r'"\# heading \*emphasis\* \[link\](x) \!\[img\](x) &lt;script&gt; &amp;amp; \| \`tick"'
+        for title, marker in (("Comments", "comment by Ada"), ("Hyperlinks", "link")):
+            section = outside.split(f"### {title}\n\n", 1)[1].split("\n\n", 1)[0]
+            self.assertTrue(section.startswith(f"- `+` added {marker}"), section)
+            self.assertIn(escaped, section)
+        self.assertIn(r"→ https\://example.invalid/a\_b\*c", outside)
+        self.assertIn(r"by Mallory &lt;b&gt;\|\*x\*\: ", outside)
+        # Nothing from the document survives unescaped outside the fence.
+        for raw in ("<script>", "[link](x)", "*emphasis*", "| `", "&amp; ", "<b>"):
+            self.assertNotIn(raw, outside)
+        self.assertEqual([line for line in outside.split("\n") if line.startswith("#")],
+                         ["## Review: `old.docx` → `new.docx`", "### Prose", "### Comments", "### Tracked changes",
+                          "### Hyperlinks", "### Warnings", "### Coverage warnings (either side)"])
+        # The prose diff itself is verbatim.
+        self.assertIn(f"+{hostile}\n", report[fence:])
+
+    def test_markdown_header_labels_are_code_spans(self) -> None:
+        make_docx(self.old, paragraph("Same."))
+        shutil.copy(self.old, self.root / "a `b` #.docx")
+        report = self.markdown("a `b` #.docx", "old.docx", code=0)
+        self.assertTrue(report.startswith("## Review: ``a `b` #.docx`` → `old.docx`\n\n"), report)
+
     # Inputs, errors and side effects
 
     def test_missing_or_malformed_input_exits_2_with_no_report(self) -> None:
@@ -510,6 +651,27 @@ class RevisionReviewTests(unittest.TestCase):
         self.assertTrue(report.startswith(f"Review: {branch}:report.docx → feature:report.docx\n\n"), report)
         self.assertIn("-The dog sat.", report)
 
+    def test_markdown_with_revisions(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(document, paragraph("The dog sat."))
+        self.commit("second")
+        before = self.state()
+        for args, header in ((("--rev", "HEAD~1", "--rev", "HEAD"), "`HEAD~1:report.docx` → `HEAD:report.docx`"),
+                             (("--rev", "HEAD~1"), "`HEAD~1:report.docx` → `report.docx`")):
+            text = self.pilcrow("review", *args, "report.docx", code=1)
+            result = self.pilcrow("review", "--format", "markdown", *args, "report.docx", code=1)
+            self.assertEqual(result.stderr, b"")
+            assert_same_report(self, text.stdout.decode("utf-8"), result.stdout.decode("utf-8"))
+            self.assertTrue(result.stdout.decode("utf-8").startswith(f"## Review: {header}\n\n"), result.stdout)
+        self.assertEqual(self.pilcrow("review", "--format", "markdown", "--rev", "HEAD", "report.docx", code=0).stdout,
+                         f"## Review: `HEAD:report.docx` → `report.docx`\n\nProse: no changes\n\n{CAVEAT}\n".encode())
+        # Errors print nothing on stdout, whatever the format.
+        result = self.pilcrow("review", "--format", "markdown", "--rev", "no-such-rev", "report.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.state(), before)
+
     def test_two_revisions_need_no_folder_in_the_work_tree(self) -> None:
         # A later commit or a sparse checkout may have removed the document's folders.
         nested = Path("old notes") / "drafts" / "report.docx"
@@ -616,3 +778,31 @@ class RevisionReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarkdownEscapingTests(unittest.TestCase):
+    """The helpers that keep document text literal in a Markdown report."""
+
+    def test_escape_renders_literally_on_one_line(self) -> None:
+        from pilcrow.review import escape
+        self.assertEqual(escape("a\nb\r\nc\rd"), "a b c d")
+        self.assertEqual(escape("- item"), "\\- item")
+        self.assertEqual(escape("+ item"), "\\+ item")
+        self.assertEqual(escape("12. item"), "12\\. item")
+        self.assertEqual(escape("3) item"), "3\\) item")
+        self.assertEqual(escape("=== x"), "\\=== x")
+        self.assertEqual(escape("> quote"), "&gt; quote")
+        self.assertEqual(escape("<b>&copy;"), "&lt;b&gt;&amp;copy;")
+        self.assertEqual(escape("$x$ ~~s~~ _u_"), "\\$x\\$ \\~\\~s\\~\\~ \\_u\\_")
+        self.assertEqual(escape("see www.example.invalid or a@b.invalid"),
+                         "see www\\.example.invalid or a\\@b.invalid")
+        self.assertEqual(escape("back\\slash"), "back\\\\slash")
+        self.assertEqual(escape("plain words, 1.5 (ok)"), "plain words, 1.5 (ok)")
+
+    def test_code_spans_outrun_backticks_inside(self) -> None:
+        from pilcrow.review import code
+        self.assertEqual(code("plain.docx"), "`plain.docx`")
+        self.assertEqual(code("a`b"), "``a`b``")
+        self.assertEqual(code("`a``"), "``` `a`` ```")
+        self.assertEqual(code(" padded "), "`  padded  `")
+        self.assertEqual(code("two\nlines"), "`two lines`")

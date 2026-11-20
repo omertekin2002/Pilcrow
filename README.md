@@ -317,6 +317,55 @@ re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
 
+To paste the report into a pull request, an issue, or a chat that renders
+Markdown, add `--format markdown` (the default, `--format text`, is the plain
+report above). It works with both forms, `OLD NEW` and `--rev`, and says the
+same things with the same exit code:
+
+```sh
+pilcrow review --format markdown --rev HEAD~1 --rev HEAD report.docx
+```
+
+For a reworded sentence and a resolved comment, it prints:
+
+````markdown
+## Review: `HEAD~1:report.docx` → `HEAD:report.docx`
+
+### Prose
+
+```diff
+--- OLD
++++ NEW
+@@ -1,4 +1,4 @@
+ first sentence.
+ 
+ Opening sentence.
+-The cat sat on the mat.
++The dog sat on the mat.
+```
+
+### Comments
+
+- `~` resolved comment by Ada on "first sentence."\: "Please clarify."
+
+### Coverage warnings (either side)
+
+- Comment text, authors, anchored text, replies, and resolved state are recorded; dates and rich formatting are not compared.
+- Formatting and page layout are not compared; unchanged prose is not an identical document.
+
+Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).
+````
+
+The header becomes a heading with both sides in code spans, and the prose diff
+sits unchanged in a fenced `diff` block whose fence is longer than any run of
+backticks in the document. Each metadata section becomes a subheading with one
+bullet per line of the text report, its `-`, `~`, or `+` marker kept in a code
+span so the meaning does not depend on colour. Text from the document (comment
+text, anchors, authors, link text and targets, warnings) is escaped, so it renders
+literally: it cannot add headings, emphasis, links, images, HTML, or tables. A
+renderer may still turn a bare URL, an `@name`, or a `#123` into a link
+afterwards, as GitHub does in any comment.
+
 The report shows only what Pilcrow's extraction supports: formatting, layout,
 and anything else outside the prose and `.meta.json` are not compared, so "No
 supported prose or review changes detected" is not a claim that the documents
