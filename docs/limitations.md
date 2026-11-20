@@ -82,8 +82,11 @@ when every other recorded field, including author, text, anchor and the parent
 of a reply, identifies exactly one comment on each side, and resolved or
 reopened only when both states are known; otherwise they fall back to removed
 and added, or to a notice that the category changed. A reply is matched by its
-parent's author and text rather than its recorded position. Long texts are
-shortened to 80 characters for display.
+parent's author, text, and anchor rather than its recorded position, so inserting
+an earlier comment does not change it; when several comments share that identity,
+the position is compared too, so moving a reply between them is still reported.
+An image whose media part goes missing or appears is listed as removed and added.
+Long texts are shortened to 80 characters for display.
 
 ## Normalization and sentence lines
 

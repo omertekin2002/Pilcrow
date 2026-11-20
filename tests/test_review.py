@@ -185,7 +185,7 @@ class ReviewTests(unittest.TestCase):
         self.threaded(self.new, replied, {**ids, "3": "33333333"},
                       ("11111111", None, "0"), ("22222222", None, "0"), ("33333333", "11111111", "0"))
         self.assertEqual(self.section(self.review(), "Comments"),
-                         ['+ added reply by Ada to Ada\'s comment "First.": "A reply." (open)'])
+                         ['+ added reply by Ada to Ada\'s comment "First." on "Passage 0.": "A reply." (open)'])
 
         def ranged(path: Path, before: str, anchored: str, after: str, text: str = "Note.") -> None:
             make_docx(path, f"<w:p>{run(before)}{start('1')}{run(anchored)}{end('1')}{run(after)}</w:p>",
@@ -212,6 +212,28 @@ class ReviewTests(unittest.TestCase):
                       ("22222222", "11111111", "0"), body=body(comments))
         self.assertEqual(self.section(self.review(), "Comments"),
                          ['+ added comment by Ada on "Passage 0.": "Earlier." (open)'])
+
+    def test_moving_a_reply_between_look_alike_parents_is_reported(self) -> None:
+        def write(path: Path, parent: str, other: str, same_anchor: bool) -> None:
+            comments = {"1": "Same.", "2": "Same.", "3": "Reply.", "4": other}
+            ids = {"1": "11111111", "2": "22222222", "3": "33333333", "4": "44444444"}
+            body = "".join(f"<w:p>{start(c)}{run('Same passage.' if same_anchor and c in '12' else f'Passage {c}.')}"
+                           f"{end(c)}</w:p>" for c in comments)
+            self.threaded(path, comments, ids, ("11111111", None, "0"), ("22222222", None, "0"),
+                          ("33333333", parent, "0"), ("44444444", None, "0"), body=body)
+        # Parents with the same author and text but different anchors; another comment also changes.
+        write(self.old, "11111111", "Other.", same_anchor=False)
+        write(self.new, "22222222", "Other, edited.", same_anchor=False)
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Passage 1.": "Reply." (open)', lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Same." on "Passage 2.": "Reply." (open)', lines)
+        self.assertIn('~ edited text of comment by Ada on "Passage 4.": "Other." → "Other, edited."', lines)
+        # Parents the metadata cannot tell apart at all: their position tells the replies apart.
+        write(self.old, "11111111", "Other.", same_anchor=True)
+        write(self.new, "22222222", "Other, edited.", same_anchor=True)
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 1): "Reply." (open)', lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 2): "Reply." (open)', lines)
 
     def test_long_comment_text_is_shortened(self) -> None:
         long = "word " * 40
@@ -267,6 +289,16 @@ class ReviewTests(unittest.TestCase):
         write(self.new, "second picture", "https://example.invalid/b.png")
         self.assertEqual(self.section(self.review(), "Images"),
                          ["~ image 1 (word/document.xml) replaced; link changed: https://example.invalid/a.png → https://example.invalid/b.png"])
+        # A dangling embedded reference next to the link: no hash to compare, so both sides are listed.
+        dangling = picture("rId9").replace('r:embed="rId9"', 'r:embed="rId9" r:link="rId6"')
+        make_docx(self.old, anchored("Figure:", picture("rId6", "link")),
+                  relationships=image_rel("rId6", "https://example.invalid/b.png", external=True))
+        make_docx(self.new, anchored("Figure:", dangling),
+                  relationships=image_rel("rId6", "https://example.invalid/b.png", external=True))
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ["- removed image 1 (word/document.xml): linked to https://example.invalid/b.png",
+                          "+ added image 1 (word/document.xml): with a missing media part, linked to https://example.invalid/b.png"])
+        write(self.new, "second picture", "https://example.invalid/b.png")
         make_docx(self.old, paragraph("Figure:"))
         (line,) = self.section(self.review(), "Images")
         self.assertRegex(line, r"^\+ added image 1 \(word/document\.xml\): 14 bytes, sha256 [0-9a-f]{12}, "

@@ -95,19 +95,26 @@ def only_differs(old: Entry, new: Entry, *fields: str) -> bool:
 
 
 def comment_view(comments: Sequence[Entry]) -> list[Entry]:
-    """Comments with ``reply_to`` replaced by the parent's author and text.
+    """Comments with ``reply_to`` replaced by the parent's identity.
 
     A reply's raw ``reply_to`` is a position, so inserting an earlier comment would
-    change every later reply; the parent's identity does not.
+    change every later reply; the parent's author, text and anchor do not. When that
+    identity is shared by several comments, the position is kept too, so moving a
+    reply between look-alike parents is still a difference.
     """
+    def identity(entry: Entry) -> list[Any]:
+        return [author(entry), entry.get("text"), entry.get("anchor"), entry.get("anchor_part")]
+    shared = Counter(canonical(identity(entry)) for entry in comments)
     result = []
     for entry in comments:
         view = {k: v for k, v in entry.items() if k != "reply_to"}
         parent = entry.get("reply_to")
         if isinstance(parent, int) and 0 <= parent < len(comments):
-            view["parent"] = [author(comments[parent]), comments[parent].get("text")]
+            view["parent"] = identity(comments[parent])
+            if shared[canonical(view["parent"])] > 1:
+                view["parent"].append(parent)
         else:
-            view["parent"] = None
+            view["parent"] = parent  # None, or a position that names no comment
         result.append(view)
     return result
 
@@ -124,9 +131,15 @@ def anchor(entry: Entry) -> str:
 def describe_comment(entry: Entry) -> str:
     resolved = entry.get("resolved")
     state = " (resolved)" if resolved is True else " (open)" if resolved is False else ""
-    if entry.get("parent") is not None:
-        parent_author, parent_text = entry["parent"]
-        return f"reply by {author(entry)} to {parent_author}'s comment {short(parent_text)}: {short(entry.get('text'))}{state}"
+    parent = entry.get("parent")
+    if isinstance(parent, list):
+        parent_author, parent_text, parent_anchor, parent_part = parent[:4]
+        which = f" (comment {parent[4] + 1})" if len(parent) > 4 else ""  # look-alike parents
+        on = anchor({"anchor": parent_anchor, "anchor_part": parent_part})
+        return (f"reply by {author(entry)} to {parent_author}'s comment {short(parent_text)} {on}{which}:"
+                f" {short(entry.get('text'))}{state}")
+    if parent is not None:
+        return f"reply by {author(entry)} to a missing comment {parent + 1}: {short(entry.get('text'))}{state}"
     return f"comment by {author(entry)} {anchor(entry)}: {short(entry.get('text'))}{state}"
 
 
@@ -218,14 +231,17 @@ def describe_image(entry: Entry, position: int) -> str:
 
 
 def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
-    if old.get("part") != new.get("part"):
+    """Word a hash or link change of one image; anything else falls back to removed/added."""
+    if old.get("part") != new.get("part") or ("sha256" in old) != ("sha256" in new):
         return None
     details = []
     if (old.get("sha256"), old.get("bytes")) != (new.get("sha256"), new.get("bytes")):
+        if None in (old.get("sha256"), new.get("sha256")):
+            return None  # a media part went missing or appeared: describe both sides in full
         details.append("replaced")
     if old.get("target") != new.get("target"):
         details.append(f"link changed: {old.get('target') or '(none)'} → {new.get('target') or '(none)'}")
-    return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details)
+    return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details) if details else None
 
 
 def describe_level(level: Entry) -> str:
