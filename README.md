@@ -342,9 +342,12 @@ With one `--rev`, the old side is `report.docx` as committed at that revision
 and the new side is the file in your working copy. With two, both sides come
 from Git and the working copy is not read. The header names both sides, such as
 `Review: HEAD~1:report.docx → report.docx`. The path is relative to the current
-directory, like `git show HEAD:./report.docx`. The old side is extracted from
-the **committed DOCX itself**, not from companions committed with it, so it needs
-no `.pilcrow/` files and works for history from before you used Pilcrow.
+directory, like `git show HEAD:./report.docx`. A folder inside the repository
+that was committed as a folder and is now a symlink keeps its own history:
+Pilcrow reads the committed file, not whatever the link points to. The old
+side is extracted from the **committed DOCX itself**, not from companions
+committed with it, so it needs no `.pilcrow/` files and works for history from
+before you used Pilcrow.
 Pilcrow reads it with read-only Git commands (`rev-parse` and `cat-file`): it
 never stages, checks out, or writes a file, not even a temporary one, and it
 checks the committed file's size against the package limit before reading it.
