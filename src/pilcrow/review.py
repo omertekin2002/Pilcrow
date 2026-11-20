@@ -60,8 +60,19 @@ def prose_section(old: str, new: str) -> list[str]:
 def aligned(old: Sequence[Entry], new: Sequence[Entry],
             key: Callable[[Entry], str] = canonical) -> list[tuple[list[int], list[int]]]:
     """The unmatched (old positions, new positions) of each differing block of an alignment."""
-    matcher = difflib.SequenceMatcher(None, [key(e) for e in old], [key(e) for e in new], autojunk=False)
-    return [(list(range(i1, i2)), list(range(j1, j2)))
+    a, b = [key(e) for e in old], [key(e) for e in new]
+    # Trim the common ends first: aligning many repeated entries is quadratic, and most
+    # reviews change a few entries of a long, otherwise identical sequence.
+    head = 0
+    while head < min(len(a), len(b)) and a[head] == b[head]:
+        head += 1
+    tail = 0
+    while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
+        tail += 1
+    if head + tail == len(a) == len(b):
+        return []
+    matcher = difflib.SequenceMatcher(None, a[head:len(a) - tail], b[head:len(b) - tail], autojunk=False)
+    return [(list(range(head + i1, head + i2)), list(range(head + j1, head + j2)))
             for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
 
 

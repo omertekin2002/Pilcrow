@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -326,6 +327,18 @@ class ReviewTests(unittest.TestCase):
                       warnings)
         footer = self.section(report, "Coverage warnings (either side)")
         self.assertEqual(len(footer), len(set(footer)))
+
+    def test_long_repetitive_metadata_is_aligned_quickly(self) -> None:
+        # 4,000 identical field records: unchanged ones must not be aligned pairwise.
+        field = '<w:p><w:fldSimple w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>'
+        make_docx(self.old, field * 4000 + paragraph("Old ending."))
+        make_docx(self.new, field * 4000 + paragraph("New ending."))
+        started = time.monotonic()
+        report = self.review()
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertNotIn("Fields:", report)
+        make_docx(self.new, field * 3999 + paragraph("Old ending."))
+        self.assertEqual(self.section(self.review(), "Fields"), ["- removed field 4000 (PAGE) in word/document.xml"])
 
     # Inputs, errors and side effects
 
