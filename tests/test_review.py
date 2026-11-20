@@ -708,6 +708,83 @@ class RevisionReviewTests(unittest.TestCase):
                 self.assertIn("-The committed docs version.", report)
                 self.assertIn("+The other folder's version.", report)
 
+    def link(self, link: Path, target: Path | str) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+
+    def test_a_folder_now_symlinked_to_the_top_keeps_its_own_history(self) -> None:
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / relative, paragraph("The root file's version."))
+            make_docx(self.repo / "docs" / relative, paragraph("The committed docs version."))
+        self.commit("first")
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / "docs" / relative, paragraph("The second docs version."))
+        self.commit("second")
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", ".")
+        before = self.state()
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "report.docx", self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                # Old: docs/... as committed, not the root file the link now leads to. New: the working copy.
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The second docs version.", report)
+                self.assertIn("+The root file's version.", report)
+                # Both sides from Git read docs/..., not the root file.
+                self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", path, code=0)
+                report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The second docs version.", report)
+                self.assertNotIn("root file", report)
+        self.assertEqual(self.state(), before)
+
+    def test_a_folder_now_symlinked_outside_any_repository_keeps_its_own_history(self) -> None:
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / "docs" / relative, paragraph("The committed docs version."))
+            make_docx(self.outside / "docs" / relative, paragraph("The outside folder's version."))
+        self.commit("first")
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", self.outside / "docs")
+        before = self.state()
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "report.docx", self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The outside folder's version.", report)
+                self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", path, code=0)
+        self.assertEqual(self.state(), before)
+
+    def test_symlinks_above_the_repository_are_followed(self) -> None:
+        base = Path(self.temp.name)
+        make_docx(self.repo / "report.docx", paragraph("The cat sat."))
+        make_docx(self.repo / "docs" / "report.docx", paragraph("The committed docs version."))
+        self.commit("first")
+        make_docx(self.repo / "report.docx", paragraph("The dog sat."))
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", ".")
+        self.link(base / "alias", base)
+        # A checkout reached through a link from inside another repository, such as a home folder kept in Git.
+        home = base / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-q", str(home)], env=self.env, capture_output=True, timeout=60, check=True)
+        self.link(home / "code", base)
+        before = self.state()
+        for top in (base / "alias" / "repo", home / "code" / "repo"):
+            with self.subTest(top=str(top)):
+                report = self.pilcrow("review", "--rev", "HEAD", top / "report.docx", cwd=self.outside,
+                                      code=1).stdout.decode("utf-8")
+                self.assertIn("-The cat sat.", report)
+                self.assertIn("+The dog sat.", report)
+                # A link inside the repository is still not followed when its top is reached through one.
+                report = self.pilcrow("review", "--rev", "HEAD", top / "docs" / "report.docx", cwd=self.outside,
+                                      code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The dog sat.", report)
+        self.assertEqual(self.state(), before)
+
     def test_subdirectories_spaces_and_unicode(self) -> None:
         folder = self.repo / "drafts and notes" / "İstanbul"
         document = folder / "résumé final.docx"

@@ -32,6 +32,22 @@ def git_output(directory: Path, *args: str) -> bytes | None:
     raise ValueError(detail.removeprefix("fatal: "))
 
 
+def toplevel(directory: Path) -> Path | None:
+    """The resolved top level of the work tree holding ``directory``, or None outside one."""
+    result = git(directory, "rev-parse", "--show-toplevel")
+    if result is None or result.returncode:
+        return None
+    return Path(os.fsdecode(result.stdout.strip())).resolve()
+
+
+def other_root(folder: Path, top: Path) -> bool:
+    """Whether ``folder`` is the top level of a work tree other than ``top``."""
+    try:
+        return (folder / ".git").exists() and folder.resolve() != top
+    except (OSError, RuntimeError):  # RuntimeError: symlink loop before 3.13
+        return False
+
+
 def revision_blob(path: Path, revision: str, limit: int) -> bytes:
     """Read ``path`` as it is at ``revision`` without writing anything.
 
@@ -42,23 +58,32 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
     whose folder was since deleted, or is left out of a sparse checkout, still
     resolves. The rest of the path is looked up in the committed tree, not the
     work tree.
+
+    A folder on the path that is now a symlink, but sits inside the repository,
+    is not followed: wherever it points, even to the top of the repository or
+    outside any repository, Git runs from the folder holding the outermost such
+    link and the rest of the path is looked up in the committed tree. Symlinks
+    above the repository, such as macOS ``/var`` -> ``/private/var``, are
+    followed, and so is a link to the top of another repository.
     """
     if revision.startswith("-"):
         raise ValueError('a revision must not start with "-"')
     if not path.parents:  # "." or a filesystem root: a directory, never a committed file
         raise ValueError("expected the path of a file")
     directory = next((parent for parent in path.parents if parent.is_dir()), path.parents[-1])
-    top = Path(os.fsdecode((git_output(directory, "rev-parse", "--show-toplevel") or b"").strip())).resolve()
-    # Git would follow a folder on the path that is now a symlink, and read the history of the
-    # folder it points to. Run it from above the outermost such folder inside the repository.
-    outermost = None
-    for folder in (directory, *directory.parents):  # a relative path stops at the current directory
-        if folder.resolve() == top:
-            break
-        if folder.is_symlink():
-            outermost = folder
-    if outermost is not None:
-        directory = outermost.parent
+    # Git would follow a folder on the path that is now a symlink, and read the history of the folder it
+    # points to, or of no repository at all. Walk the path from the outside in, and stop at the first link
+    # whose parent is inside a repository, unless the document's own repository starts at or below the link.
+    # Git never runs through such a link. A relative path starts at the current directory.
+    folders = (*reversed(directory.parents), directory)
+    for index, folder in enumerate(folders):
+        if not folder.is_symlink():
+            continue
+        top = toplevel(folder.parent)
+        if top is None or any(other_root(inner, top) for inner in folders[index:]):
+            continue  # above the document's repository
+        directory = folder.parent
+        break
     name = path.relative_to(directory).as_posix()
     # Neither argument can start with "-": the revision is checked above, and the second starts with a hash.
     tree = git_output(directory, "rev-parse", "--verify", "--quiet", f"{revision}^{{tree}}")
