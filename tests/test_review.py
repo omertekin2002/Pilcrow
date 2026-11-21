@@ -6,6 +6,7 @@ Run with ``python -m unittest discover -s tests -v`` from the project root.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -481,6 +482,80 @@ class ReviewTests(unittest.TestCase):
         report = self.markdown("a `b` #.docx", "old.docx", code=0)
         self.assertTrue(report.startswith("## Review: ``a `b` #.docx`` → `old.docx`\n\n"), report)
 
+    # Word marks (--word-diff)
+
+    def test_word_diff_marks_the_changed_words_of_a_sentence(self) -> None:
+        make_docx(self.old, paragraph("The supplier shall deliver the goods within 30 days. Payment is due on receipt."))
+        make_docx(self.new, paragraph("The supplier may deliver the goods within 60 days. Payment is due on receipt."))
+        tail = ("Coverage warnings (either side):\n"
+                "  Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+                "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n")
+        result = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout.decode("utf-8"), (
+            "Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.\n"
+            " Payment is due on receipt.\n\n" + tail))
+        # Without the flag, the same documents give the whole-line diff, as before.
+        plain = self.pilcrow("review", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertEqual(plain, (
+            "Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "-The supplier shall deliver the goods within 30 days.\n"
+            "+The supplier may deliver the goods within 60 days.\n"
+            " Payment is due on receipt.\n\n" + tail))
+        markdown = self.pilcrow("review", "--format", "markdown", "--word-diff", "old.docx", "new.docx", code=1)
+        self.assertEqual(markdown.stderr, b"")
+        self.assertEqual(markdown.stdout.decode("utf-8"), (
+            "## Review: `old.docx` → `new.docx`\n\n### Prose\n\n```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.\n"
+            " Payment is due on receipt.\n```\n\n"
+            "### Coverage warnings (either side)\n\n"
+            "- Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+            "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n"))
+        assert_same_report(self, result.stdout.decode("utf-8"), markdown.stdout.decode("utf-8"))
+        # The flag changes no exit code: 0 for no changes, 2 for an input error.
+        for args in (("--word-diff", "old.docx", "old.docx"), ("--format", "markdown", "--word-diff", "old.docx", "old.docx")):
+            unchanged = self.pilcrow("review", *args, code=0).stdout
+            self.assertEqual(unchanged, self.pilcrow("review", *(a for a in args if a != "--word-diff"), code=0).stdout)
+        result = self.pilcrow("review", "--word-diff", "old.docx", "absent.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+
+    def test_word_diff_falls_back_to_whole_lines(self) -> None:
+        long = " ".join(f"word{n}" for n in range(200))
+        cases = {
+            "unequal line counts": ("Opening. The cat sat on the mat.", "Opening. The cat sat. It liked the mat."),
+            "a dissimilar pair": ("Opening. The cat sat on the mat.", "Opening. Rain fell hard all night."),
+            "one dissimilar pair in the block": ("Opening. The cat sat. The mat was red.",
+                                                 "Opening. The dog sat. Rain fell hard all night."),
+            "a line over the token cap": (f"Opening. {long} old.", f"Opening. {long} new."),
+            "a mark sequence": ("Opening. Write [-x-] here.", "Opening. Write [-y-] here."),
+        }
+        for name, (old, new) in cases.items():
+            with self.subTest(name):
+                make_docx(self.old, paragraph(old))
+                make_docx(self.new, paragraph(new))
+                for form in ("text", "markdown"):
+                    plain = self.pilcrow("review", "--format", form, "old.docx", "new.docx", code=1).stdout
+                    marked = self.pilcrow("review", "--format", form, "--word-diff", "old.docx", "new.docx", code=1).stdout
+                    self.assertEqual(marked, plain)
+                    self.assertNotIn(b"\n~ ", marked)
+
+    def test_word_diff_still_caps_a_very_large_change(self) -> None:
+        make_docx(self.old, "".join(paragraph(f"Old sentence {n}.") for n in range(1500)))
+        make_docx(self.new, "".join(paragraph(f"New sentence {n}.") for n in range(1500)))
+        result = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1)
+        prose = self.section(result.stdout.decode("utf-8"), "Prose")
+        # Every sentence pairs, and the blank lines between paragraphs are unchanged
+        # pairs shown as context: 3002 diff lines in all, 2000 shown.
+        self.assertEqual(len(prose), 2001)
+        self.assertEqual(prose[3:6], ["~ [-Old-]{+New+} sentence 0.", " ", "~ [-Old-]{+New+} sentence 1."])
+        self.assertEqual(prose[-1], "… 1002 more diff lines omitted")
+
+    def test_help_describes_word_diff(self) -> None:
+        help_text = b" ".join(self.pilcrow("review", "--help").stdout.split())
+        for words in (b"[--word-diff] OLD NEW", b"[--word-diff] --rev REV", b"[-...-]", b"{+...+}", b"whole"):
+            self.assertIn(words, help_text)
+
     # Inputs, errors and side effects
 
     def test_missing_or_malformed_input_exits_2_with_no_report(self) -> None:
@@ -670,6 +745,31 @@ class RevisionReviewTests(unittest.TestCase):
         # Errors print nothing on stdout, whatever the format.
         result = self.pilcrow("review", "--format", "markdown", "--rev", "no-such-rev", "report.docx", code=2)
         self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.state(), before)
+
+    def test_word_diff_with_revisions(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The supplier shall deliver the goods. Payment is due on receipt."))
+        self.commit("first")
+        make_docx(document, paragraph("The supplier may deliver the goods. Payment is due on receipt."))
+        self.commit("second")
+        make_docx(document, paragraph("The supplier may deliver all the goods. Payment is due on receipt."))
+        before = self.state()
+        marked = {
+            ("--rev", "HEAD"): "~ The supplier may deliver {+all +}the goods.",
+            ("--rev", "HEAD~1"): "~ The supplier [-shall-]{+may+} deliver {+all +}the goods.",
+            ("--rev", "HEAD~1", "--rev", "HEAD"): "~ The supplier [-shall-]{+may+} deliver the goods.",
+        }
+        for args, line in marked.items():
+            with self.subTest(args=args):
+                text = self.pilcrow("review", "--word-diff", *args, "report.docx", code=1).stdout.decode("utf-8")
+                self.assertIn(f"\n@@ -1,2 +1,2 @@\n{line}\n Payment is due on receipt.\n\n", text)
+                result = self.pilcrow("review", "--format", "markdown", "--word-diff", *args, "report.docx", code=1)
+                self.assertEqual(result.stderr, b"")
+                assert_same_report(self, text, result.stdout.decode("utf-8"))
+                self.assertIn(f"```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n{line}\n", result.stdout.decode("utf-8"))
+        self.pilcrow("review", "--word-diff", "--rev", "HEAD~1", "--rev", "HEAD~1", "report.docx", code=0)
+        self.assertEqual(self.pilcrow("review", "--word-diff", "--rev", "no-such-rev", "report.docx", code=2).stdout, b"")
         self.assertEqual(self.state(), before)
 
     def test_two_revisions_need_no_folder_in_the_work_tree(self) -> None:
@@ -883,3 +983,118 @@ class MarkdownEscapingTests(unittest.TestCase):
         self.assertEqual(code("`a``"), "``` `a`` ```")
         self.assertEqual(code(" padded "), "`  padded  `")
         self.assertEqual(code("two\nlines"), "`two lines`")
+
+
+def unmark(line: str, side: str) -> str:
+    """The old (``side`` "old") or new line a marked line was made from."""
+    if side == "old":
+        return re.sub(r"\[-(.*?)-\]", r"\1", re.sub(r"\{\+.*?\+\}", "", line, flags=re.S), flags=re.S)
+    return re.sub(r"\{\+(.*?)\+\}", r"\1", re.sub(r"\[-.*?-\]", "", line, flags=re.S), flags=re.S)
+
+
+class WordMarksTests(unittest.TestCase):
+    """The word marks of `pilcrow review --word-diff`, and when lines are not paired."""
+
+    def assert_round_trip(self, old: str, new: str) -> str:
+        from pilcrow.review import word_marks
+        marked = word_marks(old, new)
+        self.assertEqual(unmark(marked, "old"), old, marked)
+        self.assertEqual(unmark(marked, "new"), new, marked)
+        return marked
+
+    def test_marks(self) -> None:
+        cases = {
+            ("The supplier shall deliver the goods within 30 days.", "The supplier may deliver the goods within 60 days."):
+                "The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.",
+            # Changes separated only by whitespace are one mark.
+            ("The supplier shall deliver the goods.", "The supplier may send the goods."):
+                "The supplier [-shall deliver-]{+may send+} the goods.",
+            ("Pay 1,000.50 EUR, net.", "Pay 1,200.50 USD; net!"): "Pay 1,[-000-]{+200+}.50 [-EUR,-]{+USD;+} net[-.-]{+!+}",
+            ("the the cat sat", "the cat sat"): "the [-the -]cat sat",
+            # An added or removed word keeps its following space inside the mark, wherever it is.
+            ("deliver the goods", "deliver all the goods"): "deliver {+all +}the goods",
+            ("a b c d", "a c d"): "a [-b -]c d",
+            ("Die Größe ist groß.", "Die Größe ist klein."): "Die Größe ist [-groß-]{+klein+}.",
+            ("a  b", "a b"): "a[-  -]{+ +}b",
+            ("end", "end now"): "end{+ now+}",
+            ("", "added"): "{+added+}",
+        }
+        for (old, new), expected in cases.items():
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self.assert_round_trip(old, new), expected)
+
+    def test_round_trip(self) -> None:
+        pairs = [
+            ("He said: “No.” (See §3.)", "She said: “Yes!” (See §4.)"),
+            ("10 apples, 20 pears, 30 plums.", "10 apples, 25 pears, 30 plums and figs."),
+            ("very very very good", "very good very very"),
+            ("Ünïcödé café naïve 東京 test", "Unicode café naive 京都 test"),
+            ("tabs\tand  spaces ", " tabs and\tspaces"),
+            ("Brackets [ ] { } + - stay.", "Brackets [ ] { } - + stay."),
+            ("x-", "x--"), ("{x", "{{x"), ("[", "[["), ("-", "+"), ("", ""), ("a", ""),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assert_round_trip(old, new)
+        pieces = ["the", "cat", "Größe", "42", "3.5", " ", "  ", "\t", ",", ".", "-", "+", "[", "]", "{", "}",
+                  "“", "é", "_", "x"]
+        rng = random.Random(43)
+        for _ in range(2000):
+            old = "".join(rng.choice(pieces) for _ in range(rng.randrange(12)))
+            new = list(old)
+            for _ in range(rng.randrange(4)):
+                at = rng.randrange(len(new) + 1)
+                new[at:at + rng.randrange(3)] = rng.choice(pieces)
+            new_line = "".join(new)
+            if any(mark in line for line in (old, new_line) for mark in ("[-", "-]", "{+", "+}")):
+                continue  # never paired, so never marked
+            self.assert_round_trip(old, new_line)
+
+    def test_pairing_rules(self) -> None:
+        from pilcrow.review import (
+            MAX_WORD_TOKENS,
+            MIN_WORD_SIMILARITY,
+            pairable,
+            paired,
+        )
+        self.assertEqual(MIN_WORD_SIMILARITY, 0.5)
+        self.assertTrue(pairable("The cat sat.", "The dog sat."))  # 3 of 4 words: 0.75
+        self.assertTrue(pairable("a b c d", "a b x y"))  # exactly 0.5
+        self.assertFalse(pairable("a b c d", "a x y z"))  # 0.25
+        words = " ".join(["w"] * MAX_WORD_TOKENS)
+        self.assertTrue(pairable(words, words))
+        self.assertFalse(pairable(words + " w", words + " v"))  # one line over the cap
+        self.assertFalse(pairable(words + " w", words))
+        for mark in ("[-", "-]", "{+", "+}"):
+            self.assertFalse(pairable(f"The {mark} cat.", "The dog."), mark)
+            self.assertFalse(pairable("The dog.", f"The {mark} cat."), mark)
+        self.assertEqual(paired(["The cat sat.", "", "It was warm."], ["The dog sat.", "", "It was hot."]),
+                         ["~ The [-cat-]{+dog+} sat.", " ", "~ It was [-warm-]{+hot+}."])
+        self.assertIsNone(paired(["The cat sat."], ["The dog sat.", "More."]))
+        self.assertIsNone(paired(["The cat sat.", "It was warm."], ["The dog sat.", "Rain fell all night."]))
+
+    def test_whole_line_fallback_is_the_plain_diff(self) -> None:
+        from pilcrow.review import prose_diff
+        long = " ".join(f"w{n}" for n in range(201))
+        for old, new in (("A.\nThe cat sat.\nB.", "A.\nThe cat sat.\nIt purred.\nB."),
+                         ("A.\nThe cat sat.\nB.", "A.\nRain fell all night.\nB."),
+                         (f"A.\n{long} x\nB.", f"A.\n{long} y\nB."),
+                         ("A.\nWrite {+x+}.\nB.", "A.\nWrite {+y+}.\nB."),
+                         ("A.\nGone.\nB.", "A.\nB.")):
+            with self.subTest(old=old[:40], new=new[:40]):
+                self.assertEqual(prose_diff(old, new, marks=True), prose_diff(old, new))
+        self.assertEqual(prose_diff("same", "same", marks=True), [])
+
+    def test_hunks_match_unified_diff(self) -> None:
+        """With pairing switched off, the word diff is exactly difflib's unified diff, hunk headers included."""
+        from unittest.mock import patch
+
+        from pilcrow import review
+        rng = random.Random(7)
+        vocabulary = ["", "A.", "B.", "C.", "D.", "E.", "F."]
+        with patch.object(review, "paired", return_value=None):
+            for _ in range(500):
+                old = "\n".join(rng.choice(vocabulary) for _ in range(rng.randrange(30)))
+                new = "\n".join(rng.choice(vocabulary) for _ in range(rng.randrange(30)))
+                with self.subTest(old=old, new=new):
+                    self.assertEqual(review.prose_diff(old, new, marks=True), review.prose_diff(old, new))
