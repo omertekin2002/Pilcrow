@@ -16,14 +16,28 @@ from pathlib import Path
 
 try:
     from .test_cli import PROJECT, make_docx, paragraph
-    from .test_textconv import tree
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
     from test_cli import PROJECT, make_docx, paragraph  # type: ignore[no-redef]
-    from test_textconv import tree  # type: ignore[no-redef]
 
 DOCUMENT = "report.docx"
 PROSE = Path(".pilcrow") / f"{DOCUMENT}.prose.md"
 META = Path(".pilcrow") / f"{DOCUMENT}.meta.json"
+
+
+def work_tree(repo: Path) -> list[tuple[str, int, int]]:
+    """Every file and directory in the work tree with its size and mtime, leaving out ``.git``.
+
+    Git may still be tidying ``.git`` in the background after a commit, so it is not compared.
+    """
+    listing = []
+    for directory, folders, files in os.walk(repo):
+        if Path(directory) == repo:
+            folders[:] = [folder for folder in folders if folder != ".git"]
+        for name in folders + files:
+            item = Path(directory) / name
+            info = item.stat()
+            listing.append((item.relative_to(repo).as_posix(), info.st_size, info.st_mtime_ns))
+    return sorted(listing)
 
 
 def quickstart_section() -> str:
@@ -67,7 +81,8 @@ class QuickstartTests(unittest.TestCase):
         self.env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(base)}
         self.env["PYTHONPATH"] = os.pathsep.join((str(PROJECT / "src"), self.env.get("PYTHONPATH", "")))
         for args in (("init", "-q"), ("config", "user.name", "Pilcrow Test"),
-                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false")):
+                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false"),
+                     ("config", "maintenance.auto", "false"), ("config", "gc.auto", "0")):
             self.git(*args)
 
     def git(self, *args: str) -> str:
@@ -96,16 +111,16 @@ class QuickstartTests(unittest.TestCase):
 
         # Step 1: review a committed change with no setup. It reports the edit and writes nothing.
         self.write("The dog sat on the mat.", "It was warm.")
-        before = tree(self.repo)
+        before = work_tree(self.repo)
         report = self.pilcrow("review", "--rev", "HEAD", DOCUMENT, code=1)
         self.assertIn(f"Review: HEAD:{DOCUMENT} → {DOCUMENT}", report)
         self.assertIn("-The cat sat on the mat.", report)
         self.assertIn("+The dog sat on the mat.", report)
-        self.assertEqual(tree(self.repo), before)
+        self.assertEqual(work_tree(self.repo), before)
         self.assertFalse((self.repo / ".pilcrow").exists())
         # The two-file form reports the same edit between the committed copy and the working copy.
         self.assertIn("+The dog sat on the mat.", self.pilcrow("review", str(old), DOCUMENT, code=1))
-        self.assertEqual(tree(self.repo), before)
+        self.assertEqual(work_tree(self.repo), before)
 
         # Step 2: export a baseline; check passes and names the document. Commit all three files.
         self.assertIn(f"EXPORTED {DOCUMENT}", self.pilcrow("export", DOCUMENT, "--root", ".", code=0))
