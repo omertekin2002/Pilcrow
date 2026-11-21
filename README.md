@@ -53,6 +53,68 @@ Pilcrow uses Python's ZIP reader and `defusedxml` for XML parsing. There is no W
 process, cloud service, AI connection, watcher, or background service. Extraction
 never writes to the DOCX.
 
+## Quickstart
+
+From a Word file already in Git to a readable review, then to a freshness gate.
+Run these in your document repository; `report.docx` stands for your file.
+
+**1. Review a committed change, with no setup.** Compare the last commit with
+your working copy:
+
+```sh
+pilcrow review --rev HEAD "report.docx"
+```
+
+Without Git history, compare two files: `pilcrow review old.docx new.docx`.
+Review is read-only and writes nothing, not even `.pilcrow/` companions. It exits
+0 when no supported changes are found, 1 when it reports changes, and 2 on an
+error. `--rev` first ships in the release after v0.1.7. More:
+[Review a change in words](#review-a-change-in-words).
+
+**2. Export a baseline**, then check it:
+
+```sh
+pilcrow export "report.docx" --root .
+pilcrow check "report.docx" --root .
+```
+
+Confirm that `report.docx` is named in both outputs: a passing check that selected
+no documents proves nothing. Commit the DOCX and its two companions under
+`.pilcrow/` together. More: [Baseline, then review a change](#baseline-then-review-a-change).
+
+**3. Review the next edit.** Save your edit in Word, export again, and read the
+`.prose.md` diff in GitHub Desktop's **Changes** view or with Git (`--word-diff`
+marks the changed words in each line):
+
+```sh
+pilcrow export "report.docx" --root .
+git diff --word-diff -- ".pilcrow/report.docx.prose.md"
+```
+
+The Word and GitHub Desktop steps have not been tested; see
+[manual validation](docs/manual-validation.md).
+
+**4. Add a freshness gate.** A pre-commit hook or a GitHub Action runs
+`pilcrow check --all` and fails on missing or stale companions. In
+`.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/omertekin2002/Pilcrow
+    rev: v0.1.8
+    hooks:
+      - id: pilcrow-check
+```
+
+Or as a step in a GitHub Actions job, after `actions/checkout`:
+
+```yaml
+      - uses: omertekin2002/Pilcrow@v0.1.8
+```
+
+More, including the optional review report in the job summary:
+[Enforce freshness](#enforce-freshness).
+
 ## Baseline, then review a change
 
 In **your document repository**, choose an explicit scope. For example:
@@ -161,7 +223,11 @@ fails, run `pilcrow export` yourself and commit the DOCX and its companions
 together.
 
 Pin both to a Pilcrow release tag (see the repository's Releases). The hook and
-action first ship in the release after v0.1.2; the snippets below assume `v0.1.3`.
+action first ship in the release after v0.1.2. The snippets in this README assume
+`v0.1.8`, the release after v0.1.7, which adds `pilcrow review --rev` and the
+action's `summary` input. Pin the same release as your installed
+`pilcrow --version`: a newer release can record more in its companions, so
+companions exported by one release can be stale to another.
 
 `.pre-commit-config.yaml` in your document repository root (then run
 `pre-commit install` once):
@@ -169,7 +235,7 @@ action first ship in the release after v0.1.2; the snippets below assume `v0.1.3
 ```yaml
 repos:
   - repo: https://github.com/omertekin2002/Pilcrow
-    rev: v0.1.3
+    rev: v0.1.8
     hooks:
       - id: pilcrow-check
 ```
@@ -193,7 +259,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: omertekin2002/Pilcrow@v0.1.3
+      - uses: omertekin2002/Pilcrow@v0.1.8
         with:
           root: .              # optional, default "."
           python-version: "3.12"  # optional, default "3.12"
