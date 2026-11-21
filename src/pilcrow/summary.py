@@ -4,6 +4,10 @@ Internal to the Action (``action.yml``), not a ``pilcrow`` subcommand::
 
     python -m pilcrow.summary --base REV --root ROOT --mode outline|full --output FILE
 
+It compares from the merge base of the base revision and ``HEAD``, as GitHub's Files
+changed view does, so edits made on the base branch after ``HEAD`` forked from it are
+not reported as ``HEAD``'s own changes.
+
 Read-only: it lists changed documents and reads both sides with read-only Git
 plumbing, and writes no file except ``--output``. Problems with the base revision
 or a single document become an explanation in the summary and a ``::warning::``
@@ -80,6 +84,12 @@ def shallow(root: Path) -> bool:
         return False
 
 
+def merge_base(root: Path, base: str, head: str) -> str | None:
+    """The full commit ID of the best common ancestor of ``base`` and ``head``, or None if they share none."""
+    found = (git_output(root, "merge-base", base, head) or b"").decode("ascii").strip()
+    return found or None
+
+
 def changed(root: Path, base: str, head: str) -> list[tuple[str, str]]:
     """(status letter, path relative to the root) of each eligible DOCX that differs, sorted by path."""
     # --relative limits the listing to the root and prints paths relative to it; no rename
@@ -125,9 +135,11 @@ def block(document: Document, mode: str, base: str, head: str) -> str:
     return outline(document, mode == "full")
 
 
-def header(mode: str, root: str, base: str, head: str) -> list[str]:
+def header(mode: str, root: str, base: str, head: str, fork: str | None = None) -> list[str]:
+    """The title and the line naming both sides; ``fork`` is the merge base's ID when it is not ``base``."""
     where = f" in {code(root)}" if root != "." else ""
-    lines = [TITLE, f"Changed DOCX documents{where} from {code(base)} (base) to {code(head)} (head)."]
+    old = f"{code(base)} (base)" if fork is None else f"{code(fork)} (merge base of {code(base)} and {code('HEAD')})"
+    lines = [TITLE, f"Changed DOCX documents{where} from {old} to {code(head)} (head)."]
     if mode == "full":
         lines.append(FULL_NOTE)
     return lines
@@ -154,11 +166,24 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
             hint += "Fetch history that reaches the base, for example with {} on actions/checkout."
             return problem(f"the base revision {code(shown(base))} is not in this checkout. " + hint.format(code("fetch-depth: 0")),
                            f"the base revision {base} is not in this checkout. " + hint.format("fetch-depth: 0"))
-        listing = changed(root, old, head)
+        # Compare from where HEAD forked from the base, not from the base's tip: otherwise edits made on
+        # the base branch since then would show as HEAD's changes, reversed. Equal when base is an ancestor.
+        fork = merge_base(root, old, head)
+        if fork is None:
+            if shallow(root):
+                hint = ("The checkout is shallow, so it may not reach their common ancestor. "
+                        "Fetch more history, for example with {} on actions/checkout.")
+            else:
+                hint = "The base and HEAD have unrelated histories."
+            return problem(f"the base revision {code(shown(base))} and {code('HEAD')} have no common ancestor in this "
+                           "checkout. " + hint.format(code("fetch-depth: 0")),
+                           f"the base revision {base} and HEAD have no common ancestor in this checkout. "
+                           + hint.format("fetch-depth: 0"))
+        listing = changed(root, fork, head)
     except ValueError as exc:  # Git missing, not a repository, or a failed diff
         return problem(f"Git could not list the changes: {escape(str(exc))}", f"Git could not list the changes: {exc}")
-    short_base, short_head = old[:SHORT], head[:SHORT]
-    lines = header(mode, label, short_base, short_head)
+    short_base, short_head = fork[:SHORT], head[:SHORT]
+    lines = header(mode, label, old[:SHORT], short_head, None if fork == old else short_base)
     if not listing:
         return "\n\n".join([*lines, "No DOCX documents changed."]) + "\n"
     blocks: list[str] = []
@@ -171,7 +196,7 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
             elif status == "D":
                 document = Document(path, "removed")
             else:
-                document = compare(root, path, old, head)
+                document = compare(root, path, fork, head)
                 if document.error is not None:
                     annotate(f"Pilcrow could not read {shown(path)}: {document.error}")
             text = block(document, mode, short_base, short_head)
