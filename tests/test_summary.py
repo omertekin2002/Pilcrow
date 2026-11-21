@@ -92,8 +92,11 @@ class SummaryTests(unittest.TestCase):
         patcher = patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(base)})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # state() lists .git too, so stop the background maintenance and auto-gc that `git commit` can start
+        # from creating or deleting files there while it is read (see work_tree() in tests/test_quickstart.py).
         for args in (("init", "-q"), ("config", "user.name", "Pilcrow Test"),
-                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false")):
+                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false"),
+                     ("config", "maintenance.auto", "false"), ("config", "gc.auto", "0")):
             self.git(*args)
 
     def git(self, *args: str, cwd: Path | None = None) -> str:

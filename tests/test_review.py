@@ -637,8 +637,11 @@ class RevisionReviewTests(unittest.TestCase):
         self.env = {**os.environ, "TMPDIR": str(self.tmp), "TEMP": str(self.tmp), "TMP": str(self.tmp),
                     "GIT_CEILING_DIRECTORIES": str(base)}
         self.env["PYTHONPATH"] = os.pathsep.join((str(PROJECT / "src"), self.env.get("PYTHONPATH", "")))
+        # state() lists .git too, so stop the background maintenance and auto-gc that `git commit` can start
+        # from creating or deleting files there while it is read (see work_tree() in tests/test_quickstart.py).
         for args in (("init", "-q"), ("config", "user.name", "Pilcrow Test"),
-                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false")):
+                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false"),
+                     ("config", "maintenance.auto", "false"), ("config", "gc.auto", "0")):
             self.git(*args)
 
     def git(self, *args: str) -> str:
