@@ -6,6 +6,8 @@ Run with ``python -m unittest discover -s tests -v`` from the project root.
 from __future__ import annotations
 
 import os
+import random
+import re
 import shutil
 import subprocess
 import sys
@@ -64,6 +66,49 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
     from test_textconv import tree  # type: ignore[no-redef]
 
 CAVEAT = "No supported prose or review changes detected (not a complete document comparison)."
+MARKERS = {"- ", "~ ", "+ "}
+
+
+def assert_same_report(test: unittest.TestCase, text: str, markdown: str) -> None:
+    """Check that a Markdown report says what the text report says, block for block.
+
+    The header becomes a heading, the prose diff sits unchanged in a fenced diff block,
+    and each metadata section is a subheading with one bullet per text line, its
+    -/~/+ marker in a code span.
+    """
+    blocks = text.rstrip("\n").split("\n\n")
+    header = blocks.pop(0)
+    old, new = header.removeprefix("Review: ").split(" → ")
+    md = markdown.rstrip("\n").split("\n\n")
+    test.assertEqual(md.pop(0), f"## Review: `{old}` → `{new}`")
+    prose = blocks.pop(0)
+    if prose == "Prose: no changes":
+        test.assertEqual(md.pop(0), prose)
+    else:
+        # Unified diff lines are never empty (a blank context line is " "), so the
+        # diff and its fence are one block, like the text's "Prose:" block.
+        test.assertEqual(md.pop(0), "### Prose")
+        fenced = md.pop(0).split("\n")
+        fence = fenced[-1]
+        test.assertEqual(set(fence), {"`"})
+        test.assertGreaterEqual(len(fence), 3)
+        test.assertGreater(len(fence), max((len(run) for run in re.findall("`+", prose)), default=0))
+        test.assertEqual(fenced, [f"{fence}diff", *prose.split("\n")[1:], fence])
+    test.assertEqual(md.pop(), blocks.pop())  # the closing caveat has nothing to escape
+    for block in blocks:
+        first, *lines = block.split("\n")
+        if lines:
+            title = first.removesuffix(":")
+        else:  # a one-line section such as "Metadata: key changed"
+            title, inline = first.split(": ", 1)
+            lines = [inline]
+        test.assertEqual(md.pop(0), f"### {title}")
+        bullets = md.pop(0).split("\n")
+        test.assertEqual(len(bullets), len(lines), block)
+        for line, item in zip(lines, bullets, strict=True):
+            prefix = f"- `{line[0]}` " if line[:2] in MARKERS else "- "
+            test.assertTrue(item.startswith(prefix), item)
+    test.assertEqual(md, [])
 
 
 class ReviewTests(unittest.TestCase):
@@ -85,11 +130,18 @@ class ReviewTests(unittest.TestCase):
         return result
 
     def review(self, code: int = 1) -> str:
-        """Review old.docx -> new.docx by relative name and return the report."""
+        """Review old.docx -> new.docx by relative name and return the report.
+
+        Every review is also printed as Markdown, which must reach the same verdict
+        and say the same things (see ``assert_same_report``).
+        """
         result = self.pilcrow("review", "old.docx", "new.docx", code=code)
         self.assertEqual(result.stderr, b"")
         report = result.stdout.decode("utf-8")
         self.assertTrue(report.startswith("Review: old.docx → new.docx\n\n"), report)
+        markdown = self.pilcrow("review", "--format", "markdown", "old.docx", "new.docx", code=code)
+        self.assertEqual(markdown.stderr, b"")
+        assert_same_report(self, report, markdown.stdout.decode("utf-8"))
         return report
 
     def section(self, report: str, title: str) -> list[str]:
@@ -340,6 +392,170 @@ class ReviewTests(unittest.TestCase):
         make_docx(self.new, field * 3999 + paragraph("Old ending."))
         self.assertEqual(self.section(self.review(), "Fields"), ["- removed field 4000 (PAGE) in word/document.xml"])
 
+    # Markdown
+
+    def markdown(self, old: str = "old.docx", new: str = "new.docx", code: int = 1) -> str:
+        result = self.pilcrow("review", "--format", "markdown", old, new, code=code)
+        self.assertEqual(result.stderr, b"")
+        return result.stdout.decode("utf-8")
+
+    def test_text_is_the_default_format_and_unchanged(self) -> None:
+        make_docx(self.old, paragraph("Opening sentence. The cat sat on the mat."))
+        make_docx(self.new, paragraph("Opening sentence. The dog sat on the mat."))
+        changed = ("Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+                   " Opening sentence.\n-The cat sat on the mat.\n+The dog sat on the mat.\n\n"
+                   "Coverage warnings (either side):\n"
+                   "  Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+                   "Only the prose and review metadata Pilcrow extracts are compared"
+                   " (not a complete document comparison).\n")
+        unchanged = f"Review: old.docx → old.docx\n\nProse: no changes\n\n{CAVEAT}\n"
+        for new, code, expected in (("new.docx", 1, changed), ("old.docx", 0, unchanged)):
+            default = self.pilcrow("review", "old.docx", new, code=code).stdout
+            self.assertEqual(default, expected.encode("utf-8"))
+            self.assertEqual(self.pilcrow("review", "--format", "text", "old.docx", new, code=code).stdout, default)
+            self.assertEqual(self.pilcrow("review", "old.docx", new, "--format=text", code=code).stdout, default)
+
+    def test_markdown_report_shape(self) -> None:
+        make_docx(self.old, paragraph("Opening sentence. The cat sat on the mat."))
+        make_docx(self.new, paragraph("Opening sentence. The dog sat on the mat."))
+        self.assertEqual(self.markdown(), (
+            "## Review: `old.docx` → `new.docx`\n\n### Prose\n\n```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            " Opening sentence.\n-The cat sat on the mat.\n+The dog sat on the mat.\n```\n\n"
+            "### Coverage warnings (either side)\n\n"
+            "- Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+            "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n"))
+        self.assertEqual(self.markdown("old.docx", "old.docx", code=0),
+                         f"## Review: `old.docx` → `old.docx`\n\nProse: no changes\n\n{CAVEAT}\n")
+
+    def test_an_invalid_format_is_a_usage_error(self) -> None:
+        make_docx(self.old, paragraph("Prose."))
+        result = self.pilcrow("review", "--format", "html", "old.docx", "old.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        for word in (b"--format", b"html", b"text", b"markdown", b"usage:"):
+            self.assertIn(word, result.stderr)
+
+    def test_the_diff_fence_is_longer_than_any_backtick_run_in_the_prose(self) -> None:
+        make_docx(self.old, paragraph("Code: ``` here.") + paragraph("Before."))
+        make_docx(self.new, paragraph("Code: ```` here.") + paragraph("```") + paragraph("````"))
+        text = self.review()  # also checks the fenced block holds exactly the text diff
+        report = self.markdown()
+        lines = report.split("\n")
+        opening = lines.index("`````diff")
+        closing = lines.index("`````", opening)
+        self.assertEqual(lines[opening + 1:closing], self.section(text, "Prose"))
+        self.assertIn("+````", lines[opening + 1:closing])
+        # Nothing inside could close a fence of five backticks.
+        self.assertFalse(any(set(line.strip()) == {"`"} and len(line.strip()) >= 5 for line in lines[opening + 1:closing]))
+
+    def test_hostile_document_text_is_escaped_outside_the_diff(self) -> None:
+        hostile = "# heading *emphasis* [link](x) ![img](x) <script> &amp; | `tick"
+        link = f'<w:p><w:hyperlink r:id="link">{run(hostile)}</w:hyperlink></w:p>'
+        make_docx(self.old, paragraph("Body."))
+        make_docx(self.new, f"<w:p>{start('1')}{run('Body.')}{end('1')}</w:p>{link}"
+                  '<w:p><w:ins w:id="7" w:author="Mallory &lt;b&gt;|*x*"><w:r><w:t>Inserted.</w:t></w:r></w:ins></w:p>',
+                  extra={"word/comments.xml": comments_part({"1": hostile})},
+                  relationships=COMMENTS_REL + f'<Relationship Id="link" Type="{R}/hyperlink" '
+                                               'Target="https://example.invalid/a_b*c" TargetMode="External"/>')
+        self.review()
+        report = self.markdown()
+        fence = report.index("```diff\n")
+        outside = report[:fence] + report[report.index("\n```\n", fence) + 5:]
+        escaped = r'"\# heading \*emphasis\* \[link\](x) \!\[img\](x) &lt;script&gt; &amp;amp; \| \`tick"'
+        for title, marker in (("Comments", "comment by Ada"), ("Hyperlinks", "link")):
+            section = outside.split(f"### {title}\n\n", 1)[1].split("\n\n", 1)[0]
+            self.assertTrue(section.startswith(f"- `+` added {marker}"), section)
+            self.assertIn(escaped, section)
+        self.assertIn(r"→ https\://example.invalid/a\_b\*c", outside)
+        self.assertIn(r"by Mallory &lt;b&gt;\|\*x\*\: ", outside)
+        # Nothing from the document survives unescaped outside the fence.
+        for raw in ("<script>", "[link](x)", "*emphasis*", "| `", "&amp; ", "<b>"):
+            self.assertNotIn(raw, outside)
+        self.assertEqual([line for line in outside.split("\n") if line.startswith("#")],
+                         ["## Review: `old.docx` → `new.docx`", "### Prose", "### Comments", "### Tracked changes",
+                          "### Hyperlinks", "### Warnings", "### Coverage warnings (either side)"])
+        # The prose diff itself is verbatim.
+        self.assertIn(f"+{hostile}\n", report[fence:])
+
+    def test_markdown_header_labels_are_code_spans(self) -> None:
+        make_docx(self.old, paragraph("Same."))
+        shutil.copy(self.old, self.root / "a `b` #.docx")
+        report = self.markdown("a `b` #.docx", "old.docx", code=0)
+        self.assertTrue(report.startswith("## Review: ``a `b` #.docx`` → `old.docx`\n\n"), report)
+
+    # Word marks (--word-diff)
+
+    def test_word_diff_marks_the_changed_words_of_a_sentence(self) -> None:
+        make_docx(self.old, paragraph("The supplier shall deliver the goods within 30 days. Payment is due on receipt."))
+        make_docx(self.new, paragraph("The supplier may deliver the goods within 60 days. Payment is due on receipt."))
+        tail = ("Coverage warnings (either side):\n"
+                "  Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+                "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n")
+        result = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout.decode("utf-8"), (
+            "Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.\n"
+            " Payment is due on receipt.\n\n" + tail))
+        # Without the flag, the same documents give the whole-line diff, as before.
+        plain = self.pilcrow("review", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertEqual(plain, (
+            "Review: old.docx → new.docx\n\nProse:\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "-The supplier shall deliver the goods within 30 days.\n"
+            "+The supplier may deliver the goods within 60 days.\n"
+            " Payment is due on receipt.\n\n" + tail))
+        markdown = self.pilcrow("review", "--format", "markdown", "--word-diff", "old.docx", "new.docx", code=1)
+        self.assertEqual(markdown.stderr, b"")
+        self.assertEqual(markdown.stdout.decode("utf-8"), (
+            "## Review: `old.docx` → `new.docx`\n\n### Prose\n\n```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n"
+            "~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.\n"
+            " Payment is due on receipt.\n```\n\n"
+            "### Coverage warnings (either side)\n\n"
+            "- Formatting and page layout are not compared; unchanged prose is not an identical document.\n\n"
+            "Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).\n"))
+        assert_same_report(self, result.stdout.decode("utf-8"), markdown.stdout.decode("utf-8"))
+        # The flag changes no exit code: 0 for no changes, 2 for an input error.
+        for args in (("--word-diff", "old.docx", "old.docx"), ("--format", "markdown", "--word-diff", "old.docx", "old.docx")):
+            unchanged = self.pilcrow("review", *args, code=0).stdout
+            self.assertEqual(unchanged, self.pilcrow("review", *(a for a in args if a != "--word-diff"), code=0).stdout)
+        result = self.pilcrow("review", "--word-diff", "old.docx", "absent.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+
+    def test_word_diff_falls_back_to_whole_lines(self) -> None:
+        long = " ".join(f"word{n}" for n in range(200))
+        cases = {
+            "unequal line counts": ("Opening. The cat sat on the mat.", "Opening. The cat sat. It liked the mat."),
+            "a dissimilar pair": ("Opening. The cat sat on the mat.", "Opening. Rain fell hard all night."),
+            "one dissimilar pair in the block": ("Opening. The cat sat. The mat was red.",
+                                                 "Opening. The dog sat. Rain fell hard all night."),
+            "a line over the token cap": (f"Opening. {long} old.", f"Opening. {long} new."),
+            "a mark sequence": ("Opening. Write [-x-] here.", "Opening. Write [-y-] here."),
+        }
+        for name, (old, new) in cases.items():
+            with self.subTest(name):
+                make_docx(self.old, paragraph(old))
+                make_docx(self.new, paragraph(new))
+                for form in ("text", "markdown"):
+                    plain = self.pilcrow("review", "--format", form, "old.docx", "new.docx", code=1).stdout
+                    marked = self.pilcrow("review", "--format", form, "--word-diff", "old.docx", "new.docx", code=1).stdout
+                    self.assertEqual(marked, plain)
+                    self.assertNotIn(b"\n~ ", marked)
+
+    def test_word_diff_still_caps_a_very_large_change(self) -> None:
+        make_docx(self.old, "".join(paragraph(f"Old sentence {n}.") for n in range(1500)))
+        make_docx(self.new, "".join(paragraph(f"New sentence {n}.") for n in range(1500)))
+        result = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1)
+        prose = self.section(result.stdout.decode("utf-8"), "Prose")
+        # Every sentence pairs, and the blank lines between paragraphs are unchanged
+        # pairs shown as context: 3002 diff lines in all, 2000 shown.
+        self.assertEqual(len(prose), 2001)
+        self.assertEqual(prose[3:6], ["~ [-Old-]{+New+} sentence 0.", " ", "~ [-Old-]{+New+} sentence 1."])
+        self.assertEqual(prose[-1], "… 1002 more diff lines omitted")
+
+    def test_help_describes_word_diff(self) -> None:
+        help_text = b" ".join(self.pilcrow("review", "--help").stdout.split())
+        for words in (b"[--word-diff] OLD NEW", b"[--word-diff] --rev REV", b"[-...-]", b"{+...+}", b"whole"):
+            self.assertIn(words, help_text)
+
     # Inputs, errors and side effects
 
     def test_missing_or_malformed_input_exits_2_with_no_report(self) -> None:
@@ -402,5 +618,486 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((repo / ".pilcrow").exists())
 
 
+class RevisionReviewTests(unittest.TestCase):
+    """`pilcrow review --rev`: the old side, or both, read from Git with read-only plumbing."""
+
+    def setUp(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-review-rev-")
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        self.outside = base / "outside"  # not in any repository: GIT_CEILING_DIRECTORIES stops the search
+        self.outside.mkdir()
+        # An empty temporary directory for every process, to show nothing is written there.
+        self.tmp = base / "tmp"
+        self.tmp.mkdir()
+        self.env = {**os.environ, "TMPDIR": str(self.tmp), "TEMP": str(self.tmp), "TMP": str(self.tmp),
+                    "GIT_CEILING_DIRECTORIES": str(base)}
+        self.env["PYTHONPATH"] = os.pathsep.join((str(PROJECT / "src"), self.env.get("PYTHONPATH", "")))
+        # state() lists .git too, so stop the background maintenance and auto-gc that `git commit` can start
+        # from creating or deleting files there while it is read (see work_tree() in tests/test_quickstart.py).
+        for args in (("init", "-q"), ("config", "user.name", "Pilcrow Test"),
+                     ("config", "user.email", "pilcrow@example.invalid"), ("config", "commit.gpgsign", "false"),
+                     ("config", "maintenance.auto", "false"), ("config", "gc.auto", "0")):
+            self.git(*args)
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=self.repo, env=self.env, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.decode("utf-8")
+
+    def commit(self, message: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def pilcrow(self, *args: str | Path, code: int, cwd: Path | None = None,
+                limit: int | None = None) -> subprocess.CompletedProcess[bytes]:
+        command = [sys.executable, "-m", "pilcrow"]
+        if limit is not None:  # lower the package size limit in the child process
+            command = [sys.executable, "-c", "import sys; import pilcrow.cli as cli; "
+                       f"cli.MAX_PACKAGE_BYTES = {limit}; sys.exit(cli.main(sys.argv[1:]))"]
+        result = subprocess.run([*command, *(str(arg) for arg in args)], cwd=cwd or self.repo, env=self.env,
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, code, f"args={args!r}\nstdout={result.stdout!r}\nstderr={result.stderr!r}")
+        return result
+
+    def state(self) -> tuple[object, ...]:
+        """The work tree, the index and the temporary directory, read without refreshing the index."""
+        index = self.repo / ".git" / "index"
+        status = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain"], cwd=self.repo,
+                                env=self.env, capture_output=True, timeout=60).stdout
+        return tree(self.repo), index.stat().st_mtime_ns, status, tree(self.tmp)
+
+    def threaded(self, path: Path, text: str, done: str) -> None:
+        comments, ids = {"1": "Please check."}, {"1": "11111111"}
+        body = paragraph(text) + f"<w:p>{start('1')}{run('A commented passage.')}{end('1')}</w:p>"
+        make_docx(path, body,
+                  extra={"word/comments.xml": comments_part(comments, ids),
+                         "word/commentsExtended.xml": comments_extended(("11111111", None, done))},
+                  relationships=COMMENTS_REL + COMMENTS_EXT_REL)
+
+    def test_an_unchanged_work_tree_reports_no_changes(self) -> None:
+        make_docx(self.repo / "report.docx", paragraph("A sentence."))
+        self.commit("first")
+        before = self.state()
+        result = self.pilcrow("review", "--rev", "HEAD", "report.docx", code=0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout.decode("utf-8"),
+                         f"Review: HEAD:report.docx → report.docx\n\nProse: no changes\n\n{CAVEAT}\n")
+        self.assertEqual(self.state(), before)
+
+    def test_work_tree_edits_match_a_review_of_two_files(self) -> None:
+        document = self.repo / "report.docx"
+        self.threaded(document, "The cat sat. It was warm.", "0")
+        self.commit("first")
+        committed = Path(self.temp.name) / "old.docx"
+        shutil.copy(document, committed)
+        self.threaded(document, "The dog sat. It was warm.", "1")  # edit the prose and resolve the comment
+        before = self.state()
+        result = self.pilcrow("review", "--rev", "HEAD", "report.docx", code=1)
+        self.assertEqual(self.state(), before)
+        header, body = result.stdout.split(b"\n", 1)
+        self.assertEqual(header.decode("utf-8"), "Review: HEAD:report.docx → report.docx")
+        files = self.pilcrow("review", committed, "report.docx", code=1)
+        self.assertEqual(body, files.stdout.split(b"\n", 1)[1])
+        self.assertIn(b"-The cat sat.", body)
+        self.assertIn(b"~ resolved comment by Ada", body)
+
+    def test_two_revisions_ignore_the_work_tree(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(document, paragraph("The dog sat."))
+        self.commit("second")
+        make_docx(document, paragraph("An uncommitted edit."))
+        before = self.state()
+        report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", "report.docx", code=1).stdout.decode("utf-8")
+        self.assertTrue(report.startswith("Review: HEAD~1:report.docx → HEAD:report.docx\n\n"), report)
+        self.assertIn("-The cat sat.", report)
+        self.assertIn("+The dog sat.", report)
+        self.assertNotIn("uncommitted", report)
+        self.assertEqual(self.state(), before)
+        # The work-tree file is not read at all, so it need not exist.
+        document.unlink()
+        self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "report.docx", code=0)
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "feature", "HEAD~1")
+        report = self.pilcrow("review", "--rev", branch, "--rev", "feature", "report.docx", code=1).stdout.decode("utf-8")
+        self.assertTrue(report.startswith(f"Review: {branch}:report.docx → feature:report.docx\n\n"), report)
+        self.assertIn("-The dog sat.", report)
+
+    def test_markdown_with_revisions(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(document, paragraph("The dog sat."))
+        self.commit("second")
+        before = self.state()
+        for args, header in ((("--rev", "HEAD~1", "--rev", "HEAD"), "`HEAD~1:report.docx` → `HEAD:report.docx`"),
+                             (("--rev", "HEAD~1"), "`HEAD~1:report.docx` → `report.docx`")):
+            text = self.pilcrow("review", *args, "report.docx", code=1)
+            result = self.pilcrow("review", "--format", "markdown", *args, "report.docx", code=1)
+            self.assertEqual(result.stderr, b"")
+            assert_same_report(self, text.stdout.decode("utf-8"), result.stdout.decode("utf-8"))
+            self.assertTrue(result.stdout.decode("utf-8").startswith(f"## Review: {header}\n\n"), result.stdout)
+        self.assertEqual(self.pilcrow("review", "--format", "markdown", "--rev", "HEAD", "report.docx", code=0).stdout,
+                         f"## Review: `HEAD:report.docx` → `report.docx`\n\nProse: no changes\n\n{CAVEAT}\n".encode())
+        # Errors print nothing on stdout, whatever the format.
+        result = self.pilcrow("review", "--format", "markdown", "--rev", "no-such-rev", "report.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.state(), before)
+
+    def test_word_diff_with_revisions(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("The supplier shall deliver the goods. Payment is due on receipt."))
+        self.commit("first")
+        make_docx(document, paragraph("The supplier may deliver the goods. Payment is due on receipt."))
+        self.commit("second")
+        make_docx(document, paragraph("The supplier may deliver all the goods. Payment is due on receipt."))
+        before = self.state()
+        marked = {
+            ("--rev", "HEAD"): "~ The supplier may deliver {+all +}the goods.",
+            ("--rev", "HEAD~1"): "~ The supplier [-shall-]{+may+} deliver {+all +}the goods.",
+            ("--rev", "HEAD~1", "--rev", "HEAD"): "~ The supplier [-shall-]{+may+} deliver the goods.",
+        }
+        for args, line in marked.items():
+            with self.subTest(args=args):
+                text = self.pilcrow("review", "--word-diff", *args, "report.docx", code=1).stdout.decode("utf-8")
+                self.assertIn(f"\n@@ -1,2 +1,2 @@\n{line}\n Payment is due on receipt.\n\n", text)
+                result = self.pilcrow("review", "--format", "markdown", "--word-diff", *args, "report.docx", code=1)
+                self.assertEqual(result.stderr, b"")
+                assert_same_report(self, text, result.stdout.decode("utf-8"))
+                self.assertIn(f"```diff\n--- OLD\n+++ NEW\n@@ -1,2 +1,2 @@\n{line}\n", result.stdout.decode("utf-8"))
+        self.pilcrow("review", "--word-diff", "--rev", "HEAD~1", "--rev", "HEAD~1", "report.docx", code=0)
+        self.assertEqual(self.pilcrow("review", "--word-diff", "--rev", "no-such-rev", "report.docx", code=2).stdout, b"")
+        self.assertEqual(self.state(), before)
+
+    def test_two_revisions_need_no_folder_in_the_work_tree(self) -> None:
+        # A later commit or a sparse checkout may have removed the document's folders.
+        nested = Path("old notes") / "drafts" / "report.docx"
+        make_docx(self.repo / nested, paragraph("The cat sat."))
+        self.commit("first")
+        make_docx(self.repo / nested, paragraph("The dog sat."))
+        self.commit("second")
+        shutil.rmtree(self.repo / "old notes")
+        for path in (nested, self.repo / nested):
+            with self.subTest(path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertTrue(report.startswith(f"Review: HEAD~1:{path} → HEAD:{path}\n\n"), report)
+                self.assertIn("-The cat sat.", report)
+                self.assertIn("+The dog sat.", report)
+        result = self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", Path("old notes") / "gone.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(f"error: HEAD:{Path('old notes') / 'gone.docx'}: no such file at HEAD".encode(), result.stderr)
+
+    def test_a_folder_now_symlinked_elsewhere_keeps_its_own_history(self) -> None:
+        for relative in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx"):
+            make_docx(self.repo / relative, paragraph("The committed docs version."))
+            make_docx(self.repo / "other" / relative.relative_to("docs"), paragraph("The other folder's version."))
+        self.commit("first")
+        shutil.rmtree(self.repo / "docs")
+        try:
+            (self.repo / "docs").symlink_to("other", target_is_directory=True)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                # Old: docs/... as committed. New: the working copy, read through the symlink.
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The other folder's version.", report)
+
+    def link(self, link: Path, target: Path | str) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+
+    def test_a_folder_now_symlinked_to_the_top_keeps_its_own_history(self) -> None:
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / relative, paragraph("The root file's version."))
+            make_docx(self.repo / "docs" / relative, paragraph("The committed docs version."))
+        self.commit("first")
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / "docs" / relative, paragraph("The second docs version."))
+        self.commit("second")
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", ".")
+        before = self.state()
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "report.docx", self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                # Old: docs/... as committed, not the root file the link now leads to. New: the working copy.
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The second docs version.", report)
+                self.assertIn("+The root file's version.", report)
+                # Both sides from Git read docs/..., not the root file.
+                self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", path, code=0)
+                report = self.pilcrow("review", "--rev", "HEAD~1", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The second docs version.", report)
+                self.assertNotIn("root file", report)
+        self.assertEqual(self.state(), before)
+
+    def test_a_folder_now_symlinked_outside_any_repository_keeps_its_own_history(self) -> None:
+        for relative in (Path("report.docx"), Path("sub") / "report.docx"):
+            make_docx(self.repo / "docs" / relative, paragraph("The committed docs version."))
+            make_docx(self.outside / "docs" / relative, paragraph("The outside folder's version."))
+        self.commit("first")
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", self.outside / "docs")
+        before = self.state()
+        for path in (Path("docs") / "report.docx", Path("docs") / "sub" / "report.docx",
+                     self.repo / "docs" / "report.docx", self.repo / "docs" / "sub" / "report.docx"):
+            with self.subTest(path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD", path, code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The outside folder's version.", report)
+                self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", path, code=0)
+        self.assertEqual(self.state(), before)
+
+    def test_symlinks_above_the_repository_are_followed(self) -> None:
+        base = Path(self.temp.name)
+        make_docx(self.repo / "report.docx", paragraph("The cat sat."))
+        make_docx(self.repo / "docs" / "report.docx", paragraph("The committed docs version."))
+        self.commit("first")
+        make_docx(self.repo / "report.docx", paragraph("The dog sat."))
+        shutil.rmtree(self.repo / "docs")
+        self.link(self.repo / "docs", ".")
+        self.link(base / "alias", base)
+        # A checkout reached through a link from inside another repository, such as a home folder kept in Git.
+        home = base / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-q", str(home)], env=self.env, capture_output=True, timeout=60, check=True)
+        self.link(home / "code", base)
+        before = self.state()
+        for top in (base / "alias" / "repo", home / "code" / "repo"):
+            with self.subTest(top=str(top)):
+                report = self.pilcrow("review", "--rev", "HEAD", top / "report.docx", cwd=self.outside,
+                                      code=1).stdout.decode("utf-8")
+                self.assertIn("-The cat sat.", report)
+                self.assertIn("+The dog sat.", report)
+                # A link inside the repository is still not followed when its top is reached through one.
+                report = self.pilcrow("review", "--rev", "HEAD", top / "docs" / "report.docx", cwd=self.outside,
+                                      code=1).stdout.decode("utf-8")
+                self.assertIn("-The committed docs version.", report)
+                self.assertIn("+The dog sat.", report)
+        self.assertEqual(self.state(), before)
+
+    def test_subdirectories_spaces_and_unicode(self) -> None:
+        folder = self.repo / "drafts and notes" / "İstanbul"
+        document = folder / "résumé final.docx"
+        make_docx(document, paragraph("Old wording."))
+        make_docx(self.repo / "résumé final.docx", paragraph("A different file at the top."))
+        self.commit("first")
+        make_docx(document, paragraph("New wording."))
+        relative = Path("drafts and notes") / "İstanbul" / "résumé final.docx"
+        for cwd, path in ((self.repo, relative), (folder, Path("résumé final.docx")),
+                          (folder.parent, Path("İstanbul") / "résumé final.docx"),
+                          (self.outside, document)):
+            with self.subTest(cwd=cwd.name, path=str(path)):
+                report = self.pilcrow("review", "--rev", "HEAD", path, cwd=cwd, code=1).stdout.decode("utf-8")
+                self.assertTrue(report.startswith(f"Review: HEAD:{path} → {path}\n\n"), report)
+                self.assertIn("-Old wording.", report)
+                self.assertIn("+New wording.", report)
+        # From a subdirectory, a bare name means the file there, not the one at the top of the repository.
+        self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "résumé final.docx", cwd=folder, code=0)
+        report = self.pilcrow("review", "--rev", "HEAD", "résumé final.docx", cwd=folder, code=1).stdout
+        self.assertNotIn(b"A different file", report)
+
+    def test_errors_name_the_input_print_no_report_and_write_nothing(self) -> None:
+        document = self.repo / "report.docx"
+        make_docx(document, paragraph("First."))
+        self.commit("first")
+        make_docx(self.repo / "added.docx", paragraph("Added later."))
+        (self.repo / "folder.docx").mkdir()
+        make_docx(self.repo / "folder.docx" / "inner.docx", paragraph("Inside."))
+        self.commit("second")
+        shutil.copy(document, self.outside / "report.docx")
+        size = int(self.git("cat-file", "-s", "HEAD:report.docx"))
+        before = self.state()
+        cases: list[tuple[tuple[str, ...], Path, int | None, bytes]] = [
+            (("--rev", "HEAD", "report.docx"), self.outside, None, b"error: HEAD:report.docx: not a git repository"),
+            (("--rev", "no-such-revision", "report.docx"), self.repo, None,
+             b"error: no-such-revision:report.docx: unknown revision"),
+            (("--rev", "HEAD~1", "added.docx"), self.repo, None, b"error: HEAD~1:added.docx: no such file at HEAD~1"),
+            (("--rev", "HEAD", "folder.docx"), self.repo, None, b"error: HEAD:folder.docx: not a file at HEAD"),
+            (("--rev", "HEAD", "--rev", "HEAD", "."), self.repo, None, b"error: HEAD:.: expected the path of a file"),
+            (("--rev", "HEAD", "--rev", "HEAD", self.repo.anchor), self.repo, None,
+             f"error: HEAD:{self.repo.anchor}: expected the path of a file".encode()),
+            (("--rev", "HEAD", "."), self.repo, None, b"error: HEAD:.: expected the path of a file"),
+            (("--rev=-c", "report.docx"), self.repo, None, b'error: -c:report.docx: a revision must not start with "-"'),
+            (("--rev=--output=x", "report.docx"), self.repo, None, b"error: --output=x:report.docx: a revision must"),
+            (("--rev", "HEAD", "report.docx"), self.repo, size - 1,
+             f"error: HEAD:report.docx: file is {size} bytes at HEAD; the safety limit is {size - 1} bytes".encode()),
+            (("--rev", "HEAD", "report.docx", "report.docx"), self.repo, None, b"--rev takes one PATH, not 2"),
+            (("--rev", "HEAD", "--rev", "HEAD", "--rev", "HEAD", "report.docx"), self.repo, None,
+             b"give --rev at most twice"),
+        ]
+        for args, cwd, limit, message in cases:
+            with self.subTest(args=args, limit=limit):
+                result = self.pilcrow("review", *args, cwd=cwd, limit=limit, code=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(message, result.stderr)
+                self.assertNotIn(b"Traceback", result.stderr)
+                self.assertEqual(self.state(), before)
+        self.assertFalse((self.repo / "x").exists())
+        # A malformed committed DOCX is an error too, with the same label.
+        (self.repo / "broken.docx").write_bytes(b"not a zip")
+        self.commit("third")
+        result = self.pilcrow("review", "--rev", "HEAD", "--rev", "HEAD", "broken.docx", code=2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"error: HEAD:broken.docx: cannot read DOCX", result.stderr)
+        # The limit is on the committed blob's size: a blob exactly at the limit still reads.
+        self.pilcrow("review", "--rev", "HEAD", "report.docx", limit=size, code=0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarkdownEscapingTests(unittest.TestCase):
+    """The helpers that keep document text literal in a Markdown report."""
+
+    def test_escape_renders_literally_on_one_line(self) -> None:
+        from pilcrow.review import escape
+        self.assertEqual(escape("a\nb\r\nc\rd"), "a b c d")
+        self.assertEqual(escape("- item"), "\\- item")
+        self.assertEqual(escape("+ item"), "\\+ item")
+        self.assertEqual(escape("12. item"), "12\\. item")
+        self.assertEqual(escape("3) item"), "3\\) item")
+        self.assertEqual(escape("=== x"), "\\=== x")
+        self.assertEqual(escape("> quote"), "&gt; quote")
+        self.assertEqual(escape("<b>&copy;"), "&lt;b&gt;&amp;copy;")
+        self.assertEqual(escape("$x$ ~~s~~ _u_"), "\\$x\\$ \\~\\~s\\~\\~ \\_u\\_")
+        self.assertEqual(escape("see www.example.invalid or a@b.invalid"),
+                         "see www\\.example.invalid or a\\@b.invalid")
+        self.assertEqual(escape("back\\slash"), "back\\\\slash")
+        self.assertEqual(escape("plain words, 1.5 (ok)"), "plain words, 1.5 (ok)")
+
+    def test_code_spans_outrun_backticks_inside(self) -> None:
+        from pilcrow.review import code
+        self.assertEqual(code("plain.docx"), "`plain.docx`")
+        self.assertEqual(code("a`b"), "``a`b``")
+        self.assertEqual(code("`a``"), "``` `a`` ```")
+        self.assertEqual(code(" padded "), "`  padded  `")
+        self.assertEqual(code("two\nlines"), "`two lines`")
+
+
+def unmark(line: str, side: str) -> str:
+    """The old (``side`` "old") or new line a marked line was made from."""
+    if side == "old":
+        return re.sub(r"\[-(.*?)-\]", r"\1", re.sub(r"\{\+.*?\+\}", "", line, flags=re.S), flags=re.S)
+    return re.sub(r"\{\+(.*?)\+\}", r"\1", re.sub(r"\[-.*?-\]", "", line, flags=re.S), flags=re.S)
+
+
+class WordMarksTests(unittest.TestCase):
+    """The word marks of `pilcrow review --word-diff`, and when lines are not paired."""
+
+    def assert_round_trip(self, old: str, new: str) -> str:
+        from pilcrow.review import word_marks
+        marked = word_marks(old, new)
+        self.assertEqual(unmark(marked, "old"), old, marked)
+        self.assertEqual(unmark(marked, "new"), new, marked)
+        return marked
+
+    def test_marks(self) -> None:
+        cases = {
+            ("The supplier shall deliver the goods within 30 days.", "The supplier may deliver the goods within 60 days."):
+                "The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.",
+            # Changes separated only by whitespace are one mark.
+            ("The supplier shall deliver the goods.", "The supplier may send the goods."):
+                "The supplier [-shall deliver-]{+may send+} the goods.",
+            ("Pay 1,000.50 EUR, net.", "Pay 1,200.50 USD; net!"): "Pay 1,[-000-]{+200+}.50 [-EUR,-]{+USD;+} net[-.-]{+!+}",
+            ("the the cat sat", "the cat sat"): "the [-the -]cat sat",
+            # An added or removed word keeps its following space inside the mark, wherever it is.
+            ("deliver the goods", "deliver all the goods"): "deliver {+all +}the goods",
+            ("a b c d", "a c d"): "a [-b -]c d",
+            ("Die Größe ist groß.", "Die Größe ist klein."): "Die Größe ist [-groß-]{+klein+}.",
+            ("a  b", "a b"): "a[-  -]{+ +}b",
+            ("end", "end now"): "end{+ now+}",
+            ("", "added"): "{+added+}",
+        }
+        for (old, new), expected in cases.items():
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self.assert_round_trip(old, new), expected)
+
+    def test_round_trip(self) -> None:
+        pairs = [
+            ("He said: “No.” (See §3.)", "She said: “Yes!” (See §4.)"),
+            ("10 apples, 20 pears, 30 plums.", "10 apples, 25 pears, 30 plums and figs."),
+            ("very very very good", "very good very very"),
+            ("Ünïcödé café naïve 東京 test", "Unicode café naive 京都 test"),
+            ("tabs\tand  spaces ", " tabs and\tspaces"),
+            ("Brackets [ ] { } + - stay.", "Brackets [ ] { } - + stay."),
+            ("x-", "x--"), ("{x", "{{x"), ("[", "[["), ("-", "+"), ("", ""), ("a", ""),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.assert_round_trip(old, new)
+        pieces = ["the", "cat", "Größe", "42", "3.5", " ", "  ", "\t", ",", ".", "-", "+", "[", "]", "{", "}",
+                  "“", "é", "_", "x"]
+        rng = random.Random(43)
+        for _ in range(2000):
+            old = "".join(rng.choice(pieces) for _ in range(rng.randrange(12)))
+            new = list(old)
+            for _ in range(rng.randrange(4)):
+                at = rng.randrange(len(new) + 1)
+                new[at:at + rng.randrange(3)] = rng.choice(pieces)
+            new_line = "".join(new)
+            if any(mark in line for line in (old, new_line) for mark in ("[-", "-]", "{+", "+}")):
+                continue  # never paired, so never marked
+            self.assert_round_trip(old, new_line)
+
+    def test_pairing_rules(self) -> None:
+        from pilcrow.review import (
+            MAX_WORD_TOKENS,
+            MIN_WORD_SIMILARITY,
+            pairable,
+            paired,
+        )
+        self.assertEqual(MIN_WORD_SIMILARITY, 0.5)
+        self.assertTrue(pairable("The cat sat.", "The dog sat."))  # 3 of 4 words: 0.75
+        self.assertTrue(pairable("a b c d", "a b x y"))  # exactly 0.5
+        self.assertFalse(pairable("a b c d", "a x y z"))  # 0.25
+        words = " ".join(["w"] * MAX_WORD_TOKENS)
+        self.assertTrue(pairable(words, words))
+        self.assertFalse(pairable(words + " w", words + " v"))  # one line over the cap
+        self.assertFalse(pairable(words + " w", words))
+        for mark in ("[-", "-]", "{+", "+}"):
+            self.assertFalse(pairable(f"The {mark} cat.", "The dog."), mark)
+            self.assertFalse(pairable("The dog.", f"The {mark} cat."), mark)
+        self.assertEqual(paired(["The cat sat.", "", "It was warm."], ["The dog sat.", "", "It was hot."]),
+                         ["~ The [-cat-]{+dog+} sat.", " ", "~ It was [-warm-]{+hot+}."])
+        self.assertIsNone(paired(["The cat sat."], ["The dog sat.", "More."]))
+        self.assertIsNone(paired(["The cat sat.", "It was warm."], ["The dog sat.", "Rain fell all night."]))
+
+    def test_whole_line_fallback_is_the_plain_diff(self) -> None:
+        from pilcrow.review import prose_diff
+        long = " ".join(f"w{n}" for n in range(201))
+        for old, new in (("A.\nThe cat sat.\nB.", "A.\nThe cat sat.\nIt purred.\nB."),
+                         ("A.\nThe cat sat.\nB.", "A.\nRain fell all night.\nB."),
+                         (f"A.\n{long} x\nB.", f"A.\n{long} y\nB."),
+                         ("A.\nWrite {+x+}.\nB.", "A.\nWrite {+y+}.\nB."),
+                         ("A.\nGone.\nB.", "A.\nB.")):
+            with self.subTest(old=old[:40], new=new[:40]):
+                self.assertEqual(prose_diff(old, new, marks=True), prose_diff(old, new))
+        self.assertEqual(prose_diff("same", "same", marks=True), [])
+
+    def test_hunks_match_unified_diff(self) -> None:
+        """With pairing switched off, the word diff is exactly difflib's unified diff, hunk headers included."""
+        from unittest.mock import patch
+
+        from pilcrow import review
+        rng = random.Random(7)
+        vocabulary = ["", "A.", "B.", "C.", "D.", "E.", "F."]
+        with patch.object(review, "paired", return_value=None):
+            for _ in range(500):
+                old = "\n".join(rng.choice(vocabulary) for _ in range(rng.randrange(30)))
+                new = "\n".join(rng.choice(vocabulary) for _ in range(rng.randrange(30)))
+                with self.subTest(old=old, new=new):
+                    self.assertEqual(review.prose_diff(old, new, marks=True), review.prose_diff(old, new))

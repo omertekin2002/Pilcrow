@@ -53,6 +53,68 @@ Pilcrow uses Python's ZIP reader and `defusedxml` for XML parsing. There is no W
 process, cloud service, AI connection, watcher, or background service. Extraction
 never writes to the DOCX.
 
+## Quickstart
+
+From a Word file already in Git to a readable review, then to a freshness gate.
+Run these in your document repository; `report.docx` stands for your file.
+
+**1. Review a committed change, with no setup.** Compare the last commit with
+your working copy:
+
+```sh
+pilcrow review --rev HEAD "report.docx"
+```
+
+Without Git history, compare two files: `pilcrow review old.docx new.docx`.
+Review is read-only and writes nothing, not even `.pilcrow/` companions. It exits
+0 when no supported changes are found, 1 when it reports changes, and 2 on an
+error. `--rev` first ships in the release after v0.1.7. More:
+[Review a change in words](#review-a-change-in-words).
+
+**2. Export a baseline**, then check it:
+
+```sh
+pilcrow export "report.docx" --root .
+pilcrow check "report.docx" --root .
+```
+
+Confirm that `report.docx` is named in both outputs: a passing check that selected
+no documents proves nothing. Commit the DOCX and its two companions under
+`.pilcrow/` together. More: [Baseline, then review a change](#baseline-then-review-a-change).
+
+**3. Review the next edit.** Save your edit in Word, export again, and read the
+`.prose.md` diff in GitHub Desktop's **Changes** view or with Git (`--word-diff`
+marks the changed words in each line):
+
+```sh
+pilcrow export "report.docx" --root .
+git diff --word-diff -- ".pilcrow/report.docx.prose.md"
+```
+
+The Word and GitHub Desktop steps have not been tested; see
+[manual validation](docs/manual-validation.md).
+
+**4. Add a freshness gate.** A pre-commit hook or a GitHub Action runs
+`pilcrow check --all` and fails on missing or stale companions. In
+`.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/omertekin2002/Pilcrow
+    rev: v0.1.8
+    hooks:
+      - id: pilcrow-check
+```
+
+Or as a step in a GitHub Actions job, after `actions/checkout`:
+
+```yaml
+      - uses: omertekin2002/Pilcrow@v0.1.8
+```
+
+More, including the optional review report in the job summary:
+[Enforce freshness](#enforce-freshness).
+
 ## Baseline, then review a change
 
 In **your document repository**, choose an explicit scope. For example:
@@ -161,7 +223,11 @@ fails, run `pilcrow export` yourself and commit the DOCX and its companions
 together.
 
 Pin both to a Pilcrow release tag (see the repository's Releases). The hook and
-action first ship in the release after v0.1.2; the snippets below assume `v0.1.3`.
+action first ship in the release after v0.1.2. The snippets in this README assume
+`v0.1.8`, the release after v0.1.7, which adds `pilcrow review --rev` and the
+action's `summary` input. Pin the same release as your installed
+`pilcrow --version`: a newer release can record more in its companions, so
+companions exported by one release can be stale to another.
 
 `.pre-commit-config.yaml` in your document repository root (then run
 `pre-commit install` once):
@@ -169,7 +235,7 @@ action first ship in the release after v0.1.2; the snippets below assume `v0.1.3
 ```yaml
 repos:
   - repo: https://github.com/omertekin2002/Pilcrow
-    rev: v0.1.3
+    rev: v0.1.8
     hooks:
       - id: pilcrow-check
 ```
@@ -193,7 +259,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: omertekin2002/Pilcrow@v0.1.3
+      - uses: omertekin2002/Pilcrow@v0.1.8
         with:
           root: .              # optional, default "."
           python-version: "3.12"  # optional, default "3.12"
@@ -202,6 +268,62 @@ jobs:
 The action installs Pilcrow from the tagged source into a private virtual
 environment and fails with Pilcrow's exit code: 1 for missing, stale or orphan
 companions, 2 for errors.
+
+### Review report in the job summary (optional)
+
+The action can also write a review of each DOCX the push or pull request changed
+to the workflow run's job summary, so a reviewer can see what changed without
+checking the branch out. It is off by default (`summary: none`): without the
+input, the action only runs the check, exactly as above. The `summary` and `base`
+inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8`.
+
+```yaml
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0       # the summary compares from the base's history, so fetch it
+      - uses: omertekin2002/Pilcrow@v0.1.8
+        with:
+          summary: outline     # none (default), outline or full
+          # base: <revision>   # optional; default: the pull request's base, or the push's previous commit
+```
+
+- `outline` publishes **no document text**. For each changed document it lists
+  the path, its status (changed, no supported changes, added, removed, or could
+  not be read; why a document could not be read goes only to a warning
+  annotation) and the report sections that differ, each with its count of
+  described lines, such as `` `report.docx` — changed: Prose changed, Comments (2) ``.
+- `full` publishes each changed document's complete
+  [`pilcrow review --format markdown`](#review-a-change-in-words) report, comparing
+  the document at the merge base of `base` and `HEAD` with `HEAD`. **The report
+  includes document text (prose, comments, tracked changes, link targets), and
+  anyone who can view the workflow run can read it**, which for a public repository means anyone. The summary
+  repeats this warning at the top. Choose `outline` when the text must not leave
+  the repository.
+
+The new side is always `HEAD`, and the old side is the merge base of `base` and
+`HEAD`, the commit `HEAD` forked from, as in GitHub's Files changed view. So the
+summary shows what the pull request changes whether the workflow checks out the
+default merge commit or the pull request's head (`ref: ${{ github.event.pull_request.head.sha }}`),
+and edits made on the base branch since the fork, or commits a force-push
+replaced, are not reported as the pull request's own. When `base` is an ancestor
+of `HEAD`, as for the merge commit or an ordinary push, the merge base is `base`
+itself; otherwise the line under the summary's title names the merge base. Only
+DOCX files within `root` are listed, with the same lock-file and excluded-folder
+rules as `pilcrow check --all`. A renamed document is listed as removed and
+added, and an added or removed one has no report.
+
+The summary step is read-only and never fails the job (only a `summary` value
+other than `none`, `outline` or `full` does): it runs even when the
+check fails, and the action's outcome stays the check's. When the base is missing
+(the first push of a new branch), not in the checkout (the default shallow
+`fetch-depth: 1` clone), or shares no history with `HEAD` (unrelated histories,
+or a shallow clone that stops before the merge base), the summary explains why
+there is no review and the step adds a warning annotation. One unreadable document gets a warning while the
+others are still reported. GitHub limits a job summary to 1 MiB, so once the
+reports reach about 900 KB, the remaining documents are listed as `report
+omitted: summary size limit`. The action's `summary-file` output is the path of
+the Markdown file it wrote, for later steps that want to post or check it.
 
 ## Branches and conflicts
 
@@ -279,8 +401,31 @@ run `git config --unset diff.pilcrow.textconv`.
 
 `pilcrow review OLD.docx NEW.docx` prints a plain-language report of what
 changed between two DOCX files. It is read-only: it extracts both files in
-memory, writes nothing (no `.pilcrow/` companions), and never runs Git. To review
-a committed change, let Git hand it the two versions:
+memory and writes nothing (no `.pilcrow/` companions).
+
+To review a committed change, name the revision with `--rev`, as in `git diff`:
+
+```sh
+pilcrow review --rev HEAD report.docx              # last commit → working copy
+pilcrow review --rev HEAD~1 --rev HEAD report.docx # one commit → the next
+pilcrow review --rev main --rev feature report.docx
+```
+
+With one `--rev`, the old side is `report.docx` as committed at that revision
+and the new side is the file in your working copy. With two, both sides come
+from Git and the working copy is not read. The header names both sides, such as
+`Review: HEAD~1:report.docx → report.docx`. The path is relative to the current
+directory, like `git show HEAD:./report.docx`. A folder inside the repository
+that was committed as a folder and is now a symlink keeps its own history:
+Pilcrow reads the committed file, not whatever the link points to. The old
+side is extracted from the **committed DOCX itself**, not from companions
+committed with it, so it needs no `.pilcrow/` files and works for history from
+before you used Pilcrow.
+Pilcrow reads it with read-only Git commands (`rev-parse` and `cat-file`): it
+never stages, checks out, or writes a file, not even a temporary one, and it
+checks the committed file's size against the package limit before reading it.
+
+Alternatively, let `git difftool` hand it the two versions as temporary files:
 
 ```sh
 git difftool -y -x 'pilcrow review' HEAD~1 -- report.docx
@@ -297,15 +442,96 @@ re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
 
+To paste the report into a pull request, an issue, or a chat that renders
+Markdown, add `--format markdown` (the default, `--format text`, is the plain
+report above). It works with both forms, `OLD NEW` and `--rev`, and says the
+same things with the same exit code:
+
+```sh
+pilcrow review --format markdown --rev HEAD~1 --rev HEAD report.docx
+```
+
+For a reworded sentence and a resolved comment, it prints:
+
+````markdown
+## Review: `HEAD~1:report.docx` → `HEAD:report.docx`
+
+### Prose
+
+```diff
+--- OLD
++++ NEW
+@@ -1,4 +1,4 @@
+ first sentence.
+ 
+ Opening sentence.
+-The cat sat on the mat.
++The dog sat on the mat.
+```
+
+### Comments
+
+- `~` resolved comment by Ada on "first sentence."\: "Please clarify."
+
+### Coverage warnings (either side)
+
+- Comment text, authors, anchored text, replies, and resolved state are recorded; dates and rich formatting are not compared.
+- Formatting and page layout are not compared; unchanged prose is not an identical document.
+
+Only the prose and review metadata Pilcrow extracts are compared (not a complete document comparison).
+````
+
+The header becomes a heading with both sides in code spans, and the prose diff
+sits unchanged in a fenced `diff` block whose fence is longer than any run of
+backticks in the document. Each metadata section becomes a subheading with one
+bullet per line of the text report, its `-`, `~`, or `+` marker kept in a code
+span so the meaning does not depend on colour. Text from the document (comment
+text, anchors, authors, link text and targets, warnings) is escaped, so it renders
+literally: it cannot add headings, emphasis, links, images, HTML, or tables. A
+renderer may still turn a bare URL, an `@name`, or a `#123` into a link
+afterwards, as GitHub does in any comment.
+
+To see which words changed inside a sentence, add `--word-diff`. It works with
+both forms and both formats, and changes only how the prose diff is printed:
+
+```sh
+pilcrow review --word-diff --rev HEAD report.docx
+```
+
+A replaced sentence that pairs up with its new version is printed once, after
+`~ `, with removed words in `[-…-]` and added words in `{+…+}`:
+
+```text
+@@ -1,2 +1,2 @@
+~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.
+ Payment is due on receipt.
+```
+
+Sentences pair one-to-one, in order, only inside one block of replaced lines
+with as many new lines as old ones, and only when, for every pair, at least half
+of the two sentences' words and punctuation match. Otherwise, and whenever a
+sentence has more than 200 words or already contains `[-`, `-]`, `{+` or `+}`,
+the whole old and new lines are shown as `-` and `+`, exactly as without the
+flag. Dropping the added words and the brackets gives the old sentence back
+exactly; dropping the removed words and the braces gives the new one. Without
+`--word-diff` the report is unchanged, and the flag changes no exit code,
+companion, `textconv` output, or Action job summary.
+
 The report shows only what Pilcrow's extraction supports: formatting, layout,
 and anything else outside the prose and `.meta.json` are not compared, so "No
 supported prose or review changes detected" is not a claim that the documents
 are identical. Like `textconv`, it accepts any file name, because Git passes
 temporary copies. Exit codes follow `diff`: 0 when nothing supported differs,
 1 when the report lists differences, and 2 when an input is missing, unreadable,
-or malformed (the error names that file and nothing is printed on stdout). A file
-added or deleted in the commit has no other side to compare, so it reports an
-error. `git difftool` ignores the exit code unless you pass `--trust-exit-code`.
+or malformed (the error names that input, such as `error: HEAD~1:report.docx: …`,
+and nothing is printed on stdout). With `--rev`, that also covers running
+outside a Git repository, an unknown revision, and a revision whose name starts
+with `-`. A file added or deleted in the commit has no other side to compare, so
+it reports an error. `git difftool` ignores the exit code unless you pass
+`--trust-exit-code`.
+
+In CI, the GitHub Action can publish these reports for every changed document in
+the job summary; see [Review report in the job summary](#review-report-in-the-job-summary-optional).
 
 ## Coverage and maintenance
 

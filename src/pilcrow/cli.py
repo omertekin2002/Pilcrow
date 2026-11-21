@@ -6,17 +6,18 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .extract import DocumentError, extract
+from .extract import MAX_PACKAGE_BYTES, DocumentError, extract
 from .files import (
     TEXTCONV_CONFIG,
     companions,
     no_symlinks,
     orphaned,
+    revision_blob,
     select,
     setup,
     write_if_changed,
 )
-from .review import review
+from .review import FORMATS, build, markdown, text
 
 
 def parser() -> argparse.ArgumentParser:
@@ -34,9 +35,26 @@ def parser() -> argparse.ArgumentParser:
                          help="also mark DOCX files diff=pilcrow so git diff can show their prose (needs a one-time git config)")
     command = commands.add_parser("textconv", help="print one DOCX's prose to stdout (a Git textconv driver)")
     command.add_argument("path", type=Path, help="any DOCX file, such as the temporary file Git passes")
-    command = commands.add_parser("review", help="describe prose and review changes between two DOCX files in words (read-only)")
-    command.add_argument("old", type=Path, help="the earlier DOCX, such as the temporary file git difftool passes")
-    command.add_argument("new", type=Path, help="the later DOCX")
+    command = commands.add_parser(
+        "review", help="describe prose and review changes between two DOCX files in words (read-only)",
+        usage="%(prog)s [--format {text,markdown}] [--word-diff] OLD NEW\n"
+              "       %(prog)s [--format {text,markdown}] [--word-diff] --rev REV [--rev REV] PATH",
+        description="Compare OLD with NEW; or PATH at REV with the PATH in the work tree; "
+                    "or PATH at the first REV with PATH at the second, without reading the work tree.")
+    command.add_argument("paths", type=Path, nargs="+", metavar="PATH",
+                         help="OLD and NEW (any DOCX files, such as the temporary ones git difftool passes), "
+                              "or with --rev one DOCX path relative to the current directory")
+    command.add_argument("--rev", action="append", default=[], metavar="REV",
+                         help="read PATH as committed at this Git revision; give it once or twice, as in git diff")
+    command.add_argument("--format", choices=FORMATS, default="text",
+                         help="text (the default) or markdown, for pasting into a pull request, issue or chat")
+    command.add_argument("--word-diff", action="store_true",
+                         help="print a changed sentence once, after '~ ', with removed words as [-...-] and added "
+                              "words as {+...+}. Sentences pair in order only within a replaced block with as many "
+                              "new lines as old, when at least half of each pair's words match; a block that does "
+                              "not pair, or has a line over 200 words or already containing a mark, is shown as "
+                              "whole - and + lines, as without this flag")
+    command.set_defaults(usage_error=command.error)  # report usage errors with the review usage
     return result
 
 
@@ -59,26 +77,40 @@ def textconv(path: Path) -> int:
     return 0
 
 
-def review_command(old: Path, new: Path) -> int:
-    """Print a report of what changed from ``old`` to ``new``; never write files or run Git.
+def review_command(paths: list[Path], revisions: list[str], output: str = "text", marks: bool = False) -> int:
+    """Print a report of what changed from the old side to the new one; never write files.
 
-    Like textconv, no scope, discovery, extension, or symlink rules apply, because
-    git difftool passes temporary copies with arbitrary names. Exit codes follow diff:
-    0 no supported differences, 1 differences reported, 2 an input failed.
+    Each side is a DOCX file, or with ``--rev`` the DOCX blob committed at a
+    revision, read with read-only Git plumbing. Like textconv, no scope,
+    discovery, extension, or symlink rules apply, because git difftool passes
+    temporary copies with arbitrary names. Exit codes follow diff: 0 no
+    supported differences, 1 differences reported, 2 an input failed. ``output``
+    chooses the format; it changes how the report is printed, never what it says.
+    ``marks`` (``--word-diff``) marks the changed words of replaced prose lines that pair up.
     """
+    sides: list[tuple[str, Path, str | None]]
+    if revisions:
+        (path,) = paths
+        sides = [(f"{rev}:{path}", path, rev) for rev in revisions]
+        if len(sides) == 1:
+            sides.append((str(path), path, None))
+    else:
+        sides = [(str(path), path, None) for path in paths]
     results = []
-    for path in (old, new):
+    for label, path, rev in sides:
         try:
-            results.append(extract(path))
-        except (OSError, DocumentError) as exc:
-            print(f"error: {path}: {exc}", file=sys.stderr)
+            results.append(extract(path if rev is None else revision_blob(path, rev, MAX_PACKAGE_BYTES)))
+        except (OSError, ValueError) as exc:  # DocumentError is a ValueError
+            print(f"error: {label}: {exc}", file=sys.stderr)
     if len(results) != 2:
         return 2  # no partial report
-    report, changed = review(results[0], results[1])
+    report = build(results[0], results[1], marks)
+    old, new = sides[0][0], sides[1][0]
+    printed = markdown(report, old, new) if output == "markdown" else f"Review: {old} → {new}\n\n{text(report)}"
     # Raw UTF-8 bytes, not the console encoding, so output is identical on Windows.
-    sys.stdout.buffer.write(f"Review: {old} → {new}\n\n{report}".encode("utf-8", "backslashreplace"))
+    sys.stdout.buffer.write(printed.encode("utf-8", "backslashreplace"))
     sys.stdout.buffer.flush()
-    return 1 if changed else 0
+    return 1 if report.changed else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -90,7 +122,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "textconv":
         return textconv(args.path)
     if args.command == "review":
-        return review_command(args.old, args.new)
+        if len(args.rev) > 2:
+            args.usage_error("give --rev at most twice")
+        if len(args.paths) != (1 if args.rev else 2):
+            args.usage_error(f"{'--rev takes one PATH' if args.rev else 'give OLD and NEW, or --rev REV PATH'}, "
+                             f"not {len(args.paths)}")
+        return review_command(args.paths, args.rev, args.format, args.word_diff)
     root = args.root.resolve()
     if not root.is_dir():
         print(f"error: --root is not an existing directory: {root}", file=sys.stderr)

@@ -102,9 +102,15 @@ jobs:
         run: python scripts/make_fixture_repo.py "$FIXTURE"
 
       - name: Action passes when companions are fresh
+        id: fresh-action
         uses: ./
         with:
           root: ../pilcrow-fixture
+
+      - name: Without the summary input, no summary is written
+        env:
+          SUMMARY_FILE: ${{ steps.fresh-action.outputs.summary-file }}
+        run: test -z "$SUMMARY_FILE"
 
       - name: Hook passes when companions are fresh
         working-directory: ${{ env.FIXTURE }}
@@ -140,3 +146,67 @@ jobs:
           cat "$RUNNER_TEMP/hook-stale.log"
           grep -E '^pilcrow check\.+Failed$' "$RUNNER_TEMP/hook-stale.log"
           grep 'STALE' "$RUNNER_TEMP/hook-stale.log"
+
+      # The opt-in job summary (summary: outline|full) on a stale fixture: the summary
+      # still runs, and the action still fails with the check's exit code.
+      - name: Action writes a summary even when the check fails (expected to fail)
+        id: stale-summary
+        continue-on-error: true
+        uses: ./
+        with:
+          root: ../pilcrow-fixture
+          summary: outline
+          base: HEAD
+
+      - name: Stale action failed and still wrote a summary
+        env:
+          OUTCOME: ${{ steps.stale-summary.outcome }}
+          SUMMARY_FILE: ${{ steps.stale-summary.outputs.summary-file }}
+        run: |
+          echo "stale summary action outcome: $OUTCOME"
+          test "$OUTCOME" = failure
+          cat "$SUMMARY_FILE"
+          grep -F 'No DOCX documents changed.' "$SUMMARY_FILE"
+
+      - name: Commit an edited, re-exported DOCX on top of the fresh commit
+        id: edit
+        run: |
+          git -C "$FIXTURE" reset --quiet --hard
+          python scripts/make_fixture_repo.py "$FIXTURE" --commit
+          echo "base=$(git -C "$FIXTURE" rev-list --max-parents=0 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Action writes a full summary
+        id: full-summary
+        uses: ./
+        with:
+          root: ../pilcrow-fixture
+          summary: full
+          base: ${{ steps.edit.outputs.base }}
+
+      - name: Full summary has the document's report
+        env:
+          SUMMARY_FILE: ${{ steps.full-summary.outputs.summary-file }}
+        run: |
+          cat "$SUMMARY_FILE"
+          grep -E '^## Review: `[0-9a-f]+:report\.docx` → `[0-9a-f]+:report\.docx`$' "$SUMMARY_FILE"
+          grep -Fx '### Prose' "$SUMMARY_FILE"
+          grep -F 'now says something else' "$SUMMARY_FILE"
+
+      - name: Action writes an outline summary
+        id: outline-summary
+        uses: ./
+        with:
+          root: ../pilcrow-fixture
+          summary: outline
+          base: ${{ steps.edit.outputs.base }}
+
+      - name: Outline summary has no document text
+        env:
+          SUMMARY_FILE: ${{ steps.outline-summary.outputs.summary-file }}
+        run: |
+          cat "$SUMMARY_FILE"
+          grep -F '`report.docx` — changed: Prose changed' "$SUMMARY_FILE"
+          if grep -F -e 'now says something else' -e 'says one thing' "$SUMMARY_FILE"; then
+            echo "::error::the outline summary published document text"
+            exit 1
+          fi
