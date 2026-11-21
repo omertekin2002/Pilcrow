@@ -484,6 +484,32 @@ literally: it cannot add headings, emphasis, links, images, HTML, or tables. A
 renderer may still turn a bare URL, an `@name`, or a `#123` into a link
 afterwards, as GitHub does in any comment.
 
+To see which words changed inside a sentence, add `--word-diff`. It works with
+both forms and both formats, and changes only how the prose diff is printed:
+
+```sh
+pilcrow review --word-diff --rev HEAD report.docx
+```
+
+A replaced sentence that pairs up with its new version is printed once, after
+`~ `, with removed words in `[-…-]` and added words in `{+…+}`:
+
+```text
+@@ -1,2 +1,2 @@
+~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.
+ Payment is due on receipt.
+```
+
+Sentences pair one-to-one, in order, only inside one block of replaced lines
+with as many new lines as old ones, and only when, for every pair, at least half
+of the two sentences' words and punctuation match. Otherwise, and whenever a
+sentence has more than 200 words or already contains `[-`, `-]`, `{+` or `+}`,
+the whole old and new lines are shown as `-` and `+`, exactly as without the
+flag. Dropping the added words and the brackets gives the old sentence back
+exactly; dropping the removed words and the braces gives the new one. Without
+`--word-diff` the report is unchanged, and the flag changes no exit code,
+companion, `textconv` output, or Action job summary.
+
 The report shows only what Pilcrow's extraction supports: formatting, layout,
 and anything else outside the prose and `.meta.json` are not compared, so "No
 supported prose or review changes detected" is not a claim that the documents

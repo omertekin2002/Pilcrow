@@ -37,8 +37,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("path", type=Path, help="any DOCX file, such as the temporary file Git passes")
     command = commands.add_parser(
         "review", help="describe prose and review changes between two DOCX files in words (read-only)",
-        usage="%(prog)s [--format {text,markdown}] OLD NEW\n"
-              "       %(prog)s [--format {text,markdown}] --rev REV [--rev REV] PATH",
+        usage="%(prog)s [--format {text,markdown}] [--word-diff] OLD NEW\n"
+              "       %(prog)s [--format {text,markdown}] [--word-diff] --rev REV [--rev REV] PATH",
         description="Compare OLD with NEW; or PATH at REV with the PATH in the work tree; "
                     "or PATH at the first REV with PATH at the second, without reading the work tree.")
     command.add_argument("paths", type=Path, nargs="+", metavar="PATH",
@@ -48,6 +48,12 @@ def parser() -> argparse.ArgumentParser:
                          help="read PATH as committed at this Git revision; give it once or twice, as in git diff")
     command.add_argument("--format", choices=FORMATS, default="text",
                          help="text (the default) or markdown, for pasting into a pull request, issue or chat")
+    command.add_argument("--word-diff", action="store_true",
+                         help="print a changed sentence once, after '~ ', with removed words as [-...-] and added "
+                              "words as {+...+}. Sentences pair in order only within a replaced block with as many "
+                              "new lines as old, when at least half of each pair's words match; a block that does "
+                              "not pair, or has a line over 200 words or already containing a mark, is shown as "
+                              "whole - and + lines, as without this flag")
     command.set_defaults(usage_error=command.error)  # report usage errors with the review usage
     return result
 
@@ -71,7 +77,7 @@ def textconv(path: Path) -> int:
     return 0
 
 
-def review_command(paths: list[Path], revisions: list[str], output: str = "text") -> int:
+def review_command(paths: list[Path], revisions: list[str], output: str = "text", marks: bool = False) -> int:
     """Print a report of what changed from the old side to the new one; never write files.
 
     Each side is a DOCX file, or with ``--rev`` the DOCX blob committed at a
@@ -80,6 +86,7 @@ def review_command(paths: list[Path], revisions: list[str], output: str = "text"
     temporary copies with arbitrary names. Exit codes follow diff: 0 no
     supported differences, 1 differences reported, 2 an input failed. ``output``
     chooses the format; it changes how the report is printed, never what it says.
+    ``marks`` (``--word-diff``) marks the changed words of replaced prose lines that pair up.
     """
     sides: list[tuple[str, Path, str | None]]
     if revisions:
@@ -97,7 +104,7 @@ def review_command(paths: list[Path], revisions: list[str], output: str = "text"
             print(f"error: {label}: {exc}", file=sys.stderr)
     if len(results) != 2:
         return 2  # no partial report
-    report = build(results[0], results[1])
+    report = build(results[0], results[1], marks)
     old, new = sides[0][0], sides[1][0]
     printed = markdown(report, old, new) if output == "markdown" else f"Review: {old} → {new}\n\n{text(report)}"
     # Raw UTF-8 bytes, not the console encoding, so output is identical on Windows.
@@ -120,7 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if len(args.paths) != (1 if args.rev else 2):
             args.usage_error(f"{'--rev takes one PATH' if args.rev else 'give OLD and NEW, or --rev REV PATH'}, "
                              f"not {len(args.paths)}")
-        return review_command(args.paths, args.rev, args.format)
+        return review_command(args.paths, args.rev, args.format, args.word_diff)
     root = args.root.resolve()
     if not root.is_dir():
         print(f"error: --root is not an existing directory: {root}", file=sys.stderr)

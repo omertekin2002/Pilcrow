@@ -52,11 +52,133 @@ def where(part: str | None) -> str:
     return "" if part in (None, BODY) else f" in {part}"
 
 
-def prose_diff(old: str, new: str) -> list[str]:
-    """The unified prose diff, cut at MAX_DIFF_LINES with a note; empty when the prose is unchanged."""
+# Word marks (--word-diff)
+
+# A replaced line pair is marked word by word only when its word tokens are at least this similar.
+MIN_WORD_SIMILARITY = 0.5
+# Lines with more word tokens than this are never paired: the whole lines are shown instead.
+MAX_WORD_TOKENS = 200
+# Lines that already contain one of these could not be read back unambiguously, so are never marked.
+MARKS = ("[-", "-]", "{+", "+}")
+# Runs of word characters, runs of whitespace, and single other characters: joined, they are the line.
+TOKEN = re.compile(r"\w+|\s+|[^\w\s]")
+
+
+def tokens(line: str) -> list[str]:
+    return TOKEN.findall(line)
+
+
+def words(line_tokens: list[str]) -> list[str]:
+    return [t for t in line_tokens if not t.isspace()]
+
+
+def word_marks(old: str, new: str) -> str:
+    """``old`` turned into ``new``, with removed tokens as [-…-] and added tokens as {+…+}.
+
+    Changes separated only by unchanged whitespace merge into one mark, so a changed
+    phrase reads as one edit. Dropping every {+…+} and the brackets of every [-…-]
+    gives back ``old``; dropping every [-…-] and the braces of every {+…+} gives ``new``.
+    """
+    a, b = tokens(old), tokens(new)
+    # Whitespace never starts a match (it would make long lines slow to align), but
+    # unchanged whitespace next to a matched word is still part of the match.
+    opcodes = difflib.SequenceMatcher(str.isspace, a, b, autojunk=False).get_opcodes()
+    tags = [tag for tag, *_ in opcodes]
+    spans = [[i1, i2, j1, j2] for _, i1, i2, j1, j2 in opcodes]
+    # An inserted or deleted " word" can equally be read as "word "; always take the
+    # second, so an added word reads "deliver {+all +}the" wherever the matcher put it.
+    # Opcodes alternate between equal and changed, so a change's neighbours are equal.
+    for n in range(1, len(opcodes) - 1):
+        if tags[n] not in ("insert", "delete"):
+            continue
+        before, change, after = spans[n - 1:n + 2]
+        side, lo, hi = (b, change[2], change[3]) if tags[n] == "insert" else (a, change[0], change[1])
+        while after[1] - after[0] > 1 and side[lo].isspace() and side[lo] == side[hi]:
+            before[1], before[3] = before[1] + 1, before[3] + 1
+            change[:] = [k + 1 for k in change]
+            after[0], after[2] = after[0] + 1, after[2] + 1
+            lo, hi = lo + 1, hi + 1
+    # An equal opcode that is neither first nor last sits between two changes; when it
+    # is only whitespace, it joins them into one mark.
+    runs: list[tuple[bool, list[int]]] = []
+    for n, (tag, span) in enumerate(zip(tags, spans, strict=True)):
+        changed = tag != "equal" or (0 < n < len(tags) - 1 and all(t.isspace() for t in a[span[0]:span[1]]))
+        if changed and runs and runs[-1][0]:
+            runs[-1][1][1], runs[-1][1][3] = span[1], span[3]
+        else:
+            runs.append((changed, list(span)))
+    result = []
+    for changed, (i1, i2, j1, j2) in runs:
+        removed, added = "".join(a[i1:i2]), "".join(b[j1:j2])
+        if not changed:
+            result.append(removed)
+            continue
+        result.append((f"[-{removed}-]" if removed else "") + (f"{{+{added}+}}" if added else ""))
+    return "".join(result)
+
+
+def pairable(old: str, new: str) -> bool:
+    """True when ``old`` and ``new`` can be shown as one marked line (see MIN_WORD_SIMILARITY)."""
+    if any(mark in line for line in (old, new) for mark in MARKS):
+        return False
+    a, b = words(tokens(old)), words(tokens(new))
+    if len(a) > MAX_WORD_TOKENS or len(b) > MAX_WORD_TOKENS:
+        return False
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= MIN_WORD_SIMILARITY
+
+
+def paired(olds: list[str], news: list[str], shown: int | None = None) -> list[str] | None:
+    """One line per pair of a replaced block, or None when the block must be shown as whole lines.
+
+    Lines pair 1:1 by position only when the block replaces as many lines as it adds and
+    every pair is pairable; an unchanged pair (a line the alignment did not match) is context.
+    Only the first ``shown`` lines (all by default) are worded; the rest, past the
+    MAX_DIFF_LINES cap, are only counted, so they are left empty.
+    """
+    if len(olds) != len(news) or not all(pairable(a, b) for a, b in zip(olds, news, strict=True)):
+        return None
+    return ["" if shown is not None and n >= shown else f" {a}" if a == b else f"~ {word_marks(a, b)}"
+            for n, (a, b) in enumerate(zip(olds, news, strict=True))]
+
+
+def span(start: int, stop: int) -> str:
+    """A unified diff hunk range, as difflib writes it."""
+    length = stop - start
+    if length == 1:
+        return f"{start + 1}"
+    return f"{start if length == 0 else start + 1},{length}"
+
+
+def word_diff(old: list[str], new: list[str]) -> list[str]:
+    """The unified diff of difflib.unified_diff, with each pairable replaced block as marked lines."""
+    lines = ["--- OLD", "+++ NEW"]
+    for group in difflib.SequenceMatcher(None, old, new).get_grouped_opcodes(3):
+        first, last = group[0], group[-1]
+        lines.append(f"@@ -{span(first[1], last[2])} +{span(first[3], last[4])} @@")
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                lines += [f" {line}" for line in old[i1:i2]]
+                continue
+            marked = paired(old[i1:i2], new[j1:j2], MAX_DIFF_LINES - len(lines)) if tag == "replace" else None
+            if marked is not None:
+                lines += marked
+                continue
+            lines += [f"-{line}" for line in old[i1:i2]]
+            lines += [f"+{line}" for line in new[j1:j2]]
+    return lines
+
+
+def prose_diff(old: str, new: str, marks: bool = False) -> list[str]:
+    """The unified prose diff, cut at MAX_DIFF_LINES with a note; empty when the prose is unchanged.
+
+    With ``marks``, replaced lines that pair up are shown once, with word marks (see ``paired``).
+    """
     if old == new:
         return []
-    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), "OLD", "NEW", n=3, lineterm=""))
+    if marks:
+        diff = word_diff(old.splitlines(), new.splitlines())
+    else:
+        diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), "OLD", "NEW", n=3, lineterm=""))
     lines = diff[:MAX_DIFF_LINES]
     if len(diff) > MAX_DIFF_LINES:
         lines.append(f"… {len(diff) - MAX_DIFF_LINES} more diff lines omitted")
@@ -335,8 +457,11 @@ def notice(title: str, lines: list[str], differs: bool) -> Section | None:
     return Section(title, ["metadata changed (could not match entries one-to-one)"], inline=True) if differs else None
 
 
-def build(old: Extraction, new: Extraction) -> Report:
-    """Compare two extractions; render the result with ``text`` or ``markdown``."""
+def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
+    """Compare two extractions; render the result with ``text`` or ``markdown``.
+
+    ``marks`` marks the changed words of replaced prose lines that pair up (``--word-diff``).
+    """
     a, b = old.metadata, new.metadata
     old_review, new_review = a.get("review", []), b.get("review", [])
     old_comments = [e for e in old_review if e.get("kind") == "comment"]
@@ -367,7 +492,7 @@ def build(old: Extraction, new: Extraction) -> Report:
     sections += [Section("Metadata", [f"{key} changed"], inline=True)
                  for key in sorted((a.keys() | b.keys()) - known) if a.get(key) != b.get(key)]
     changed = bool(sections) or old.prose != new.prose
-    return Report(prose_diff(old.prose, new.prose), sections,
+    return Report(prose_diff(old.prose, new.prose, marks), sections,
                   sorted(set(old_warnings) | set(new_warnings)), changed)
 
 
