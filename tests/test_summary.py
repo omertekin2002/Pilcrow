@@ -236,6 +236,105 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("`fetch-depth: 0`", text)
         self.assertIn("::warning::", printed)
 
+    def fork(self) -> tuple[str, str, str]:
+        """Main and branch ``pr`` fork at a commit; ``pr`` edits b.docx, then main edits a.docx and adds c.docx.
+
+        Returns (fork, main's tip, pr's tip), with ``pr`` checked out."""
+        make_docx(self.repo / "a.docx", paragraph("Alpha one."))
+        make_docx(self.repo / "b.docx", paragraph("Bravo one."))
+        fork = self.commit("fork")
+        main = self.git("symbolic-ref", "--short", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "pr")
+        make_docx(self.repo / "b.docx", paragraph("Bravo two."))
+        pr = self.commit("pr edits b")
+        self.git("checkout", "-q", main)
+        make_docx(self.repo / "a.docx", paragraph("Alpha two."))
+        make_docx(self.repo / "c.docx", paragraph("Charlie."))
+        tip = self.commit("main edits a and adds c")
+        self.git("checkout", "-q", "pr")
+        return fork, tip, pr
+
+    def test_a_pull_request_head_is_compared_from_the_merge_base(self) -> None:
+        fork, tip, pr = self.fork()
+        before = self.state()
+        for mode in ("outline", "full"):
+            with self.subTest(mode=mode):
+                text, printed = self.summarize(tip, mode)
+                self.assertEqual(self.state(), before)
+                self.assertEqual(printed, "")
+                self.assertIn(f"from `{fork[:7]}` (merge base of `{tip[:7]}` and `HEAD`) to `{pr[:7]}` (head).", text)
+                for absent in ("a.docx", "c.docx", "Alpha", "Charlie", "removed"):
+                    self.assertNotIn(absent, text)
+                if mode == "outline":
+                    self.assertTrue(text.endswith("\n\n- `b.docx` — changed: Prose changed\n"), text)
+                else:
+                    self.assertEqual(text.count("## Review: "), 1)
+                    self.assertIn(f"## Review: `{fork[:7]}:b.docx` → `{pr[:7]}:b.docx`", text)
+                    self.assertIn("-Bravo one.", text)
+                    self.assertIn("+Bravo two.", text)
+        # Checked out on main, the pull request's fork point is an ancestor: the usual header, main's own edits.
+        self.git("checkout", "-q", "-")
+        text, _ = self.summarize(fork, "outline")
+        self.assertIn(f"from `{fork[:7]}` (base) to `{tip[:7]}` (head).", text)
+        self.assertNotIn("merge base", text)
+        self.assertIn("- `a.docx` — changed: Prose changed\n- `c.docx` — added\n", text)
+
+    def test_a_force_pushed_before_is_compared_from_the_merge_base(self) -> None:
+        make_docx(self.repo / "a.docx", paragraph("One."))
+        make_docx(self.repo / "b.docx", paragraph("Kept."))
+        parent = self.commit("first")
+        make_docx(self.repo / "a.docx", paragraph("Two."))
+        replaced = self.commit("pushed, then force-pushed away")
+        self.git("reset", "-q", "--hard", parent)
+        make_docx(self.repo / "b.docx", paragraph("Rewritten."))
+        head = self.commit("the new push")
+        before = self.state()
+        for mode in ("outline", "full"):
+            with self.subTest(mode=mode):
+                text, printed = self.summarize(replaced, mode)
+                self.assertEqual(self.state(), before)
+                self.assertEqual(printed, "")
+                self.assertIn(f"from `{parent[:7]}` (merge base of `{replaced[:7]}` and `HEAD`) to `{head[:7]}` (head).",
+                              text)
+                self.assertNotIn("a.docx", text)
+                self.assertIn("b.docx", text)
+                if mode == "full":
+                    self.assertIn(f"## Review: `{parent[:7]}:b.docx` → `{head[:7]}:b.docx`", text)
+                    self.assertIn("-Kept.", text)
+
+    def test_unrelated_histories_explain_and_warn(self) -> None:
+        make_docx(self.repo / "a.docx", paragraph("One."))
+        other = self.commit("first")
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        make_docx(self.repo / "a.docx", paragraph("Two."))
+        self.commit("a separate history")
+        before = self.state()
+        for mode in ("outline", "full"):
+            with self.subTest(mode=mode):
+                text, printed = self.summarize(other, mode)
+                self.assertEqual(self.state(), before)
+                self.assertTrue(text.startswith(f"{summary.TITLE}\n\nNo review: "), text)
+                self.assertIn("have no common ancestor", text)
+                self.assertIn("unrelated histories", text)
+                self.assertNotIn("fetch-depth", text)
+                self.assertNotIn("## Review", text)
+                self.assertTrue(printed.startswith("::warning::Pilcrow summary: no review: "), printed)
+                self.assertEqual(printed.count("\n"), 1)
+
+    def test_a_shallow_checkout_that_misses_the_merge_base_suggests_fetching_more(self) -> None:
+        _, tip, _ = self.fork()
+        clone = Path(self.temp.name) / "clone"
+        self.git("clone", "-q", "--depth", "1", "--no-single-branch", "--branch", "pr", self.repo.as_uri(), str(clone))
+        before = tree(clone)
+        text, printed = self.summarize(tip, "full", root=clone)
+        self.assertEqual(tree(clone), before)
+        self.assertIn("No review: ", text)
+        self.assertIn("have no common ancestor", text)
+        self.assertIn("The checkout is shallow", text)
+        self.assertIn("`fetch-depth: 0`", text)
+        self.assertNotIn("## Review", text)
+        self.assertIn("::warning::", printed)
+
     def test_outside_a_repository(self) -> None:
         outside = Path(self.temp.name) / "plain"
         outside.mkdir()

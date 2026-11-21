@@ -281,7 +281,7 @@ inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0       # the summary compares with the base commit, so fetch it
+          fetch-depth: 0       # the summary compares from the base's history, so fetch it
       - uses: omertekin2002/Pilcrow@v0.1.8
         with:
           summary: outline     # none (default), outline or full
@@ -295,14 +295,20 @@ inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8
   described lines, such as `` `report.docx` — changed: Prose changed, Comments (2) ``.
 - `full` publishes each changed document's complete
   [`pilcrow review --format markdown`](#review-a-change-in-words) report, comparing
-  the document at `base` with `HEAD`. **The report includes document text (prose,
-  comments, tracked changes, link targets), and anyone who can view the workflow
-  run can read it**, which for a public repository means anyone. The summary
+  the document at the merge base of `base` and `HEAD` with `HEAD`. **The report
+  includes document text (prose, comments, tracked changes, link targets), and
+  anyone who can view the workflow run can read it**, which for a public repository means anyone. The summary
   repeats this warning at the top. Choose `outline` when the text must not leave
   the repository.
 
-The new side is always `HEAD`. For a `pull_request` event, actions/checkout checks
-out the merge commit, so the summary shows what the pull request changes. Only
+The new side is always `HEAD`, and the old side is the merge base of `base` and
+`HEAD`, the commit `HEAD` forked from, as in GitHub's Files changed view. So the
+summary shows what the pull request changes whether the workflow checks out the
+default merge commit or the pull request's head (`ref: ${{ github.event.pull_request.head.sha }}`),
+and edits made on the base branch since the fork, or commits a force-push
+replaced, are not reported as the pull request's own. When `base` is an ancestor
+of `HEAD`, as for the merge commit or an ordinary push, the merge base is `base`
+itself; otherwise the line under the summary's title names the merge base. Only
 DOCX files within `root` are listed, with the same lock-file and excluded-folder
 rules as `pilcrow check --all`. A renamed document is listed as removed and
 added, and an added or removed one has no report.
@@ -310,9 +316,10 @@ added, and an added or removed one has no report.
 The summary step is read-only and never fails the job (only a `summary` value
 other than `none`, `outline` or `full` does): it runs even when the
 check fails, and the action's outcome stays the check's. When the base is missing
-(the first push of a new branch) or not in the checkout (the default shallow
-`fetch-depth: 1` clone), the summary explains why there is no review and the step
-adds a warning annotation. One unreadable document gets a warning while the
+(the first push of a new branch), not in the checkout (the default shallow
+`fetch-depth: 1` clone), or shares no history with `HEAD` (unrelated histories,
+or a shallow clone that stops before the merge base), the summary explains why
+there is no review and the step adds a warning annotation. One unreadable document gets a warning while the
 others are still reported. GitHub limits a job summary to 1 MiB, so once the
 reports reach about 900 KB, the remaining documents are listed as `report
 omitted: summary size limit`. The action's `summary-file` output is the path of
