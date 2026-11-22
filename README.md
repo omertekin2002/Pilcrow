@@ -434,12 +434,14 @@ git difftool -y -x 'pilcrow review' HEAD~1 -- report.docx
 The report starts with a unified diff of the prose (the `.prose.md` text, capped
 at 2,000 lines), then one section per kind of review metadata that differs:
 comments, tracked changes, hyperlinks, fields, images, equations and symbols,
-lists, and coverage warnings. Entries are matched by content, not by position, and described in
+charts, diagrams and embedded objects, lists, and coverage warnings. Entries are matched by content, not by position, and described in
 words, for example `~ resolved comment by Ada on "first sentence.": "Please
 clarify."`, `~ link "Report": https://old.example → https://new.example`, or
 `~ list 1 level 0: bullet → decimal`. An edited equation reads `~ equation 1
 (word/document.xml) changed` and a changed symbol `~ symbol 1
-(word/document.xml): F061 (Symbol) → F062 (Symbol)`. A comment is called resolved, reopened,
+(word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
+diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
+changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`. A comment is called resolved, reopened,
 re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
@@ -552,6 +554,13 @@ companions stale (size, position, cropping, and alt text are not compared).
 Equations and Word symbols (`w:sym`) are recorded in metadata by a fingerprint of
 their OMML structure and text (formatting and revision IDs left out) and by font
 and character code, so editing, adding, or removing one makes companions stale.
+Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
+(`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
+chart part, the diagram's data part, the embedding, the chunk), so editing a
+chart's values, a diagram's text, an embedded workbook, or a chunk, or adding or
+removing one, makes companions stale; renaming the part does not. The fingerprint
+covers the stored part, not how Word draws it; a chart's own workbook and a
+diagram's layout, style, and colour parts are not compared.
 Comments stay out of the prose; their text, author, and anchored text (the
 accepted text their range covers, and the part it is in) are recorded in metadata,
 so editing a comment or moving, widening, or narrowing its range makes companions
@@ -600,6 +609,12 @@ Upgrading from a version that did not record equations and symbols: documents
 containing an equation or a Word symbol report stale companions once, because
 `.meta.json` now has an `objects` key for them. Run `pilcrow export` and commit
 the refreshed companions. Documents without equations or symbols are unaffected.
+
+Upgrading from a version that did not record charts, SmartArt diagrams, embedded
+objects, and imported chunks: documents containing one report stale companions
+once, because `.meta.json` now records them in `objects` (and no longer warns
+that their parts are not compared). Run `pilcrow export` and commit the refreshed
+companions. Documents without them are unaffected.
 
 Run the generated-fixture suite:
 
