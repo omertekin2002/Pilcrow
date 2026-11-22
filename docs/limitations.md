@@ -22,7 +22,8 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Fields/citations | Saved display text in prose; normalized instruction fingerprint and first command token in metadata; never recalculate fields or manage Zotero |
 | Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
 | Images | Placeholders (e.g. `[Unsupported drawing]`, `[Unsupported pict]`) in prose, as for other drawings; every DrawingML (`a:blip`, including its SVG copy) and legacy VML (`v:imagedata`) image in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 and size of its media part (external links by target, never fetched), so swapping, adding, removing, or reordering images makes companions stale; renamed media parts with identical bytes do not; size, position, cropping, alt text, and images in comments are not compared and trigger one coverage warning; a missing image relationship or media part is recorded without a hash and warns |
-| Drawings, charts, embedded objects, equations | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or asset-content comparison (including the preview images of embedded objects) |
+| Equations and symbols | Placeholders (`[Unsupported oMath]`, `[Unsupported oMathPara]`, `[Unsupported sym]`) and omission warnings in prose; each outermost OMML equation (`m:oMathPara`, or an `m:oMath` outside one) and each `w:sym` in the body, headers/footers, notes, and text boxes is recorded in metadata, so editing, adding, removing, or reordering one makes companions stale; an equation is recorded by the SHA-256 of a canonical form of its accepted view (tracked deletions dropped, insertions kept; run formatting `w:rPr`, control formatting `m:ctrlPr`, `rsid*`/`w14:paraId`/`w14:textId` attributes, proofing marks, bookmarks, and comment markers left out; `m:t` text and the other `m:*Pr` structure kept), so the fingerprint covers OMML structure and text, not how Word draws it, and a formatting-only re-save stays fresh; a symbol is recorded by its font and character code; equations inside tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images |
+| Drawings, charts, embedded objects | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or asset-content comparison (including the preview images of embedded objects) |
 | Bold/italic, fonts, colors, other styles, pagination/layout | Not compared; always disclosed in coverage warning |
 
 Tracked text inclusion is an **accept-insertions/omit-deletions view**, not Word's
@@ -47,7 +48,7 @@ No claim of a complete/unchanged document is made. This is a modest coverage rep
 not an audit of every OOXML relationship or layout semantic.
 
 Metadata contains only schema/view/coverage, warnings, review text/authors, link
-destinations, field fingerprints, list formats, and image hashes. `lists` has one entry per
+destinations, field fingerprints, list formats, image hashes, and equation and symbol fingerprints. `lists` has one entry per
 list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
 Word's `numId`, which can change on save), with the part where it is first used
 and the format, level text, and start value of each level its items use.
@@ -61,7 +62,11 @@ part (internal) or `target` (external link); a dangling reference has a null
 `sha256`. Media file names are not recorded because Word renumbers them on save,
 so order plus hash is the comparison, and re-encoded images are a real change.
 The chosen `mc:AlternateContent` copy is read once: the text box branch, else
-the first `mc:Choice`. Field fingerprints avoid huge Zotero JSON
+the first `mc:Choice`. `objects` lists equations and symbols in traversal order, each
+with its story `part`: `{"kind": "equation", "sha256": …}` (the canonical
+accepted-view hash above) or `{"kind": "symbol", "font": …, "char": …}` (`w:font`
+and `w:char`, uppercased). The key is present only when the list is non-empty,
+so documents without equations or symbols keep the metadata they had. Field fingerprints avoid huge Zotero JSON
 payloads but only say a normalized code changed, not what that change means.
 Arrays follow document traversal order; related parts and warnings sort
 lexically. Internal part paths come from the package; no machine paths, save
@@ -91,6 +96,10 @@ re-anchoring, or resolving a parent gives no line for an unchanged reply, and a
 reply that changed too is worded as an edit (describing its new parent). A reply
 whose parent is removed, added, or cannot be paired is still removed and added.
 An image whose media part goes missing or appears is listed as removed and added.
+Equations and symbols are numbered by kind (equation 1, 2, … and symbol 1, 2, …);
+an equation at the same position of an aligned block is worded as changed, and a
+symbol as its old and new character and font. Only an equation's fingerprint is
+recorded, so the report cannot say what changed inside it: inspect it in Word.
 Long texts are shortened to 80 characters for display.
 
 ## Normalization and sentence lines
