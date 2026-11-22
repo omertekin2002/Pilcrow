@@ -205,10 +205,10 @@ def aligned(old: Sequence[Entry], new: Sequence[Entry],
 
 
 def entries_section(old: Sequence[Entry], new: Sequence[Entry], describe: Callable[[Entry, int], str],
-                    change: Change | None = None) -> list[str]:
+                    change: Change | None = None, key: Callable[[Entry], str] = canonical) -> list[str]:
     """Removed/added lines, with ``change`` wording pairs in the same position of a replaced block."""
     lines = []
-    for olds, news in aligned(old, new):
+    for olds, news in aligned(old, new, key):
         changes: list[str] = []
         unpaired_old, unpaired_new = list(olds), list(news)
         if change is not None:
@@ -422,6 +422,47 @@ def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
     return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details) if details else None
 
 
+def numbered_objects(objects: Sequence[Entry]) -> list[Entry]:
+    """Equations and symbols, each with its 1-based number among its own kind."""
+    counts: Counter[str] = Counter()
+    result = []
+    for entry in objects:
+        counts[entry.get("kind", "")] += 1
+        result.append({**entry, "number": counts[entry.get("kind", "")]})
+    return result
+
+
+def unnumbered(entry: Entry) -> str:
+    """An object's identity for alignment: its number shifts when an earlier one is added."""
+    return canonical({k: v for k, v in entry.items() if k != "number"})
+
+
+def symbol_char(entry: Entry) -> str:
+    return f"{entry.get('char') or '(no char)'} ({entry.get('font') or 'no font'})"
+
+
+def describe_object(entry: Entry, _: int) -> str:
+    kind = entry.get("kind")
+    label = f"{kind} {entry.get('number')} ({entry.get('part')})"
+    if kind == "symbol":
+        return f"{label}: {symbol_char(entry)}"
+    if kind == "equation":
+        return f"{label}, sha256 {str(entry.get('sha256'))[:12]}"
+    return label
+
+
+def change_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
+    """Word an edit to one equation or symbol; anything else falls back to removed/added."""
+    if old.get("kind") != new.get("kind") or old.get("part") != new.get("part"):
+        return None
+    label = f"{new.get('kind')} {new.get('number')} ({new.get('part')})"
+    if new.get("kind") == "equation" and only_differs(old, new, "sha256", "number"):
+        return f"~ {label} changed"
+    if new.get("kind") == "symbol" and only_differs(old, new, "font", "char", "number"):
+        return f"~ {label}: {symbol_char(old)} → {symbol_char(new)}"
+    return None
+
+
 def describe_level(level: Entry) -> str:
     return f'{level.get("format")} "{level.get("text")}" from {level.get("start")}'
 
@@ -519,6 +560,10 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
                a.get("fields") != b.get("fields")),
         notice("Images", entries_section(a.get("images", []), b.get("images", []), describe_image, change_image),
                a.get("images") != b.get("images")),
+        notice("Equations and symbols",
+               entries_section(numbered_objects(a.get("objects", [])), numbered_objects(b.get("objects", [])),
+                               describe_object, change_object, unnumbered),
+               a.get("objects", []) != b.get("objects", [])),
         notice("Lists", entries_section(a.get("lists", []), b.get("lists", []), describe_list, change_list)
                + entries_section(a.get("list_runs", []), b.get("list_runs", []), describe_run, change_run),
                (a.get("lists"), a.get("list_runs")) != (b.get("lists"), b.get("list_runs"))),
@@ -526,7 +571,7 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
                + [f"+ added: {w}" for w in new_warnings if w not in old_warnings],
                old_warnings != new_warnings),
     ]
-    known = {"review", "hyperlinks", "fields", "images", "lists", "list_runs", "warnings"}
+    known = {"review", "hyperlinks", "fields", "images", "objects", "lists", "list_runs", "warnings"}
     sections = [s for s in found if s is not None]
     sections += [Section("Metadata", [f"{key} changed"], inline=True)
                  for key in sorted((a.keys() | b.keys()) - known) if a.get(key) != b.get(key)]

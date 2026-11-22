@@ -28,6 +28,7 @@ try:
         comments_extended,
         comments_part,
         end,
+        equation,
         image_rel,
         level,
         list_item,
@@ -38,6 +39,7 @@ try:
         picture,
         run,
         start,
+        symbol,
     )
     from .test_textconv import tree
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
@@ -52,6 +54,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         comments_extended,
         comments_part,
         end,
+        equation,
         image_rel,
         level,
         list_item,
@@ -62,6 +65,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         picture,
         run,
         start,
+        symbol,
     )
     from test_textconv import tree  # type: ignore[no-redef]
 
@@ -452,6 +456,43 @@ class ReviewTests(unittest.TestCase):
         (line,) = self.section(self.review(), "Images")
         self.assertRegex(line, r"^\+ added image 1 \(word/document\.xml\): 14 bytes, sha256 [0-9a-f]{12}, "
                                r"linked to https://example\.invalid/b\.png$")
+
+    def test_equation_and_symbol_edits(self) -> None:
+        def write(path: Path, math: str = "E=mc2", char: str = "F061", font: str = "Symbol") -> None:
+            make_docx(path, f'<w:p>{run("Energy: ")}{equation(math)}{symbol(char, font)}</w:p>')
+
+        write(self.old)
+        write(self.new, "E=mc3")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
+        write(self.new, char="F062")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"),
+                         ["~ symbol 1 (word/document.xml): F061 (Symbol) → F062 (Symbol)"])
+        write(self.new, font="Wingdings")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"),
+                         ["~ symbol 1 (word/document.xml): F061 (Symbol) → F061 (Wingdings)"])
+        write(self.new)
+        self.assertNotIn("Equations and symbols", self.review(code=0))
+
+    def test_equations_and_symbols_are_numbered_by_kind_and_added_or_removed(self) -> None:
+        def write(path: Path, *maths: str) -> None:
+            make_docx(path, f'<w:p>{symbol()}{"".join(equation(m) for m in maths)}{symbol("F062")}</w:p>')
+
+        write(self.old, "a", "b")
+        write(self.new, "a", "c")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"), ["~ equation 2 (word/document.xml) changed"])
+        write(self.new, "z", "a", "b")
+        (added,) = self.section(self.review(), "Equations and symbols")
+        self.assertRegex(added, r"^\+ added equation 1 \(word/document\.xml\), sha256 [0-9a-f]{12}$")
+        write(self.new, "b")
+        (removed,) = self.section(self.review(), "Equations and symbols")
+        self.assertRegex(removed, r"^- removed equation 1 \(word/document\.xml\), sha256 [0-9a-f]{12}$")
+        # Companions from before objects were recorded have no key: read as no objects.
+        make_docx(self.old, paragraph("Plain."))
+        make_docx(self.new, paragraph("Plain.") + f"<w:p>{symbol()}</w:p>")
+        lines = self.section(self.review(), "Equations and symbols")
+        self.assertEqual(lines, ["+ added symbol 1 (word/document.xml): F061 (Symbol)"])
 
     def test_bullet_to_number_list_format_change(self) -> None:
         body = list_item("First.", "1") + list_item("Second.", "1")
