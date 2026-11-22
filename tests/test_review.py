@@ -572,6 +572,17 @@ class ReviewTests(unittest.TestCase):
         # The prose diff itself is verbatim.
         self.assertIn(f"+{hostile}\n", report[fence:])
 
+    def test_www_after_an_underscore_is_not_autolinked(self) -> None:
+        # GFM links "www." after "_", so its dot is escaped there too, not only after a word boundary.
+        note = "see build_www.example.invalid and _WWW.other.invalid"
+        make_docx(self.old, paragraph("Body."))
+        make_docx(self.new, f"<w:p>{start('1')}{run('Body.')}{end('1')}</w:p>",
+                  extra={"word/comments.xml": comments_part({"1": note})}, relationships=COMMENTS_REL)
+        self.review()
+        section = self.markdown().split("### Comments\n\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(section, '- `+` added comment by Ada on "Body."\\: '
+                                  '"see build\\_www\\.example.invalid and \\_WWW\\.other.invalid"')
+
     def test_markdown_header_labels_are_code_spans(self) -> None:
         make_docx(self.old, paragraph("Same."))
         shutil.copy(self.old, self.root / "a `b` #.docx")
@@ -1072,6 +1083,18 @@ class MarkdownEscapingTests(unittest.TestCase):
         self.assertEqual(escape("$x$ ~~s~~ _u_"), "\\$x\\$ \\~\\~s\\~\\~ \\_u\\_")
         self.assertEqual(escape("see www.example.invalid or a@b.invalid"),
                          "see www\\.example.invalid or a\\@b.invalid")
+        # GFM links a "www." at the start or after whitespace, "*", "_", "~" or "(", in any case;
+        # "_" is a word character, so a word boundary alone missed it.
+        for raw, escaped in (("see _www.example.invalid", "see \\_www\\.example.invalid"),
+                             ("a_b_www.x.invalid", "a\\_b\\_www\\.x.invalid"),
+                             ("*www.a.invalid", "\\*www\\.a.invalid"),
+                             ("~www.a.invalid", "\\~www\\.a.invalid"),
+                             ("(www.a.invalid", "(www\\.a.invalid"),
+                             ("www.a.invalid", "www\\.a.invalid"),
+                             ("see WWW.a.invalid and _Www.b.invalid", "see WWW\\.a.invalid and \\_Www\\.b.invalid")):
+            self.assertEqual(escape(raw), escaped)
+        # GFM links no "www." straight after a letter or digit, so it stays as it was.
+        self.assertEqual(escape("awww.example.invalid 3www.x.invalid"), "awww.example.invalid 3www.x.invalid")
         self.assertEqual(escape("back\\slash"), "back\\\\slash")
         self.assertEqual(escape("plain words, 1.5 (ok)"), "plain words, 1.5 (ok)")
 
