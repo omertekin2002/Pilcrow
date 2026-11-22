@@ -422,8 +422,18 @@ def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
     return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details) if details else None
 
 
+# Object kinds shown under "Equations and symbols"; every other kind (chart, diagram,
+# embedded object, imported chunk) is shown under "Charts, diagrams and embedded objects".
+FORMULA_KINDS = frozenset({"equation", "symbol"})
+
+
+def objects_of(metadata: Entry, formulas: bool) -> list[Entry]:
+    """The ``objects`` entries of one section: equations and symbols, or every other kind."""
+    return [e for e in metadata.get("objects", []) if (e.get("kind") in FORMULA_KINDS) == formulas]
+
+
 def numbered_objects(objects: Sequence[Entry]) -> list[Entry]:
-    """Equations and symbols, each with its 1-based number among its own kind."""
+    """Objects, each with its 1-based number among its own kind."""
     counts: Counter[str] = Counter()
     result = []
     for entry in objects:
@@ -449,6 +459,38 @@ def describe_object(entry: Entry, _: int) -> str:
     if kind == "equation":
         return f"{label}, sha256 {str(entry.get('sha256'))[:12]}"
     return label
+
+
+def one_spaced(value: Any) -> str:
+    """Document-controlled text on one line, so it cannot start a line of its own in a text report."""
+    return " ".join(str(value).split())
+
+
+def part_label(entry: Entry) -> str:
+    """"chart 1 (word/document.xml)", with an embedded object's ProgID before the part."""
+    prog_id = one_spaced(entry.get("prog_id") or "")
+    place = f"{prog_id}, {entry.get('part')}" if prog_id else entry.get("part")
+    return f"{entry.get('kind')} {entry.get('number')} ({place})"
+
+
+def describe_part_object(entry: Entry, _: int) -> str:
+    sources = []
+    if "sha256" in entry:
+        sha = entry["sha256"]
+        sources.append("with a missing part" if sha is None else f"sha256 {sha[:12]}")
+    if "target" in entry:
+        sources.append(f"linked to {one_spaced(entry['target'])}")
+    return f"{part_label(entry)}: {', '.join(sources) or 'no source'}"
+
+
+def change_part_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
+    """Word a content change of one chart, diagram, embedded object or imported chunk.
+
+    Only a hash change between two present parts is an edit; anything else falls back to removed/added.
+    """
+    if None in (old.get("sha256"), new.get("sha256")) or not only_differs(old, new, "sha256", "number"):
+        return None
+    return f"~ {part_label(new)} changed"
 
 
 def change_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
@@ -549,6 +591,10 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
     old_tracked = [e for e in old_review if e.get("kind") != "comment"]
     new_tracked = [e for e in new_review if e.get("kind") != "comment"]
     old_warnings, new_warnings = a.get("warnings", []), b.get("warnings", [])
+    # Both object sections can be unchanged while their entries moved past each other, e.g. a
+    # block-level equation (no prose) moved across a chart: never report "no changes" then.
+    objects_moved = (a.get("objects", []) != b.get("objects", [])
+                     and all(objects_of(a, kind) == objects_of(b, kind) for kind in (True, False)))
     found = [
         notice("Comments", comments_section(old_comments, new_comments), old_comments != new_comments),
         notice("Tracked changes", entries_section(old_tracked, new_tracked, describe_tracked),
@@ -561,9 +607,15 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
         notice("Images", entries_section(a.get("images", []), b.get("images", []), describe_image, change_image),
                a.get("images") != b.get("images")),
         notice("Equations and symbols",
-               entries_section(numbered_objects(a.get("objects", [])), numbered_objects(b.get("objects", [])),
+               entries_section(numbered_objects(objects_of(a, True)), numbered_objects(objects_of(b, True)),
                                describe_object, change_object, unnumbered),
-               a.get("objects", []) != b.get("objects", [])),
+               objects_of(a, True) != objects_of(b, True)),
+        notice("Charts, diagrams and embedded objects",
+               entries_section(numbered_objects(objects_of(a, False)), numbered_objects(objects_of(b, False)),
+                               describe_part_object, change_part_object, unnumbered),
+               objects_of(a, False) != objects_of(b, False)),
+        Section("Objects", ["equations or symbols moved relative to charts, diagrams or embedded objects"],
+                inline=True) if objects_moved else None,
         notice("Lists", entries_section(a.get("lists", []), b.get("lists", []), describe_list, change_list)
                + entries_section(a.get("list_runs", []), b.get("list_runs", []), describe_run, change_run),
                (a.get("lists"), a.get("list_runs")) != (b.get("lists"), b.get("list_runs"))),

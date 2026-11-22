@@ -23,7 +23,8 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
 | Images | Placeholders (e.g. `[Unsupported drawing]`, `[Unsupported pict]`) in prose, as for other drawings; every DrawingML (`a:blip`, including its SVG copy) and legacy VML (`v:imagedata`) image in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 and size of its media part (external links by target, never fetched), so swapping, adding, removing, or reordering images makes companions stale; renamed media parts with identical bytes do not; size, position, cropping, alt text, and images in comments are not compared and trigger one coverage warning; a missing image relationship or media part is recorded without a hash and warns |
 | Equations and symbols | Placeholders (`[Unsupported oMath]`, `[Unsupported oMathPara]`, `[Unsupported sym]`) and omission warnings in prose; each outermost OMML equation (`m:oMathPara`, or an `m:oMath` outside one) and each `w:sym` in the body, headers/footers, notes, and text boxes is recorded in metadata, so editing, adding, removing, or reordering one makes companions stale; an equation is recorded by the SHA-256 of a canonical form of its accepted view (tracked deletions dropped, insertions kept; run formatting `w:rPr`, control formatting `m:ctrlPr`, `rsid*`/`w14:paraId`/`w14:textId` attributes, proofing marks, bookmarks, and comment markers left out; `m:t` text and the other `m:*Pr` structure kept), so the fingerprint covers OMML structure and text, not how Word draws it, and a formatting-only re-save stays fresh; a symbol is recorded by its font and character code; equations inside tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images |
-| Drawings, charts, embedded objects | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or asset-content comparison (including the preview images of embedded objects) |
+| Charts, SmartArt, embedded objects, imported chunks | Placeholders (`[Unsupported drawing]`, `[Unsupported object]`, `[Unsupported altChunk]`) and omission warnings in prose; each DrawingML chart (`c:chart`), SmartArt diagram (`dgm:relIds`), OLE object (`o:OLEObject`) and imported chunk (`w:altChunk`) in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 of the raw bytes of the part it points to (the chart part, which holds the cached values a reader sees; the diagram's data part, `r:dm`; the embedding; the chunk), so editing, adding, removing, or reordering one makes companions stale; renaming a part with identical bytes does not; the fingerprint covers the stored part, not how Word draws it, so a Word re-save that rewrites the part without a visible edit also makes companions stale; a chart's embedded workbook, a diagram's layout, quick-style, and colour parts, and the preview images of embedded objects are not compared and keep their unrendered-part warnings; a linked OLE object (external relationship) is recorded by target and never fetched; a missing relationship or part is recorded without a hash and warns; objects in tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images, so an Office 2016 chart (`cx:chart`, e.g. waterfall or sunburst) whose compatibility copy is a text box is not recorded and its part keeps its unrendered-part warning; a part that cannot be read (e.g. corrupt compressed data) fails the export, as for images |
+| Drawings | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or text extraction from charts, diagrams, or embedded objects |
 | Bold/italic, fonts, colors, other styles, pagination/layout | Not compared; always disclosed in coverage warning |
 
 Tracked text inclusion is an **accept-insertions/omit-deletions view**, not Word's
@@ -48,7 +49,7 @@ No claim of a complete/unchanged document is made. This is a modest coverage rep
 not an audit of every OOXML relationship or layout semantic.
 
 Metadata contains only schema/view/coverage, warnings, review text/authors, link
-destinations, field fingerprints, list formats, image hashes, and equation and symbol fingerprints. `lists` has one entry per
+destinations, field fingerprints, list formats, image hashes, and equation, symbol, and object part fingerprints. `lists` has one entry per
 list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
 Word's `numId`, which can change on save), with the part where it is first used
 and the format, level text, and start value of each level its items use.
@@ -62,11 +63,16 @@ part (internal) or `target` (external link); a dangling reference has a null
 `sha256`. Media file names are not recorded because Word renumbers them on save,
 so order plus hash is the comparison, and re-encoded images are a real change.
 The chosen `mc:AlternateContent` copy is read once: the text box branch, else
-the first `mc:Choice`. `objects` lists equations and symbols in traversal order, each
-with its story `part`: `{"kind": "equation", "sha256": …}` (the canonical
-accepted-view hash above) or `{"kind": "symbol", "font": …, "char": …}` (`w:font`
-and `w:char`, uppercased). The key is present only when the list is non-empty,
-so documents without equations or symbols keep the metadata they had. Field fingerprints avoid huge Zotero JSON
+the first `mc:Choice`. `objects` lists equations, symbols, charts, diagrams,
+embedded objects, and imported chunks in one traversal order, each with its story
+`part`: `{"kind": "equation", "sha256": …}` (the canonical accepted-view hash
+above), `{"kind": "symbol", "font": …, "char": …}` (`w:font` and `w:char`,
+uppercased), or `{"kind": "chart" | "diagram" | "embedded object" | "imported
+chunk", "sha256": …}` (the raw bytes of the part it points to; an embedded object
+also records its `prog_id`, and a linked one `target` instead of `sha256`; a
+dangling reference has a null `sha256`). Part names are not recorded, as for
+images. The key is present only when the list is non-empty, so documents without
+any of these keep the metadata they had. Field fingerprints avoid huge Zotero JSON
 payloads but only say a normalized code changed, not what that change means.
 Arrays follow document traversal order; related parts and warnings sort
 lexically. Internal part paths come from the package; no machine paths, save
@@ -100,6 +106,14 @@ Equations and symbols are numbered by kind (equation 1, 2, … and symbol 1, 2, 
 an equation at the same position of an aligned block is worded as changed, and a
 symbol as its old and new character and font. Only an equation's fingerprint is
 recorded, so the report cannot say what changed inside it: inspect it in Word.
+Charts, diagrams, embedded objects, and imported chunks have their own section,
+numbered by kind the same way; one at the same position whose part's hash changed
+is worded as changed (`~ chart 1 (word/document.xml) changed`, with an embedded
+object's ProgID before the part); a part that goes missing or appears, or a link
+whose target changes, is listed as removed and added. An equation or symbol that only
+moved past a chart, diagram, embedded object, or imported chunk (for example a
+block-level equation, which has no prose) is reported as `Objects: equations or
+symbols moved relative to charts, diagrams or embedded objects`.
 Long texts are shortened to 80 characters for display.
 
 ## Normalization and sentence lines

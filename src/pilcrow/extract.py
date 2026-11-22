@@ -40,6 +40,12 @@ BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 SVG_BLIP = "{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip"
 IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
 O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
+# Objects whose content lives in a package part: a DrawingML chart, a SmartArt diagram's
+# data part (r:dm; its layout, quick-style and colour parts are formatting), and an OLE
+# object. w:altChunk is the fourth, an imported chunk.
+CHART = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
+DIAGRAM = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}relIds"
+OLE_OBJECT = "{urn:schemas-microsoft-com:office:office}OLEObject"
 # Shape content that a rendered text box still leaves out of the prose.
 UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
 TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
@@ -51,6 +57,8 @@ UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numb
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
+MISSING_OBJECT_NOTE = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
+                       "or point to missing parts; those objects are recorded without a hash.")
 COMMENT_NOTE = ("Comment text, authors, anchored text, replies, and resolved state are recorded; "
                 "dates and rich formatting are not compared.")
 UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part; "
@@ -191,11 +199,12 @@ class Reader:
         self.lists: dict[str, dict[str, Any]] = {}
         # Which list each list item belongs to, run-length encoded in traversal order.
         self.list_runs: list[dict[str, Any]] = []
-        # Image references in traversal order, and hashed media part -> (sha256, size).
+        # Image references in traversal order, and hashed part (media, or the part a chart,
+        # diagram, embedded object or imported chunk points to) -> (sha256, size).
         self.images: list[dict[str, Any]] = []
         self.media: dict[str, tuple[str, int]] = {}
-        # Equation and symbol fingerprints in traversal order.
-        self.objects: list[dict[str, str]] = []
+        # Equation, symbol and object part fingerprints in traversal order.
+        self.objects: list[dict[str, str | None]] = []
         # Inside an unselected mc:AlternateContent copy whose prose is still read.
         self.unselected = 0
         self.field_stack: list[list[str]] = []
@@ -378,12 +387,12 @@ class Reader:
             self.warn(IMAGE_NOTE)
 
     def object_nodes(self, node: Element) -> Iterator[Element]:
-        """Outermost equations and w:sym elements in ``node``, in document order.
+        """Outermost equations, w:sym, charts, diagrams, OLE objects and alt chunks in ``node``, in document order.
 
         Like ``image_refs``: text box content is read when the box renders, only one
         copy of an mc:AlternateContent is read, and tracked deletions are skipped.
         """
-        if node.tag in EQUATIONS or node.tag == w("sym"):
+        if node.tag in EQUATIONS or node.tag in {w("sym"), w("altChunk"), CHART, DIAGRAM, OLE_OBJECT}:
             yield node
             return
         if node.tag in {w("txbxContent"), w("del"), w("moveFrom")}:
@@ -397,15 +406,44 @@ class Reader:
             yield from self.object_nodes(child)
 
     def record_objects(self, node: Element) -> None:
-        """Fingerprint each equation (accepted-view hash) and symbol (font and character) in ``node``."""
+        """Fingerprint each object in ``node``: an equation by its accepted-view hash, a symbol by
+        font and character, and a chart, diagram, embedded object or imported chunk by its part."""
         if self.unselected:
             return
         for found in self.object_nodes(node):
             if found.tag == w("sym"):
                 self.objects.append({"kind": "symbol", "part": self.part, "font": attr(found, "font"),
                                      "char": attr(found, "char").upper()})
+            elif found.tag == CHART:
+                self.objects.append(self.object_part("chart", found.get(f"{{{R}}}id")))
+            elif found.tag == DIAGRAM:
+                self.objects.append(self.object_part("diagram", found.get(f"{{{R}}}dm")))
+            elif found.tag == OLE_OBJECT:
+                entry = self.object_part("embedded object", found.get(f"{{{R}}}id"))
+                entry["prog_id"] = found.get("ProgID", "")
+                self.objects.append(entry)
+            elif found.tag == w("altChunk"):
+                self.objects.append(self.object_part("imported chunk", found.get(f"{{{R}}}id")))
             else:
                 self.objects.append({"kind": "equation", "part": self.part, "sha256": equation_hash(found)})
+
+    def object_part(self, kind: str, rid: str | None) -> dict[str, str | None]:
+        """An object entry with the hash of the part ``rid`` points to, or its target if external.
+
+        Part names are not recorded, so renaming a part with the same content is no change.
+        """
+        entry: dict[str, str | None] = {"kind": kind, "part": self.part}
+        rel = self.rels.get(rid) if rid else None
+        if rel is not None and rel[2]:
+            entry["target"] = rel[1]  # never fetched, like linked images
+        elif rel is not None and rel[1] in self.names:
+            if rel[1] not in self.media:
+                self.media[rel[1]] = self.hash_part(rel[1])
+            entry["sha256"] = self.media[rel[1]][0]
+        else:
+            self.warn(MISSING_OBJECT_NOTE)
+            entry["sha256"] = None
+        return entry
 
     def emit(self, text: str, anchored: str | None = None) -> str:
         """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
@@ -529,7 +567,7 @@ class Reader:
             return "".join(self.inline(child) for child in branch)
         if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
             self.record_images(node)
-        if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent", w("sym")} or tag in EQUATIONS:
+        if tag in {w("drawing"), w("pict"), w("object"), w("altChunk"), f"{{{MC}}}AlternateContent", w("sym")} or tag in EQUATIONS:
             self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
@@ -931,7 +969,7 @@ class Reader:
                               for entry in self.lists.values()],
                     "list_runs": self.list_runs, "images": self.images}
         if self.objects:
-            # Only when present, so documents without equations or symbols keep their companions.
+            # Only when present, so documents without any of these objects keep their companions.
             metadata["objects"] = self.objects
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
