@@ -32,6 +32,7 @@ try:
         checkbox,
         comments_extended,
         comments_part,
+        described_picture,
         dropdown,
         end,
         equation,
@@ -49,6 +50,7 @@ try:
         run,
         start,
         symbol,
+        vml_wordart,
     )
     from .test_textconv import tree
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
@@ -67,6 +69,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         checkbox,
         comments_extended,
         comments_part,
+        described_picture,
         dropdown,
         end,
         equation,
@@ -84,6 +87,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         run,
         start,
         symbol,
+        vml_wordart,
     )
     from test_textconv import tree  # type: ignore[no-redef]
 
@@ -526,6 +530,67 @@ class ReviewTests(unittest.TestCase):
         (line,) = self.section(self.review(), "Images")
         self.assertRegex(line, r"^\+ added image 1 \(word/document\.xml\): 14 bytes, sha256 [0-9a-f]{12}, "
                                r"linked to https://example\.invalid/b\.png$")
+
+    def write_alt(self, path: Path, descr: str | None, *, title: str | None = None, data: str = "picture") -> None:
+        make_docx(path, anchored("Figure:", described_picture("rId5", descr, title=title)),
+                  extra={"word/media/image1.png": data}, relationships=image_rel("rId5", "media/image1.png"))
+
+    def test_alt_text_changes(self) -> None:
+        self.write_alt(self.old, "A red cat")
+        self.write_alt(self.new, "A blue dog")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Images"),
+                         ['~ image 1 (word/document.xml) alt text: "A red cat" → "A blue dog"'])
+        self.write_alt(self.new, None)
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) alt text: "A red cat" → (none)'])
+        self.write_alt(self.old, None)
+        self.write_alt(self.new, "A red cat", title="Cat")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) alt text: (none) → "A red cat"; alt title: (none) → "Cat"'])
+        self.write_alt(self.old, "A red cat", data="first")
+        self.write_alt(self.new, "A blue dog", data="second")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) replaced; alt text: "A red cat" → "A blue dog"'])
+        self.write_alt(self.new, "A red cat", data="first")
+        self.assertNotIn("Images", self.review(code=0))
+        # An added or removed image shows its alt text.
+        make_docx(self.old, paragraph("Figure:"))
+        self.write_alt(self.new, "A red cat", title="Cat")
+        (line,) = self.section(self.review(), "Images")
+        self.assertRegex(line, r'^\+ added image 1 \(word/document\.xml\): 7 bytes, sha256 [0-9a-f]{12}, '
+                               r'alt text "A red cat", alt title "Cat"$')
+
+    def test_alt_text_stays_on_one_line_and_is_escaped_in_markdown(self) -> None:
+        self.write_alt(self.old, "A *red* cat\n+ added image 9")
+        self.write_alt(self.new, "[A dog](https://example.invalid) <b>")
+        line = '~ image 1 (word/document.xml) alt text: "A *red* cat + added image 9" → "[A dog](https://example.invalid) <b>"'
+        self.assertEqual(self.section(self.review(), "Images"), [line])
+        self.assertIn('- `~` image 1 (word/document.xml) alt text\\: "A \\*red\\* cat + added image 9" → '
+                      '"\\[A dog\\](https\\://example.invalid) &lt;b&gt;"\n', self.markdown())
+
+    def test_wordart_changes(self) -> None:
+        title = "Charts, diagrams and embedded objects"
+
+        def write(path: Path, *texts: str) -> None:
+            make_docx(path, "".join(f"<w:p><w:r>{vml_wordart(t)}</w:r></w:p>" for t in texts))
+
+        write(self.old, "SALE")
+        write(self.new, "CLOSED")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, title), ['~ WordArt 1 (word/document.xml): "SALE" → "CLOSED"'])
+        self.assertIn(f'### {title}\n\n- `~` WordArt 1 (word/document.xml)\\: "SALE" → "CLOSED"\n', self.markdown())
+        write(self.new, "SALE", "OPEN")
+        self.assertEqual(self.section(self.review(), title), ['+ added WordArt 2 (word/document.xml): "OPEN"'])
+        write(self.new)
+        self.assertEqual(self.section(self.review(), title), ['- removed WordArt 1 (word/document.xml): "SALE"'])
+        # Document text in the report stays on one line and renders literally in Markdown.
+        write(self.new, "*SALE*\n+ added chart 1")
+        self.assertEqual(self.section(self.review(), title),
+                         ['~ WordArt 1 (word/document.xml): "SALE" → "*SALE* + added chart 1"'])
+        self.assertIn('- `~` WordArt 1 (word/document.xml)\\: "SALE" → "\\*SALE\\* + added chart 1"\n', self.markdown())
 
     def test_equation_and_symbol_edits(self) -> None:
         def write(path: Path, math: str = "E=mc2", char: str = "F061", font: str = "Symbol") -> None:

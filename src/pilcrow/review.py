@@ -432,6 +432,10 @@ def change_field(old: Entry, new: Entry, _: int, j: int) -> str | None:
     return None
 
 
+# Alt text metadata keys and how the review names them.
+ALT_TEXT = (("alt", "alt text"), ("alt_title", "alt title"))
+
+
 def describe_image(entry: Entry, position: int) -> str:
     # An image can hold both an embedded copy (sha256/bytes) and an external link (target).
     sources = []
@@ -440,11 +444,18 @@ def describe_image(entry: Entry, position: int) -> str:
         sources.append("with a missing media part" if sha is None else f"{entry.get('bytes')} bytes, sha256 {sha[:12]}")
     if "target" in entry:
         sources.append(f"linked to {entry['target']}")
-    return f"image {position + 1} ({entry.get('part')}): {', '.join(sources) or 'no source'}"
+    labels = [f"{name} {short(entry[key])}" for key, name in ALT_TEXT if entry.get(key)]
+    return f"image {position + 1} ({entry.get('part')}): {', '.join(sources) or 'no source'}" + "".join(
+        f", {label}" for label in labels)
+
+
+def alt_value(entry: Entry, key: str) -> str:
+    value = entry.get(key)
+    return short(value) if value else "(none)"
 
 
 def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
-    """Word a hash or link change of one image; anything else falls back to removed/added."""
+    """Word a hash, link or alt text change of one image; anything else falls back to removed/added."""
     if old.get("part") != new.get("part") or ("sha256" in old) != ("sha256" in new):
         return None
     details = []
@@ -454,11 +465,13 @@ def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
         details.append("replaced")
     if old.get("target") != new.get("target"):
         details.append(f"link changed: {old.get('target') or '(none)'} → {new.get('target') or '(none)'}")
+    details += [f"{name}: {alt_value(old, key)} → {alt_value(new, key)}"
+                for key, name in ALT_TEXT if old.get(key) != new.get(key)]
     return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details) if details else None
 
 
 # Object kinds shown under "Equations and symbols"; every other kind (chart, diagram,
-# embedded object, imported chunk) is shown under "Charts, diagrams and embedded objects".
+# embedded object, imported chunk, WordArt) is shown under "Charts, diagrams and embedded objects".
 FORMULA_KINDS = frozenset({"equation", "symbol"})
 
 
@@ -509,6 +522,8 @@ def part_label(entry: Entry) -> str:
 
 
 def describe_part_object(entry: Entry, _: int) -> str:
+    if entry.get("kind") == "WordArt":
+        return f"{part_label(entry)}: {short(entry.get('text'))}"
     sources = []
     if "sha256" in entry:
         sha = entry["sha256"]
@@ -521,8 +536,11 @@ def describe_part_object(entry: Entry, _: int) -> str:
 def change_part_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
     """Word a content change of one chart, diagram, embedded object or imported chunk.
 
-    Only a hash change between two present parts is an edit; anything else falls back to removed/added.
+    Only a hash change between two present parts, or a WordArt text change, is an edit;
+    anything else falls back to removed/added.
     """
+    if old.get("kind") == new.get("kind") == "WordArt" and only_differs(old, new, "text", "number"):
+        return f"~ {part_label(new)}: {short(old.get('text'))} → {short(new.get('text'))}"
     if None in (old.get("sha256"), new.get("sha256")) or not only_differs(old, new, "sha256", "number"):
         return None
     return f"~ {part_label(new)} changed"

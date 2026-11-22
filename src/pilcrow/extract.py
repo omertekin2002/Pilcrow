@@ -38,8 +38,20 @@ NS = {"w": W}
 # Word stores in a blip's extension list, and legacy VML image data.
 BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 SVG_BLIP = "{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip"
-IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+VML = "urn:schemas-microsoft-com:vml"
+IMAGEDATA = f"{{{VML}}}imagedata"
 O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
+# Where an image's alt text lives: the drawing's wp:docPr, else the picture's own pic:cNvPr,
+# and a VML shape's alt attribute. A group's wp:docPr describes the group, not its members.
+WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+DRAWINGS = frozenset({f"{{{WP}}}inline", f"{{{WP}}}anchor"})
+PICTURE = f"{{{PIC}}}pic"
+GROUPS = frozenset({"{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}wgp",
+                    "{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}grpSp",
+                    f"{{{VML}}}group"})
+# Legacy VML WordArt: the text a v:shape draws along its path.
+TEXTPATH = f"{{{VML}}}textpath"
 # Objects whose content lives in a package part: a DrawingML chart, a SmartArt diagram's
 # data part (r:dm; its layout, quick-style and colour parts are formatting), and an OLE
 # object. w:altChunk is the fourth, an imported chunk.
@@ -55,6 +67,8 @@ LIST_NOTE = ("List boundaries and indentation are retained; bullet and number fo
 UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
                      "list or level, or style-linked numbering); they are recorded as unknown.")
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+# Replaces IMAGE_NOTE only when an image has alt text, so other documents keep their companions.
+IMAGE_ALT_NOTE = "Images are compared by content hash and alt text; size, position, and cropping are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
 MISSING_OBJECT_NOTE = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
@@ -173,6 +187,31 @@ def number_id(value: str) -> str:
     """One spelling per numbering ID, so "1", "+1" and "01" name the same definition."""
     number = decimal(value)
     return value if number is None else str(number)
+
+
+# An image's (alt text, alt title), each whitespace-normalised and "" when absent.
+AltText: TypeAlias = tuple[str, str]
+
+
+def alt_text(node: Element, inherited: AltText) -> AltText:
+    """The alt text images inside ``node`` have, given what its ancestors set.
+
+    A drawing's wp:docPr comes first, then the picture's own pic:cNvPr; a VML shape's
+    alt attribute; group members only have their own.
+    """
+    if node.tag in DRAWINGS:
+        props = node.find(f"{{{WP}}}docPr")
+        return ("", "") if props is None else (normalize(props.get("descr", "")), normalize(props.get("title", "")))
+    if node.tag in GROUPS:
+        return "", ""
+    if node.tag == PICTURE:
+        props = node.find(f"{{{PIC}}}nvPicPr/{{{PIC}}}cNvPr")
+        if props is None:
+            return inherited
+        return (inherited[0] or normalize(props.get("descr", "")), inherited[1] or normalize(props.get("title", "")))
+    if node.tag.startswith(f"{{{VML}}}") and "alt" in node.attrib:
+        return normalize(node.get("alt", "")), ""
+    return inherited
 
 
 class DocumentError(ValueError):
@@ -347,8 +386,8 @@ class Reader:
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
                 or any(self.unrendered_shape_parts(child) for child in node))
 
-    def image_refs(self, node: Element) -> Iterator[list[str | None]]:
-        """Relationship IDs of each image in ``node``, in document order.
+    def image_refs(self, node: Element, alt: AltText = ("", "")) -> Iterator[tuple[list[str | None], AltText]]:
+        """Relationship IDs and alt text of each image in ``node``, in document order.
 
         Text box content is skipped (it is read when the box renders), and only one
         copy of an mc:AlternateContent is read: the text box branch, else the first
@@ -359,14 +398,15 @@ class Reader:
         if node.tag == f"{{{MC}}}AlternateContent":
             branch = self.image_branch(node)
             if branch is not None:
-                yield from self.image_refs(branch)
+                yield from self.image_refs(branch, alt)
             return
+        alt = alt_text(node, alt)
         if node.tag in {BLIP, SVG_BLIP}:
-            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")]
+            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")], alt
         elif node.tag == IMAGEDATA:
-            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)]
+            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)], alt
         for child in node:
-            yield from self.image_refs(child)
+            yield from self.image_refs(child, alt)
 
     def image_branch(self, alternate: Element) -> Element | None:
         """The one copy of an mc:AlternateContent whose images are recorded."""
@@ -376,10 +416,10 @@ class Reader:
         return branch
 
     def record_images(self, node: Element) -> None:
-        """Record each image in ``node`` by content hash (internal) or target (external)."""
+        """Record each image in ``node`` by content hash (internal) or target (external), and its alt text."""
         if self.unselected:
             return
-        for ids in self.image_refs(node):
+        for ids, (description, title) in self.image_refs(node):
             entry: dict[str, Any] = {"part": self.part}
             for rid in filter(None, ids):
                 rel = self.rels.get(rid)
@@ -395,17 +435,25 @@ class Reader:
             if len(entry) == 1:  # no relationship ID at all
                 self.warn(MISSING_IMAGE_NOTE)
                 entry["sha256"] = None
+            # Only when present, so documents without alt text keep their companions.
+            if description:
+                entry["alt"] = description
+            if title:
+                entry["alt_title"] = title
             self.images.append(entry)
             self.warn(IMAGE_NOTE)
 
     def object_nodes(self, node: Element) -> Iterator[Element]:
-        """Outermost equations, w:sym, charts, diagrams, OLE objects and alt chunks in ``node``, in document order.
+        """Outermost equations, w:sym, charts, diagrams, OLE objects, alt chunks and VML WordArt in ``node``, in document order.
 
         Like ``image_refs``: text box content is read when the box renders, only one
         copy of an mc:AlternateContent is read, and tracked deletions are skipped.
         """
         if node.tag in EQUATIONS or node.tag in {w("sym"), w("altChunk"), CHART, DIAGRAM, OLE_OBJECT}:
             yield node
+            return
+        if node.tag == TEXTPATH and normalize(node.get("string", "")):
+            yield node  # WordArt; a v:textpath without text (e.g. in a v:shapetype) is only a style
             return
         if node.tag in {w("txbxContent"), w("del"), w("moveFrom")}:
             return
@@ -419,7 +467,8 @@ class Reader:
 
     def record_objects(self, node: Element) -> None:
         """Fingerprint each object in ``node``: an equation by its accepted-view hash, a symbol by
-        font and character, and a chart, diagram, embedded object or imported chunk by its part."""
+        font and character, a chart, diagram, embedded object or imported chunk by its part, and
+        VML WordArt by its text."""
         if self.unselected:
             return
         for found in self.object_nodes(node):
@@ -436,6 +485,8 @@ class Reader:
                 self.objects.append(entry)
             elif found.tag == w("altChunk"):
                 self.objects.append(self.object_part("imported chunk", found.get(f"{{{R}}}id")))
+            elif found.tag == TEXTPATH:
+                self.objects.append({"kind": "WordArt", "part": self.part, "text": normalize(found.get("string", ""))})
             else:
                 self.objects.append({"kind": "equation", "part": self.part, "sha256": equation_hash(found)})
 
@@ -1022,6 +1073,9 @@ class Reader:
             self.warn("Footnote references have no related footnotes part.")
         if self.features["endnote references"] and not any(k == "endnotes" for k, _ in stories):
             self.warn("Endnote references have no related endnotes part.")
+        if any("alt" in image or "alt_title" in image for image in self.images):
+            self.warnings.discard(IMAGE_NOTE)
+            self.warn(IMAGE_ALT_NOTE)
         metadata = {"schema": 1, "view": "accept-insertions-omit-deletions",
                     "coverage": "partial-prose", "warnings": sorted(self.warnings),
                     "review": self.review, "hyperlinks": self.links, "fields": self.fields,
