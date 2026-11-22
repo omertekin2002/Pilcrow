@@ -151,6 +151,35 @@ def vml_picture(rid: str) -> str:
     return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
 
 
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+
+def math_run(text: str) -> str:
+    return f"<m:r><m:t>{escape(text)}</m:t></m:r>"
+
+
+def equation(content: str = "E=mc2", *, para: bool = False) -> str:
+    """An OMML equation (m:oMath, or m:oMathPara around one); a plain string is one math run."""
+    inner = content if content.startswith("<") else math_run(content)
+    math = f'<m:oMath xmlns:m="{M}">{inner}</m:oMath>'
+    return f'<m:oMathPara xmlns:m="{M}">{math}</m:oMathPara>' if para else math
+
+
+def symbol(char: str = "F061", font: str = "Symbol") -> str:
+    return f'<w:r><w:sym w:font="{font}" w:char="{char}"/></w:r>'
+
+
+def equation_entry(form: list[Any], part: str = "word/document.xml") -> dict[str, Any]:
+    """The objects entry for an equation whose canonical form is ``form``."""
+    data = json.dumps(form, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {"kind": "equation", "part": part, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def simple_form(text: str = "E=mc2") -> list[Any]:
+    """The canonical form of ``equation(text)``."""
+    return [f"{{{M}}}oMath", [], "", [[f"{{{M}}}r", [], "", [[f"{{{M}}}t", [], text, []]]]]]
+
+
 def image_rel(rid: str, target: str, *, external: bool = False) -> str:
     mode = ' TargetMode="External"' if external else ""
     return f'<Relationship Id="{rid}" Type="{R}/image" Target="{target}"{mode}/>'
@@ -1386,6 +1415,146 @@ class CLITests(unittest.TestCase):
         self.assertNotIn(IMAGE_NOTE, meta["warnings"])
         prose, meta, stderr = self.export_images(paragraph("Plain prose."))
         self.assertEqual(meta["images"], [])
+
+    def export_objects(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        make_docx(self.root / "essay.docx", body, **options)
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        return prose.decode("utf-8"), json.loads(meta)
+
+    def test_equation_and_symbol_edits_make_check_stale_without_changing_prose(self) -> None:
+        def body(math: str = "E=mc2", char: str = "F061", font: str = "Symbol") -> str:
+            return f'<w:p>{run("Energy: ")}{equation(math)}{run(" and ")}{symbol(char, font)}</w:p>'
+
+        prose, meta = self.export_objects(body())
+        self.assertEqual(prose, "Energy: [Unsupported oMath] and [Unsupported sym]\n")
+        self.assertEqual(meta["objects"], [
+            equation_entry(simple_form()),
+            {"kind": "symbol", "part": "word/document.xml", "font": "Symbol", "char": "F061"},
+        ])
+        self.assertIn("Unsupported oMath: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        self.assertIn("Unsupported sym: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        companions = self.exported()
+        # Exporting the same document again gives byte-identical companions.
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), companions)
+        for changed in (body("E=mc3"), body(char="F062"), body(font="Wingdings")):
+            make_docx(self.root / "essay.docx", changed)
+            result = self.cli("check", "essay.docx", code=1)
+            self.assertIn("STALE", result.stdout + result.stderr)
+        # w:char is a hex number: its letter case is not a change.
+        make_docx(self.root / "essay.docx", body(char="f061"))
+        self.cli("check", "essay.docx")
+        make_docx(self.root / "essay.docx", body("E=mc3"))
+        self.cli("export", "essay.docx")
+        self.cli("check", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], companions[0], "equation edits must not alter the prose")
+        self.assertEqual(json.loads(after[1])["objects"][0], equation_entry(simple_form("E=mc3")))
+
+    def test_documents_without_equations_or_symbols_have_no_objects_key(self) -> None:
+        _, meta = self.export_objects(paragraph("Plain prose."))
+        self.assertNotIn("objects", meta)
+        # A tracked deletion is not in the accepted view: its equation and symbol are not recorded.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{equation()}</w:r>{symbol()}</w:del></w:p>'
+        _, meta = self.export_objects(deleted)
+        self.assertNotIn("objects", meta)
+        inserted = f'<w:p>{run("Kept.")}<w:ins w:id="1" w:author="Ada">{equation()}{symbol()}</w:ins></w:p>'
+        _, meta = self.export_objects(inserted)
+        self.assertEqual([entry["kind"] for entry in meta["objects"]], ["equation", "symbol"])
+
+    def test_equations_in_notes_headers_and_text_boxes_are_recorded_by_part(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p>{equation("h")}</w:p></w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'<w:p>{equation("f")}</w:p></w:footnote></w:footnotes>')
+        boxed = f'<w:p>{equation("t")}</w:p>'
+        # An equation paragraph: one entry for the m:oMathPara, not one per m:oMath inside it.
+        display = (f'<m:oMathPara xmlns:m="{M}"><m:oMath>{math_run("a")}</m:oMath>'
+                   f'<m:oMath>{math_run("b")}</m:oMath></m:oMathPara>')
+        body = (f'<w:p>{equation("b")}</w:p>' + anchored("Box:", modern_text_box(boxed)) + f"<w:p>{display}</w:p>"
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        _, meta = self.export_objects(body, extra={"word/header1.xml": header, "word/footnotes.xml": footnotes},
+                                      relationships=relationships)
+        para_form = [f"{{{M}}}oMathPara", [], "", [simple_form("a"), simple_form("b")]]
+        self.assertEqual(meta["objects"], [
+            equation_entry(simple_form("b")), equation_entry(simple_form("t")), equation_entry(para_form),
+            equation_entry(simple_form("f"), "word/footnotes.xml"),
+            equation_entry(simple_form("h"), "word/header1.xml"),
+        ])
+
+    def test_equation_fingerprint_is_the_accepted_view_without_formatting(self) -> None:
+        def write(inner: str) -> None:
+            make_docx(self.root / "essay.docx", f"<w:p>{equation(inner)}</w:p>")
+
+        base = (f'<m:sSup><m:e>{math_run("E")}</m:e><m:sup>{math_run("2")}</m:sup></m:sSup>'
+                f'<m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr><m:sub/><m:sup/><m:e>{math_run("x")}</m:e></m:nary>')
+        write(base)
+        self.cli("export", "essay.docx")
+        fresh = [
+            # Run and control character formatting, revision IDs, proofing marks, bookmarks, comment markers.
+            base.replace("<m:r>", '<m:r><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/><w:i/></w:rPr>'),
+            base.replace("<m:naryPr>", '<m:naryPr><m:ctrlPr><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr></m:ctrlPr>'),
+            base.replace("<m:r>", '<m:r w:rsidR="00A1B2C3" w:rsidRPr="00D4E5F6">'),
+            base.replace("<m:sSup>", '<w:proofErr w:type="spellStart"/><w:bookmarkStart w:id="0" w:name="_Ref1"/><m:sSup>')
+            .replace("</m:nary>", '</m:nary><w:bookmarkEnd w:id="0"/><w:proofErr w:type="spellEnd"/>'),
+            base.replace("<m:sSup>", '<w:commentRangeStart w:id="3"/><m:sSup>')
+            .replace("</m:sSup>", '</m:sSup><w:commentRangeEnd w:id="3"/><w:commentReference w:id="3"/>'),
+            # A tracked deletion is not in the accepted view.
+            base + f'<w:del w:id="9" w:author="Ada" w:date="2026-01-01T00:00:00Z">{math_run("+1")}</w:del>',
+            # A tracked insertion of the same content is the same accepted view.
+            base.replace(math_run("x"), f'<w:ins w:id="7" w:author="Ada">{math_run("x")}</w:ins>'),
+        ]
+        for variant in fresh:
+            with self.subTest(variant=variant):
+                write(variant)
+                self.cli("check", "essay.docx")
+        stale = [
+            base + f'<w:ins w:id="9" w:author="Ada">{math_run("+1")}</w:ins>',
+            base.replace(math_run("2"), math_run("3")),
+            base.replace(math_run("x"), math_run(" x")),  # m:t text is kept exactly
+            base.replace('m:val="∑"', 'm:val="∏"'),  # structure properties carry meaning
+            base.replace("<m:sSup>", "<m:sSub>").replace("</m:sSup>", "</m:sSub>").replace("m:sup>", "m:sub>", 2),
+        ]
+        for variant in stale:
+            with self.subTest(variant=variant):
+                write(variant)
+                self.cli("check", "essay.docx", code=1)
+
+    def test_block_level_equations_are_recorded(self) -> None:
+        # OOXML allows math directly in the body, a table cell, a block-level insertion, and a
+        # block-level compatibility copy; deleted block-level math is not in the accepted view.
+        cell = f"<w:tbl><w:tr><w:tc>{equation('c', para=True)}</w:tc></w:tr></w:tbl>"
+        inserted = f'<w:ins w:id="1" w:author="Ada">{equation("i", para=True)}</w:ins>'
+        deleted = f'<w:del w:id="2" w:author="Ada">{equation("d", para=True)}</w:del>'
+        compatible = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">{equation("m", para=True)}'
+                      f'</mc:Choice><mc:Fallback>{equation("f", para=True)}</mc:Fallback></mc:AlternateContent>')
+        body = paragraph("Before.") + equation("b", para=True) + cell + inserted + deleted + compatible
+
+        def para_entry(text: str) -> dict[str, Any]:
+            return equation_entry([f"{{{M}}}oMathPara", [], "", [simple_form(text)]])
+
+        prose, meta = self.export_objects(body)
+        self.assertEqual(meta["objects"], [para_entry(t) for t in "bcim"])
+        self.assertEqual(prose, "Before.\n\n[Table]\n\n[Row]\n\n[Cell]\n\n(empty)\n\n[/Row]\n\n[/Table]\n")
+        make_docx(self.root / "essay.docx", body.replace(equation("b", para=True), equation("B", para=True)))
+        self.cli("check", "essay.docx", code=1)
+
+    def test_compatibility_copies_record_one_equation(self) -> None:
+        inline = (f'<w:p>{run("Formula: ")}<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">'
+                  f'{equation(para=True)}</mc:Choice><mc:Fallback><w:r>{vml_picture("fallback")}</w:r></mc:Fallback>'
+                  "</mc:AlternateContent></w:p>")
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m"><w:p>{equation()}</w:p></mc:Choice>'
+                 f'<mc:Fallback>{anchored("", vml_picture("fallback"))}</mc:Fallback></mc:AlternateContent>')
+        media = {"word/media/fallback.png": "fallback bytes"}
+        para_form = [f"{{{M}}}oMathPara", [], "", [simple_form()]]
+        for body, form in ((inline, para_form), (block, simple_form())):
+            with self.subTest(body=body):
+                _, meta = self.export_objects(body, extra=media, relationships=image_rel("fallback", "media/fallback.png"))
+                self.assertEqual(meta["objects"], [equation_entry(form)])
+                self.assertEqual(meta["images"], [])
 
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")

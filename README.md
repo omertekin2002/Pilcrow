@@ -433,11 +433,13 @@ git difftool -y -x 'pilcrow review' HEAD~1 -- report.docx
 
 The report starts with a unified diff of the prose (the `.prose.md` text, capped
 at 2,000 lines), then one section per kind of review metadata that differs:
-comments, tracked changes, hyperlinks, fields, images, lists, and coverage
-warnings. Entries are matched by content, not by position, and described in
+comments, tracked changes, hyperlinks, fields, images, equations and symbols,
+lists, and coverage warnings. Entries are matched by content, not by position, and described in
 words, for example `~ resolved comment by Ada on "first sentence.": "Please
 clarify."`, `~ link "Report": https://old.example → https://new.example`, or
-`~ list 1 level 0: bullet → decimal`. A comment is called resolved, reopened,
+`~ list 1 level 0: bullet → decimal`. An edited equation reads `~ equation 1
+(word/document.xml) changed` and a changed symbol `~ symbol 1
+(word/document.xml): F061 (Symbol) → F062 (Symbol)`. A comment is called resolved, reopened,
 re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
@@ -547,6 +549,9 @@ box's position, wrapping, and shape formatting are not compared. Images, charts,
 equations, and embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
 companions stale (size, position, cropping, and alt text are not compared).
+Equations and Word symbols (`w:sym`) are recorded in metadata by a fingerprint of
+their OMML structure and text (formatting and revision IDs left out) and by font
+and character code, so editing, adding, or removing one makes companions stale.
 Comments stay out of the prose; their text, author, and anchored text (the
 accepted text their range covers, and the part it is in) are recorded in metadata,
 so editing a comment or moving, widening, or narrowing its range makes companions
@@ -590,6 +595,11 @@ companions once, because those sentences now stay on one line (see
 [Normalization and sentence lines](docs/limitations.md#normalization-and-sentence-lines)).
 Run `pilcrow export` and commit the refreshed companions. Other documents are
 unaffected.
+
+Upgrading from a version that did not record equations and symbols: documents
+containing an equation or a Word symbol report stale companions once, because
+`.meta.json` now has an `objects` key for them. Run `pilcrow export` and commit
+the refreshed companions. Documents without equations or symbols are unaffected.
 
 Run the generated-fixture suite:
 

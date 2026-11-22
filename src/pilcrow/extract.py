@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+# Office Math (OMML) equations.
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 # Word 2010 paragraph IDs and the Word 2012 comments-extended part (reply threads, resolved state).
 W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
 W15 = "http://schemas.microsoft.com/office/word/2012/wordml"
@@ -78,6 +80,44 @@ def w(name: str) -> str:
 
 
 COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
+EQUATIONS = frozenset({f"{{{M}}}oMathPara", f"{{{M}}}oMath"})
+# Markup an equation's fingerprint leaves out: deleted content, formatting, and markers whose
+# IDs Word renumbers on save. Proofing, bookmark, permission and move range markers carry no
+# content; comment markers are anchors, not equation content.
+EQUATION_DROPPED = frozenset({
+    w("del"), w("moveFrom"), w("rPr"), f"{{{M}}}ctrlPr", w("proofErr"), w("bookmarkStart"), w("bookmarkEnd"),
+    w("permStart"), w("permEnd"), w("moveFromRangeStart"), w("moveFromRangeEnd"), w("moveToRangeStart"),
+    w("moveToRangeEnd"), *COMMENT_MARKERS,
+})
+EQUATION_UNWRAPPED = frozenset({w("ins"), w("moveTo")})
+# Attributes that change on every save without changing the equation.
+EQUATION_IGNORED_ATTRIBUTES = frozenset({f"{{{W14}}}paraId", f"{{{W14}}}textId"})
+
+
+def equation_form(node: Element) -> list[Any]:
+    """The accepted view of an equation as nested lists: tag, sorted attributes, text, children.
+
+    Tracked deletions are dropped and insertions unwrapped; run formatting, control
+    character formatting, revision IDs and markers are left out, so a formatting-only
+    re-save keeps the same form. m:t text is kept exactly; other text is XML layout.
+    """
+    def children(parent: Element) -> Iterator[Element]:
+        for child in parent:
+            if child.tag in EQUATION_UNWRAPPED:
+                yield from children(child)
+            elif child.tag not in EQUATION_DROPPED:
+                yield child
+    attributes = sorted([key, value] for key, value in node.attrib.items()
+                        if key not in EQUATION_IGNORED_ATTRIBUTES
+                        and not key.rsplit("}", 1)[-1].startswith("rsid"))
+    value = node.text or ""
+    text = value if node.tag.rsplit("}", 1)[-1] == "t" else value.strip()
+    return [node.tag, attributes, text, [equation_form(child) for child in children(node)]]
+
+
+def equation_hash(node: Element) -> str:
+    form = json.dumps(equation_form(node), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(form.encode("utf-8")).hexdigest()
 
 
 def size_label(size: int) -> str:
@@ -154,6 +194,8 @@ class Reader:
         # Image references in traversal order, and hashed media part -> (sha256, size).
         self.images: list[dict[str, Any]] = []
         self.media: dict[str, tuple[str, int]] = {}
+        # Equation and symbol fingerprints in traversal order.
+        self.objects: list[dict[str, str]] = []
         # Inside an unselected mc:AlternateContent copy whose prose is still read.
         self.unselected = 0
         self.field_stack: list[list[str]] = []
@@ -335,6 +377,36 @@ class Reader:
             self.images.append(entry)
             self.warn(IMAGE_NOTE)
 
+    def object_nodes(self, node: Element) -> Iterator[Element]:
+        """Outermost equations and w:sym elements in ``node``, in document order.
+
+        Like ``image_refs``: text box content is read when the box renders, only one
+        copy of an mc:AlternateContent is read, and tracked deletions are skipped.
+        """
+        if node.tag in EQUATIONS or node.tag == w("sym"):
+            yield node
+            return
+        if node.tag in {w("txbxContent"), w("del"), w("moveFrom")}:
+            return
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.image_branch(node)
+            if branch is not None:
+                yield from self.object_nodes(branch)
+            return
+        for child in node:
+            yield from self.object_nodes(child)
+
+    def record_objects(self, node: Element) -> None:
+        """Fingerprint each equation (accepted-view hash) and symbol (font and character) in ``node``."""
+        if self.unselected:
+            return
+        for found in self.object_nodes(node):
+            if found.tag == w("sym"):
+                self.objects.append({"kind": "symbol", "part": self.part, "font": attr(found, "font"),
+                                     "char": attr(found, "char").upper()})
+            else:
+                self.objects.append({"kind": "equation", "part": self.part, "sha256": equation_hash(found)})
+
     def emit(self, text: str, anchored: str | None = None) -> str:
         """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
         if not self.unselected:
@@ -457,6 +529,8 @@ class Reader:
             return "".join(self.inline(child) for child in branch)
         if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
             self.record_images(node)
+        if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent", w("sym")} or tag in EQUATIONS:
+            self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
             if not self.unrendered_shape_parts(node):
@@ -643,6 +717,10 @@ class Reader:
                 continue
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
+                continue
+            elif child.tag in EQUATIONS:
+                # Body and cell content may hold math directly; it has no prose, as before.
+                self.record_objects(child)
                 continue
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
@@ -852,6 +930,9 @@ class Reader:
                     "lists": [{**entry, "levels": [entry["levels"][k] for k in sorted(entry["levels"])]}
                               for entry in self.lists.values()],
                     "list_runs": self.list_runs, "images": self.images}
+        if self.objects:
+            # Only when present, so documents without equations or symbols keep their companions.
+            metadata["objects"] = self.objects
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 
