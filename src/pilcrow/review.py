@@ -561,7 +561,9 @@ def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
 # (and the dot of "www.") stop GFM's autolink extension from taking a URL or address
 # with its escapes still in it; GitHub then links the unescaped text it renders.
 MARKDOWN_SPECIAL = frozenset("\\`*_[]!#|~$:@")
-WWW = re.compile(r"\b(www)\.", re.IGNORECASE)
+# GFM links a "www." at the start or after whitespace, "*", "_", "~" or "(". Escape its dot
+# after anything but a letter or digit: "_" is a word character, so "\b" would miss "_www.".
+WWW = re.compile(r"(?<![^\W_])(www)\.", re.IGNORECASE)
 # Raw HTML and entity references are written as entities.
 MARKDOWN_ENTITIES = {"<": "&lt;", ">": "&gt;", "&": "&amp;"}
 LINE_BREAK = re.compile(r"\r\n?|\n")
