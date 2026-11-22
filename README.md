@@ -584,6 +584,13 @@ companions. Documents without comments are unaffected. A document whose
 comments-extended relationship points to a missing part is now an error, like a
 missing styles part.
 
+Upgrading from a version that split sentences after forms such as `Art. 5`,
+`Jan. 2020`, `Cf. Smith`, or `Ph.D. in`: documents containing them report stale
+companions once, because those sentences now stay on one line (see
+[Normalization and sentence lines](docs/limitations.md#normalization-and-sentence-lines)).
+Run `pilcrow export` and commit the refreshed companions. Other documents are
+unaffected.
+
 Run the generated-fixture suite:
 
 ```sh
