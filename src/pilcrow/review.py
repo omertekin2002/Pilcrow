@@ -387,13 +387,48 @@ def change_link(old: Entry, new: Entry, _: int, __: int) -> str | None:
     return None
 
 
+def form_of(entry: Entry) -> Entry:
+    """A field's legacy form state (checkbox or dropdown), or {} for any other field."""
+    form = entry.get("form")
+    return form if isinstance(form, dict) else {}
+
+
+def field_label(entry: Entry) -> str:
+    """"FORMCHECKBOX "Check1"" for a named form field, else the field's command."""
+    command = entry.get("command") or "empty"
+    name = form_of(entry).get("name")
+    return f"{command} {short(name)}" if name else command
+
+
+def form_state(form: Entry) -> str:
+    """A checkbox's state or a dropdown's selected entry, as the review words it."""
+    if form.get("type") == "checkbox":
+        return "checked" if form.get("checked") else "unchecked"
+    selected = form.get("selected")
+    return short(selected) if isinstance(selected, str) else "(no entry selected)"
+
+
 def describe_field(entry: Entry, position: int) -> str:
-    return f"field {position + 1} ({entry.get('command') or 'empty'}) in {entry.get('part')}"
+    form = form_of(entry)
+    state = f": {form_state(form)}" if form.get("type") in ("checkbox", "dropdown") else ""
+    return f"field {position + 1} ({field_label(entry)}) in {entry.get('part')}{state}"
 
 
 def change_field(old: Entry, new: Entry, _: int, j: int) -> str | None:
     if only_differs(old, new, "sha256"):
         return f"~ field {j + 1} ({new.get('command') or 'empty'}) in {new.get('part')}: instruction changed"
+    if only_differs(old, new, "form"):
+        a, b = form_of(old), form_of(new)
+        # A form field whose kind or name changed, or that gained or lost its form data, is removed and added.
+        if not only_differs(a, b, "checked", "entries", "selected") or a.get("type") not in ("checkbox", "dropdown"):
+            return None
+        details = []
+        if a.get("entries") != b.get("entries"):
+            details.append("entries changed")
+        if (a.get("checked"), a.get("selected")) != (b.get("checked"), b.get("selected")):
+            details.append(f"{form_state(a)} → {form_state(b)}")
+        if details:
+            return f"~ field {j + 1} ({field_label(new)}) in {new.get('part')}: " + "; ".join(details)
     return None
 
 

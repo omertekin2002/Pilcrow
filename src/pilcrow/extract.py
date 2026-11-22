@@ -65,6 +65,8 @@ UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part;
                            "their anchor is recorded as null.")
 UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
                          "from the start or to the end of the story part.")
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
+                   "text form field settings are not compared.")
 MIB = 1024 * 1024
 # Package safety limits. Parsed parts (XML and .rels) are read whole into memory, so they
 # have tight caps; media is hashed in fixed-size chunks, so only the package-wide total
@@ -88,6 +90,15 @@ def w(name: str) -> str:
 
 
 COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
+# Legacy form field data (w:ffData) by element: the children whose meaning is recorded, or that
+# only set behaviour (macros, help text, enabled state). Anything else, such as w:textInput and
+# its children, keeps the unsupported construct warning.
+FORM_DATA = {
+    w("ffData"): frozenset(map(w, ("name", "enabled", "calcOnExit", "entryMacro", "exitMacro", "helpText",
+                                   "statusText", "checkBox", "ddList"))),
+    w("checkBox"): frozenset(map(w, ("size", "sizeAuto", "default", "checked"))),
+    w("ddList"): frozenset(map(w, ("result", "default", "listEntry"))),
+}
 EQUATIONS = frozenset({f"{{{M}}}oMathPara", f"{{{M}}}oMath"})
 # Markup an equation's fingerprint leaves out: deleted content, formatting, and markers whose
 # IDs Word renumbers on save. Proofing, bookmark, permission and move range markers carry no
@@ -190,7 +201,7 @@ class Reader:
         }
         self.review: list[dict[str, str | int | bool | None]] = []
         self.links: list[dict[str, str]] = []
-        self.fields: list[dict[str, str]] = []
+        self.fields: list[dict[str, Any]] = []
         self.styles: dict[str, Element] = {}
         # w:num by numId and w:abstractNum by abstractNumId; the first definition wins.
         self.nums: dict[str, Element] = {}
@@ -207,7 +218,8 @@ class Reader:
         self.objects: list[dict[str, str | None]] = []
         # Inside an unselected mc:AlternateContent copy whose prose is still read.
         self.unselected = 0
-        self.field_stack: list[list[str]] = []
+        # Open fields: instruction text so far, and the form state of a legacy form field.
+        self.field_stack: list[tuple[list[str], dict[str, Any] | None]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
         self.features: Counter[str] = Counter()
@@ -549,14 +561,15 @@ class Reader:
         if tag == w("fldChar"):
             kind = attr(node, "fldCharType")
             if kind == "begin":
-                self.field_stack.append([])
+                data = node.find("w:ffData", NS)
+                self.field_stack.append(([], None if data is None else self.form_field(data)))
             elif kind == "end" and self.field_stack:
-                self.record_field("".join(self.field_stack.pop()))
+                self.close_field()
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
             return ""
         if tag == w("instrText"):
             if self.field_stack:
-                self.field_stack[-1].append(node.text or "")
+                self.field_stack[-1][0].append(node.text or "")
             else:
                 self.record_field(node.text or "")
             return ""
@@ -581,10 +594,47 @@ class Reader:
             return ""
         return "".join(self.inline(child) for child in node)
 
-    def record_field(self, instruction: str) -> None:
+    def close_field(self) -> None:
+        instruction, form = self.field_stack.pop()
+        self.record_field("".join(instruction), form)
+
+    def record_field(self, instruction: str, form: dict[str, Any] | None = None) -> None:
         value = normalize(instruction)
-        self.fields.append({"command": value.split(" ", 1)[0],
-                            "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part})
+        entry: dict[str, Any] = {"command": value.split(" ", 1)[0],
+                                 "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part}
+        if form is not None:
+            # Only for checkbox and dropdown form fields, so other fields keep their metadata.
+            entry["form"] = form
+            self.warn(FORM_FIELD_NOTE)
+        self.fields.append(entry)
+
+    def form_field(self, data: Element) -> dict[str, Any] | None:
+        """The state of a legacy checkbox or dropdown form field from its w:ffData, else None.
+
+        A text input's visible value is already prose, so it records nothing here.
+        """
+        name = data.find("w:name", NS)
+        label = attr(name, "val") if name is not None else ""
+        box = data.find("w:checkBox", NS)
+        if box is not None:
+            # The current state, else the default state; an absent w:val is on, as for any ST_OnOff.
+            state = box.find("w:checked", NS)
+            if state is None:
+                state = box.find("w:default", NS)
+            return {"type": "checkbox", "name": label,
+                    "checked": state is not None and on_off(attr(state, "val", "1"))}
+        dropdown = data.find("w:ddList", NS)
+        if dropdown is None:
+            return None
+        entries = [attr(entry, "val") for entry in dropdown.findall("w:listEntry", NS)]
+        # w:result is the zero-based selected entry; without one, w:default applies, which defaults to 0.
+        chosen = dropdown.find("w:result", NS)
+        if chosen is None:
+            chosen = dropdown.find("w:default", NS)
+        index = 0 if chosen is None else decimal(attr(chosen, "val"))
+        # An index that names no entry is recorded as null, never guessed.
+        selected = entries[index] if index is not None and 0 <= index < len(entries) else None
+        return {"type": "dropdown", "name": label, "entries": entries, "selected": selected}
 
     def properties(self, paragraph: Element) -> tuple[list[Element], str]:
         direct = paragraph.find("w:pPr", NS)
@@ -824,8 +874,18 @@ class Reader:
     def audit(self, tree: Element) -> None:
         # This small allowlist is intentionally conservative: unknown constructs warn.
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
+        def visit_form(node: Element) -> None:
+            for child in node:
+                if child.tag not in FORM_DATA[node.tag]:
+                    visit(child)
+                elif child.tag in FORM_DATA:
+                    visit_form(child)
+
         def visit(node: Element) -> None:
             local = node.tag.rsplit("}", 1)[-1]
+            if node.tag == w("ffData"):
+                visit_form(node)  # form field data whose meaning is recorded, see FORM_DATA
+                return
             if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
                 # Only the copy holding the rendered text box is read.
                 for child in branch:
@@ -865,7 +925,7 @@ class Reader:
         if self.field_stack:
             self.warn("Unclosed field codes found; saved display text may be incomplete.")
             while self.field_stack:
-                self.record_field("".join(self.field_stack.pop()))
+                self.close_field()
         return value
 
     def extract(self) -> Extraction:

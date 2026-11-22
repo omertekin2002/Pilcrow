@@ -20,6 +20,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Comments | Text, author, and anchor in metadata, never in prose; `anchor` is the text between a comment's `w:commentRangeStart` and `w:commentRangeEnd` in the accepted view (insertions included, deletions omitted, tabs, line breaks, and paragraph boundaries as single spaces), matched by comment ID in the body, notes, headers/footers, and text boxes, and `anchor_part` is the part holding the range start, so moving, widening, narrowing, or re-attaching a range makes companions stale while Word's comment renumbering, run splits, proofing marks, and bookmarks do not; a reference without a range (or an empty range) records `""`, a comment never referenced in a rendered part records `null` with one coverage warning, and a range missing its start or end runs from the start or to the end of its part with one warning; a text box is a separate story, so a range around its anchor does not cover the box's text and a range inside a box runs at most to the box's edges; from the comments-extended part (`word/commentsExtended.xml`, reached through the document's relationship) each comment records `resolved` (`w15:done`) and `reply_to` (the 0-based position, in comments-part order, of the comment named by `w15:paraIdParent`), matched through the `w14:paraId` of the comment's last paragraph, so resolving, reopening, replying, and re-parenting make companions stale while Word's regenerated comment IDs and paraIds do not; both are `null` when there is no comments-extended part or matching `w15:commentEx`, and `reply_to` is `null` for a top-level comment or a parent that matches no comment; raw IDs, paraIds, and durable IDs are never recorded; dates, rich formatting, `commentsIds.xml`, and `commentsExtensible.xml` not compared |
 | Hyperlinks | Accepted visible text in prose; label and destination in metadata, without fetching the URL |
 | Fields/citations | Saved display text in prose; normalized instruction fingerprint and first command token in metadata; never recalculate fields or manage Zotero |
+| Legacy form fields | A `FORMCHECKBOX` or `FORMDROPDOWN` field's state, which Word keeps in the `w:ffData` of the field's begin `w:fldChar` and never writes as display text, is recorded in its field entry as `form`, so ticking a box or choosing another dropdown entry makes companions stale; a checkbox records its `name` and `checked` (`w:checked`, else `w:default`, else unchecked; an element without `w:val` is checked, as for any on/off value), and a dropdown its `name`, its `entries` (`w:listEntry`, in order) and the `selected` entry's text (the zero-based `w:result`, else `w:default`, else 0; `null` when that index names no entry); the state is not shown in prose; macros, help and status text, enabled state, and checkbox size are not compared and no longer warn; a text input (`FORMTEXT`) records no form state, because its value is already its display text, and its settings (`w:textInput`: type, default, maximum length, format) keep their unsupported-construct warnings; a form field inside a tracked deletion is not recorded, like any field there; content-control (`w:sdt`) checkboxes need no form state, because their glyph is prose text |
 | Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
 | Images | Placeholders (e.g. `[Unsupported drawing]`, `[Unsupported pict]`) in prose, as for other drawings; every DrawingML (`a:blip`, including its SVG copy) and legacy VML (`v:imagedata`) image in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 and size of its media part (external links by target, never fetched), so swapping, adding, removing, or reordering images makes companions stale; renamed media parts with identical bytes do not; size, position, cropping, alt text, and images in comments are not compared and trigger one coverage warning; a missing image relationship or media part is recorded without a hash and warns |
 | Equations and symbols | Placeholders (`[Unsupported oMath]`, `[Unsupported oMathPara]`, `[Unsupported sym]`) and omission warnings in prose; each outermost OMML equation (`m:oMathPara`, or an `m:oMath` outside one) and each `w:sym` in the body, headers/footers, notes, and text boxes is recorded in metadata, so editing, adding, removing, or reordering one makes companions stale; an equation is recorded by the SHA-256 of a canonical form of its accepted view (tracked deletions dropped, insertions kept; run formatting `w:rPr`, control formatting `m:ctrlPr`, `rsid*`/`w14:paraId`/`w14:textId` attributes, proofing marks, bookmarks, and comment markers left out; `m:t` text and the other `m:*Pr` structure kept), so the fingerprint covers OMML structure and text, not how Word draws it, and a formatting-only re-save stays fresh; a symbol is recorded by its font and character code; equations inside tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images |
@@ -49,7 +50,7 @@ No claim of a complete/unchanged document is made. This is a modest coverage rep
 not an audit of every OOXML relationship or layout semantic.
 
 Metadata contains only schema/view/coverage, warnings, review text/authors, link
-destinations, field fingerprints, list formats, image hashes, and equation, symbol, and object part fingerprints. `lists` has one entry per
+destinations, field fingerprints and legacy form field state, list formats, image hashes, and equation, symbol, and object part fingerprints. `lists` has one entry per
 list used by a rendered list paragraph, numbered 1, 2, … by first use (not by
 Word's `numId`, which can change on save), with the part where it is first used
 and the format, level text, and start value of each level its items use.
@@ -72,7 +73,10 @@ chunk", "sha256": …}` (the raw bytes of the part it points to; an embedded obj
 also records its `prog_id`, and a linked one `target` instead of `sha256`; a
 dangling reference has a null `sha256`). Part names are not recorded, as for
 images. The key is present only when the list is non-empty, so documents without
-any of these keep the metadata they had. Field fingerprints avoid huge Zotero JSON
+any of these keep the metadata they had. A field entry has a `form` key only for a
+legacy checkbox or dropdown form field: `{"type": "checkbox", "name": …,
+"checked": true | false}` or `{"type": "dropdown", "name": …, "entries": […],
+"selected": … | null}`, so other fields keep the metadata they had. Field fingerprints avoid huge Zotero JSON
 payloads but only say a normalized code changed, not what that change means.
 Arrays follow document traversal order; related parts and warnings sort
 lexically. Internal part paths come from the package; no machine paths, save
@@ -114,6 +118,12 @@ whose target changes, is listed as removed and added. An equation or symbol that
 moved past a chart, diagram, embedded object, or imported chunk (for example a
 block-level equation, which has no prose) is reported as `Objects: equations or
 symbols moved relative to charts, diagrams or embedded objects`.
+A legacy checkbox or dropdown form field at the same position whose state alone
+changed is worded with its old and new state, `~ field 1 (FORMCHECKBOX "Check1")
+in word/document.xml: unchecked → checked` or `~ field 2 (FORMDROPDOWN "Drop1")
+in word/document.xml: "Yes" → "No"`, and a changed list of dropdown entries as
+`entries changed`; a form field that was renamed or changed kind is listed as
+removed and added, with its state.
 Long texts are shortened to 80 characters for display.
 
 ## Normalization and sentence lines

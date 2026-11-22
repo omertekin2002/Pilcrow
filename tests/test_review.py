@@ -29,8 +29,10 @@ try:
         alt_chunk,
         anchored,
         chart,
+        checkbox,
         comments_extended,
         comments_part,
+        dropdown,
         end,
         equation,
         image_rel,
@@ -62,8 +64,10 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         alt_chunk,
         anchored,
         chart,
+        checkbox,
         comments_extended,
         comments_part,
+        dropdown,
         end,
         equation,
         image_rel,
@@ -431,6 +435,58 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("Prose: no changes", report)
         self.assertEqual(self.section(report, "Hyperlinks"),
                          ['~ link "Visible label": https://example.invalid/first → https://example.invalid/second'])
+
+    def write_forms(self, old: str, new: str) -> None:
+        for path, field in ((self.old, old), (self.new, new)):
+            make_docx(path, f"<w:p>{run('Sublet: ')}{field}</w:p>")
+
+    def test_ticking_a_form_checkbox(self) -> None:
+        self.write_forms(checkbox("0"), checkbox("1"))
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
+                         ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked → checked'])
+        self.write_forms(checkbox(None, "1"), checkbox(None, "0"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: checked → unchecked'])
+
+    def test_choosing_another_dropdown_entry(self) -> None:
+        self.write_forms(dropdown("Yes", "No", result="0"), dropdown("Yes", "No", result="1"))
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"'])
+        self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", "Maybe", result="1"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed'])
+        self.write_forms(dropdown("Yes", "No", result="0"), dropdown("No", "Yes", result="0"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed; "Yes" → "No"'])
+        self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", result="7"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "No" → (no entry selected)'])
+
+    def test_unnamed_and_renamed_form_fields(self) -> None:
+        self.write_forms(checkbox("0", name=None), checkbox("1", name=None))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ["~ field 1 (FORMCHECKBOX) in word/document.xml: unchecked → checked"])
+        # A renamed field, or one that changed kind, is not worded as a state change.
+        self.write_forms(checkbox("0"), checkbox("1", name="Other"))
+        self.assertEqual(self.section(self.review(), "Fields"), [
+            '- removed field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked',
+            '+ added field 1 (FORMCHECKBOX "Other") in word/document.xml: checked'])
+        self.write_forms(checkbox("1"), dropdown("Yes", result="0"))
+        self.assertEqual(self.section(self.review(), "Fields"), [
+            '- removed field 1 (FORMCHECKBOX "Check1") in word/document.xml: checked',
+            '+ added field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes"'])
+
+    def test_markdown_escapes_form_field_names_and_entries(self) -> None:
+        self.write_forms(dropdown("*Yes*", "[No](x)", result="0", name="<b>|"),
+                         dropdown("*Yes*", "[No](x)", result="1", name="<b>|"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "<b>|") in word/document.xml: "*Yes*" → "[No](x)"'])
+        self.assertIn('- `~` field 1 (FORMDROPDOWN "&lt;b&gt;\\|") in word/document.xml\\: '
+                      '"\\*Yes\\*" → "\\[No\\](x)"\n', self.markdown())
 
     def test_image_swap(self) -> None:
         for path, data in ((self.old, "first picture"), (self.new, "second picture")):
