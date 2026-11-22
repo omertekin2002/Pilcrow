@@ -1523,6 +1523,25 @@ class CLITests(unittest.TestCase):
                 write(variant)
                 self.cli("check", "essay.docx", code=1)
 
+    def test_block_level_equations_are_recorded(self) -> None:
+        # OOXML allows math directly in the body, a table cell, a block-level insertion, and a
+        # block-level compatibility copy; deleted block-level math is not in the accepted view.
+        cell = f"<w:tbl><w:tr><w:tc>{equation('c', para=True)}</w:tc></w:tr></w:tbl>"
+        inserted = f'<w:ins w:id="1" w:author="Ada">{equation("i", para=True)}</w:ins>'
+        deleted = f'<w:del w:id="2" w:author="Ada">{equation("d", para=True)}</w:del>'
+        compatible = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">{equation("m", para=True)}'
+                      f'</mc:Choice><mc:Fallback>{equation("f", para=True)}</mc:Fallback></mc:AlternateContent>')
+        body = paragraph("Before.") + equation("b", para=True) + cell + inserted + deleted + compatible
+
+        def para_entry(text: str) -> dict[str, Any]:
+            return equation_entry([f"{{{M}}}oMathPara", [], "", [simple_form(text)]])
+
+        prose, meta = self.export_objects(body)
+        self.assertEqual(meta["objects"], [para_entry(t) for t in "bcim"])
+        self.assertEqual(prose, "Before.\n\n[Table]\n\n[Row]\n\n[Cell]\n\n(empty)\n\n[/Row]\n\n[/Table]\n")
+        make_docx(self.root / "essay.docx", body.replace(equation("b", para=True), equation("B", para=True)))
+        self.cli("check", "essay.docx", code=1)
+
     def test_compatibility_copies_record_one_equation(self) -> None:
         inline = (f'<w:p>{run("Formula: ")}<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">'
                   f'{equation(para=True)}</mc:Choice><mc:Fallback><w:r>{vml_picture("fallback")}</w:r></mc:Fallback>'

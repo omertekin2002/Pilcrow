@@ -718,6 +718,10 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
+            elif child.tag in EQUATIONS:
+                # Body and cell content may hold math directly; it has no prose, as before.
+                self.record_objects(child)
+                continue
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag == f"{{{MC}}}AlternateContent":
