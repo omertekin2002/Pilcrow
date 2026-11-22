@@ -390,8 +390,8 @@ would contain and writes nothing. Coverage warnings go to stderr, so they can
 appear in the terminal alongside the diff. Because Git converts each revision on
 demand, this also works for history committed before you used Pilcrow, with no
 companions. It shows prose only: changes recorded in `.meta.json`, such as
-comments, list formats, images, form checkbox and dropdown state, and
-tracked-change authors, do not appear, so it does not replace companions,
+comments, list formats, images and their alt text, WordArt text, form
+checkbox and dropdown state, and tracked-change authors, do not appear, so it does not replace companions,
 `pilcrow check`, or review in Word. Whether
 GitHub Desktop uses the driver is **untested**.
 
@@ -443,6 +443,9 @@ clarify."`, `~ link "Report": https://old.example → https://new.example`, or
 (word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
 diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
 changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`.
+Edited image alt text reads `~ image 1 (word/document.xml) alt text: "A red cat"
+→ "A blue dog"`, and edited WordArt text `~ WordArt 1 (word/document.xml):
+"SALE" → "CLOSED"`.
 Ticking a legacy form checkbox reads `~ field 1 (FORMCHECKBOX "Check1")
 in word/document.xml: unchecked → checked`, and choosing another dropdown entry
 `~ field 2 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"`. A comment is called resolved, reopened,
@@ -554,7 +557,11 @@ between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; th
 box's position, wrapping, and shape formatting are not compared. Images, charts,
 equations, and embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
-companions stale (size, position, cropping, and alt text are not compared).
+companions stale (size, position, and cropping are not compared). An image's alt
+text (its description, and its title when it has one) is recorded with it, so
+editing, adding, or removing alt text makes companions stale too; screen readers
+read it, but it is not shown in the prose. Legacy VML WordArt is not rendered
+either; its text is recorded in metadata, so editing it makes companions stale.
 Equations and Word symbols (`w:sym`) are recorded in metadata by a fingerprint of
 their OMML structure and text (formatting and revision IDs left out) and by font
 and character code, so editing, adding, or removing one makes companions stale.
@@ -633,6 +640,12 @@ because their field entries in `.meta.json` now have a `form` key (and documents
 with any legacy form field no longer warn about its `w:ffData`). Run `pilcrow
 export` and commit the refreshed companions. Documents without legacy form
 fields are unaffected.
+
+Upgrading from a version that did not record image alt text and WordArt text:
+documents containing an image with alt text, or legacy VML WordArt, report stale
+companions once, because their image entries in `.meta.json` now have an `alt`
+(or `alt_title`) key, and WordArt is recorded in `objects`. Run `pilcrow export`
+and commit the refreshed companions. Documents without them are unaffected.
 
 Run the generated-fixture suite:
 

@@ -131,6 +131,7 @@ def numbering(*definitions: str) -> str:
 
 
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+IMAGE_ALT_NOTE = "Images are compared by content hash and alt text; size, position, and cropping are not compared."
 MISSING_IMAGE_NOTE = (
     "Some image relationships are missing or point to missing parts; "
     "those images are recorded without a hash."
@@ -149,6 +150,40 @@ def picture(rid: str, attribute: str = "embed") -> str:
 def vml_picture(rid: str) -> str:
     """A legacy VML picture, as in older files and in mc:Fallback."""
     return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
+
+
+def quoted(value: str) -> str:
+    """``value`` escaped for a double-quoted XML attribute."""
+    return escape(value, {'"': "&quot;", "\n": "&#10;"})
+
+
+def described_picture(rid: str, descr: str | None = None, *, own: str | None = None,
+                      title: str | None = None) -> str:
+    """An inline DrawingML picture with alt text on its wp:docPr (``descr``, ``title``) and on
+    its pic:cNvPr (``own``), as Word writes it; None leaves an attribute out."""
+    def attributes(**values: str | None) -> str:
+        return "".join(f' {key}="{quoted(value)}"' for key, value in values.items() if value is not None)
+    return (f'<w:drawing><wp:inline xmlns:wp="{WP}"><wp:extent cx="914400" cy="914400"/>'
+            f'<wp:docPr id="1" name="Picture 1"{attributes(descr=descr, title=title)}/>'
+            f'<a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}"><pic:pic xmlns:pic="{PIC}">'
+            f'<pic:nvPicPr><pic:cNvPr id="0" name="cat.png"{attributes(descr=own)}/><pic:cNvPicPr/></pic:nvPicPr>'
+            f'<pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>'
+            '</wp:inline></w:drawing>')
+
+
+def vml_wordart(text: str) -> str:
+    """Legacy VML WordArt: a v:shape drawing ``text`` along its v:textpath, with the shape type
+    Word writes next to it (whose own v:textpath has no text)."""
+    return (f'<w:pict><v:shapetype xmlns:v="{V}" id="_x0000_t136" coordsize="21600,21600" o:spt="136" '
+            f'xmlns:o="urn:schemas-microsoft-com:office:office" path="m@7,l@8,m@5,21600l@6,21600e">'
+            '<v:path textpathok="t" o:connecttype="custom"/><v:textpath on="t" fitshape="t"/></v:shapetype>'
+            f'<v:shape xmlns:v="{V}" id="WordArt 1" type="#_x0000_t136" style="width:200pt;height:50pt" fillcolor="black">'
+            f'<v:textpath style="font-family:&quot;Arial Black&quot;;v-text-kern:t" trim="t" fitpath="t" '
+            f'string="{quoted(text)}"/></v:shape></w:pict>')
+
+
+def wordart_entry(text: str, part: str = "word/document.xml") -> dict[str, Any]:
+    return {"kind": "WordArt", "part": part, "text": text}
 
 
 C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
@@ -1700,6 +1735,165 @@ class CLITests(unittest.TestCase):
         self.assertNotIn(IMAGE_NOTE, meta["warnings"])
         prose, meta, stderr = self.export_images(paragraph("Plain prose."))
         self.assertEqual(meta["images"], [])
+
+    def review_report(self, old: str, new: str) -> str:
+        """``pilcrow review old new``'s report, which must find a change; read as the UTF-8 it is
+        written in, not the locale encoding ``cli`` decodes with (cp1252 on Windows)."""
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(PROJECT / "src"), str(PROJECT)))}
+        result = subprocess.run([sys.executable, "-m", "pilcrow", "review", old, new], cwd=self.root, env=env,
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result)
+        return result.stdout.decode("utf-8")
+
+    def write_described(self, body: str, path: str = "essay.docx") -> None:
+        make_docx(self.root / path, body, extra={"word/media/image1.png": "picture bytes"},
+                  relationships=image_rel("rId5", "media/image1.png"))
+
+    def test_alt_text_edits_make_check_stale_and_review_names_them(self) -> None:
+        def figure(descr: str | None) -> str:
+            # Word writes the same description on the drawing and on the picture.
+            return anchored("Figure:", described_picture("rId5", descr, own=descr))
+
+        self.write_described(figure("A red cat"))
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        data = json.loads(meta)
+        self.assertEqual(data["images"], [{**image_entry("picture bytes"), "alt": "A red cat"}])
+        self.assertIn(IMAGE_ALT_NOTE, data["warnings"])
+        self.assertNotIn(IMAGE_NOTE, data["warnings"])
+        self.assertEqual(prose, b"Figure:[Unsupported drawing]\n", "alt text is not rendered in prose")
+        self.write_described(figure("A red cat"), "old.docx")
+        for descr, line in (
+            ("A blue dog", '~ image 1 (word/document.xml) alt text: "A red cat" → "A blue dog"'),
+            (None, '~ image 1 (word/document.xml) alt text: "A red cat" → (none)'),
+            ("", '~ image 1 (word/document.xml) alt text: "A red cat" → (none)'),
+        ):
+            with self.subTest(descr=descr):
+                self.write_described(figure(descr))
+                self.cli("check", "essay.docx", code=1)
+                report = self.review_report("old.docx", "essay.docx")
+                self.assertIn(f"Images:\n{line}\n", report)
+                self.assertIn("Prose: no changes", report)
+        # Adding alt text to an image that had none is a change too.
+        self.write_described(figure(None))
+        self.cli("export", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], prose)
+        self.assertEqual(json.loads(after[1])["images"], [image_entry("picture bytes")])
+        self.assertIn(IMAGE_NOTE, json.loads(after[1])["warnings"])
+        self.write_described(figure(None), "old.docx")
+        self.write_described(figure("A red cat"))
+        self.cli("check", "essay.docx", code=1)
+        report = self.review_report("old.docx", "essay.docx")
+        self.assertIn('Images:\n~ image 1 (word/document.xml) alt text: (none) → "A red cat"\n', report)
+
+    def test_alt_text_reads_the_same_from_either_attribute(self) -> None:
+        def alt(body: str) -> list[dict[str, Any]]:
+            self.write_described(body)
+            self.cli("export", "essay.docx")
+            images: list[dict[str, Any]] = json.loads(self.exported()[1])["images"]
+            return images
+
+        expected = [{**image_entry("picture bytes"), "alt": "A red cat"}]
+        # On the drawing only, on the picture only, or spread over lines: one recorded value.
+        self.assertEqual(alt(anchored("", described_picture("rId5", "A red cat"))), expected)
+        self.assertEqual(alt(anchored("", described_picture("rId5", own="A red cat"))), expected)
+        self.assertEqual(alt(anchored("", described_picture("rId5", " A red\n  cat ", own="A red cat"))), expected)
+        self.cli("check", "essay.docx")
+        self.write_described(anchored("", described_picture("rId5", own="A red cat")))
+        self.cli("check", "essay.docx")
+        # The drawing's description wins over the picture's own, as in Word's alt text pane.
+        self.assertEqual(alt(anchored("", described_picture("rId5", "A red cat", own="A cat"))), expected)
+        # A title is recorded apart from the description, and only when present.
+        self.assertEqual(alt(anchored("", described_picture("rId5", title="Cat"))),
+                         [{**image_entry("picture bytes"), "alt_title": "Cat"}])
+        self.assertEqual(alt(anchored("", described_picture("rId5", "", own=" ", title=""))),
+                         [image_entry("picture bytes")])
+        # A legacy VML picture keeps its alt text on the shape.
+        vml = vml_picture("rId5").replace('id="Picture 1"', 'id="Picture 1" alt="A red cat"')
+        self.assertEqual(alt(anchored("", vml)), expected)
+
+    def test_grouped_pictures_keep_their_own_alt_text(self) -> None:
+        def member(rid: str, descr: str | None) -> str:
+            props = "" if descr is None else f' descr="{descr}"'
+            return (f'<pic:pic xmlns:pic="{PIC}"><pic:nvPicPr><pic:cNvPr id="2" name="p"{props}/></pic:nvPicPr>'
+                    f'<pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic>')
+        group = (f'<w:drawing><wp:anchor xmlns:wp="{WP}"><wp:docPr id="1" name="Group 1" descr="Two pets"/>'
+                 f'<a:graphic xmlns:a="{A}"><a:graphicData uri="{WPG}"><wpg:wgp xmlns:wpg="{WPG}">'
+                 f'{member("rId5", "A red cat")}{member("rId6", None)}</wpg:wgp></a:graphicData></a:graphic>'
+                 '</wp:anchor></w:drawing>')
+        make_docx(self.root / "essay.docx", anchored("Group:", group),
+                  extra={"word/media/image1.png": "cat bytes", "word/media/image2.png": "dog bytes"},
+                  relationships=image_rel("rId5", "media/image1.png") + image_rel("rId6", "media/image2.png"))
+        self.cli("export", "essay.docx")
+        self.assertEqual(json.loads(self.exported()[1])["images"],
+                         [{**image_entry("cat bytes"), "alt": "A red cat"}, image_entry("dog bytes")])
+
+    def test_documents_without_alt_text_or_wordart_keep_their_companions(self) -> None:
+        # Companions exported by agent/improvements before alt text and WordArt were recorded
+        # (87a23c6): DrawingML, described-but-empty and VML pictures, and a WordArt shape type
+        # with no text, must export byte for byte the same.
+        shape_type = vml_wordart("unused").split("<v:shape ")[0] + "</w:pict>"
+        body = (paragraph("Caption above.") + anchored("Figure:", picture("rId5"))
+                + anchored("Described:", described_picture("rId6")) + anchored("Legacy:", vml_picture("rId7"))
+                + anchored("Shape type:", shape_type))
+        make_docx(self.root / "essay.docx", body, extra={f"word/media/image{i}.png": f"picture {i}" for i in (5, 6, 7)},
+                  relationships="".join(image_rel(f"rId{i}", f"media/image{i}.png") for i in (5, 6, 7)))
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(hashlib.sha256(prose).hexdigest(),
+                         "37997d7537bbac3bd80770076952b402b2538528a7fd7efef5d99ea6f9ff8959", prose)
+        self.assertEqual(hashlib.sha256(meta).hexdigest(),
+                         "bf59117831f52348f3221f581f11cef4d2ebcd040d2dc6c0f19a750b89a928e8", meta)
+        self.assertNotIn("objects", json.loads(meta))
+
+    def test_wordart_text_edits_make_check_stale_and_review_names_them(self) -> None:
+        def write(text: str, path: str = "essay.docx") -> None:
+            make_docx(self.root / path, anchored("Banner:", vml_wordart(text)))
+
+        write("SALE")
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(prose, b"Banner:[Unsupported pict]\n", "WordArt is still not rendered in prose")
+        data = json.loads(meta)
+        self.assertEqual(data["objects"], [wordart_entry("SALE")])
+        self.assertIn("Unsupported pict: content is not rendered in prose; inspect the DOCX in Word.", data["warnings"])
+        self.assertEqual(data["images"], [])
+        write("SALE", "old.docx")
+        write("CLOSED")
+        self.cli("check", "essay.docx", code=1)
+        report = self.review_report("old.docx", "essay.docx")
+        self.assertIn('Charts, diagrams and embedded objects:\n~ WordArt 1 (word/document.xml): "SALE" → "CLOSED"\n',
+                      report)
+        # Whitespace is normalised like other recorded text.
+        write("  SALE\n ")
+        self.cli("check", "essay.docx")
+
+    def test_wordart_follows_tracked_deletions_and_compatibility_copies(self) -> None:
+        def objects(body: str) -> list[dict[str, Any]] | None:
+            _, meta = self.export_objects(body)
+            return meta.get("objects")
+
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{vml_wordart("Gone")}</w:r></w:del></w:p>'
+        self.assertIsNone(objects(deleted))
+        moved = f'<w:p>{run("Kept.")}<w:moveFrom w:id="1" w:author="Ada"><w:r>{vml_wordart("Gone")}</w:r></w:moveFrom></w:p>'
+        self.assertIsNone(objects(moved))
+        inserted = f'<w:p>{run("Kept.")}<w:ins w:id="1" w:author="Ada"><w:r>{vml_wordart("New")}</w:r></w:ins></w:p>'
+        self.assertEqual(objects(inserted), [wordart_entry("New")])
+        both = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="v">{vml_wordart("SALE")}</mc:Choice>'
+                f'<mc:Fallback>{vml_wordart("SALE")}</mc:Fallback></mc:AlternateContent>')
+        self.assertEqual(objects(f"<w:p><w:r>{both}</w:r></w:p>"), [wordart_entry("SALE")])
+        block = both.replace(vml_wordart("SALE"), f'<w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>')
+        self.assertEqual(objects(block), [wordart_entry("SALE")])
+        # In document order with other objects, and by story part.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p><w:r>{vml_wordart("Head")}</w:r></w:p></w:hdr>'
+        body = (f'<w:p><w:r>{vml_wordart("One")}</w:r>{symbol()}<w:r>{vml_wordart("Two")}</w:r></w:p>'
+                '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        _, meta = self.export_objects(body, extra={"word/header1.xml": header},
+                                      relationships=f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>')
+        self.assertEqual(meta["objects"], [
+            wordart_entry("One"), {"kind": "symbol", "part": "word/document.xml", "font": "Symbol", "char": "F061"},
+            wordart_entry("Two"), wordart_entry("Head", "word/header1.xml")])
 
     def export_objects(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
         make_docx(self.root / "essay.docx", body, **options)
