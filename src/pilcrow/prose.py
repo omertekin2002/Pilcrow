@@ -3,7 +3,13 @@
 import re
 
 ABBREVIATIONS = frozenset(
-    "mr mrs ms dr prof sr jr st vs etc e.g i.e fig figs eq eqs ref refs vol no pp al".split()
+    "mr mrs ms dr prof sr jr st vs etc e.g i.e fig figs eq eqs ref refs vol no pp al cf viz".split()
+)
+# Never split after these when the next word starts with a digit ("Art. 5", "Jan. 2020");
+# before a capital letter they may end a sentence ("It was Jan. Then it snowed.").
+NUMBER_ABBREVIATIONS = frozenset(
+    "approx ca ch chap sec secs art arts para paras fn nos "
+    "jan feb mar apr jun jul aug sep sept oct nov dec".split()
 )
 # Split only after terminal punctuation followed by whitespace. Keep closing quotes
 # and reference brackets with the sentence. Decimal points have no following space.
@@ -39,8 +45,14 @@ def sentences(text: str) -> list[str]:
         start = 0
         for match in BOUNDARY.finditer(line):
             end = match.end()
-            token = abbreviation_candidate(line, match.start())
-            if token and (token.lower() in ABBREVIATIONS or INITIALISM.fullmatch(token)):
+            # A boundary ends in whitespace, so ``end`` is the next word's first character.
+            following = line[end:end + 1]
+            # A sentence rarely starts lowercase: "Ph.D. in", "Acme Inc. was", "Max. load".
+            if following.islower():
+                continue
+            token = abbreviation_candidate(line, match.start()).lower()
+            if token and (token in ABBREVIATIONS or INITIALISM.fullmatch(token)
+                          or (token in NUMBER_ABBREVIATIONS and following.isdecimal())):
                 continue
             result.append(line[start: end].strip())
             start = end

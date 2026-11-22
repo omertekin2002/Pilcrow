@@ -104,12 +104,26 @@ Long texts are shortened to 80 characters for display.
   Empty paragraphs are omitted. Thus spacing and blank-paragraph layout changes
   are intentionally not reviewed. Nonbreaking and soft hyphen characters remain.
 - Sentence breaks occur at `.`, `!`, or `?` followed by whitespace; closing quotes
-  or brackets stay with the sentence. A small English abbreviation list and
-  single-letter/initialism heuristic suppress common false splits. Decimals such
-  as `3.14` have no whitespace and stay intact. Question/exclamation sentences and
-  ordinary Unicode text are retained.
+  or brackets stay with the sentence. A small English abbreviation list (including
+  `cf.` and `viz.`) and single-letter/initialism heuristic suppress common false
+  splits. Decimals such as `3.14` have no whitespace and stay intact.
+  Question/exclamation sentences and ordinary Unicode text are retained.
+- There is no break when the next word starts with a lowercase letter (`Ph.D. in`,
+  `Acme Inc. was`, `Max. load`, `Absolutely... fine`), which also covers unknown
+  abbreviations. The trade-off: a sentence that really starts lowercase after
+  `.`, `!`, or `?` (for example one starting with `iPhone`) joins the previous line.
+- After `approx.`, `ca.`, `ch.`, `chap.`, `sec.`, `secs.`, `art.`, `arts.`,
+  `para.`, `paras.`, `fn.`, `nos.`, or a month abbreviation (`Jan.` to `Dec.`,
+  `Sept.`; any case) there is no break when the next word starts with a digit
+  (`Art. 5`, `Sec. 3.2`, `Jan. 2020`). Before a capital letter these still end a
+  sentence, so `It was Jan. Then it snowed.` stays two lines.
+- Upgrading from a version without the two rules above: documents containing
+  these forms report stale companions once, because their sentence lines change.
+  Run `pilcrow export` and commit the refreshed companions. Documents without
+  them produce byte-identical companions.
 - This is English-oriented, not universal sentence detection. Unknown abbreviations
-  can split too soon; an abbreviation at sentence end can suppress a valid split.
+  can still split too soon before a capitalized word or a number; an abbreviation
+  at sentence end can suppress a valid split.
   CJK text without whitespace stays on one line. Citation punctuation, initials,
   ellipses, and unusual scientific notation may need later tuning. An incorrect
   split changes line boundaries, not the underlying words.
