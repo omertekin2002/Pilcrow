@@ -461,9 +461,14 @@ def describe_object(entry: Entry, _: int) -> str:
     return label
 
 
+def one_spaced(value: Any) -> str:
+    """Document-controlled text on one line, so it cannot start a line of its own in a text report."""
+    return " ".join(str(value).split())
+
+
 def part_label(entry: Entry) -> str:
     """"chart 1 (word/document.xml)", with an embedded object's ProgID before the part."""
-    prog_id = entry.get("prog_id")
+    prog_id = one_spaced(entry.get("prog_id") or "")
     place = f"{prog_id}, {entry.get('part')}" if prog_id else entry.get("part")
     return f"{entry.get('kind')} {entry.get('number')} ({place})"
 
@@ -474,7 +479,7 @@ def describe_part_object(entry: Entry, _: int) -> str:
         sha = entry["sha256"]
         sources.append("with a missing part" if sha is None else f"sha256 {sha[:12]}")
     if "target" in entry:
-        sources.append(f"linked to {entry['target']}")
+        sources.append(f"linked to {one_spaced(entry['target'])}")
     return f"{part_label(entry)}: {', '.join(sources) or 'no source'}"
 
 

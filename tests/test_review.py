@@ -580,16 +580,25 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("\n\nObjects: equations or symbols moved relative to charts, diagrams or embedded objects\n",
                       report)
 
-    def test_markdown_escapes_an_embedded_object_prog_id(self) -> None:
-        prog_id = "Evil*<b>`x`[y](https://example.invalid)"
+    def write_ole(self, prog_id_xml: str) -> None:
+        """An old and new OLE object whose embeddings differ; ``prog_id_xml`` is the raw attribute value."""
         for path, workbook in ((self.old, "v1"), (self.new, "v2")):
-            make_docx(path, f'<w:p><w:r>{ole_object("ole", prog_id)}</w:r></w:p>',
-                      extra={"word/embeddings/oleObject1.bin": workbook},
+            obj = ole_object("ole", "PROG").replace('ProgID="PROG"', f'ProgID="{prog_id_xml}"')
+            make_docx(path, f"<w:p><w:r>{obj}</w:r></w:p>", extra={"word/embeddings/oleObject1.bin": workbook},
                       relationships=rel("ole", "oleObject", "embeddings/oleObject1.bin"))
+
+    def test_markdown_escapes_an_embedded_object_prog_id(self) -> None:
+        self.write_ole("Evil*&lt;b&gt;`x`[y](https://example.invalid)")
         self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
-                         [f"~ embedded object 1 ({prog_id}, word/document.xml) changed"])
+                         ["~ embedded object 1 (Evil*<b>`x`[y](https://example.invalid), word/document.xml) changed"])
         self.assertIn("- `~` embedded object 1 (Evil\\*&lt;b&gt;\\`x\\`\\[y\\](https\\://example.invalid), "
                       "word/document.xml) changed\n", self.markdown())
+
+    def test_a_line_break_in_a_prog_id_stays_on_its_line(self) -> None:
+        # An attribute can carry a line break as a character reference.
+        self.write_ole("X&#10;+ added chart 7")
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         ["~ embedded object 1 (X + added chart 7, word/document.xml) changed"])
 
     def test_bullet_to_number_list_format_change(self) -> None:
         body = list_item("First.", "1") + list_item("Second.", "1")
