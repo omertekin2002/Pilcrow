@@ -21,11 +21,13 @@ from pilcrow import summary
 
 try:
     from .test_cli import (
+        COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
         PROJECT,
         R,
         abstract_num,
+        comments_extended,
         comments_part,
         end,
         level,
@@ -40,11 +42,13 @@ try:
     from .test_textconv import tree
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
     from test_cli import (  # type: ignore[no-redef]
+        COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
         PROJECT,
         R,
         abstract_num,
+        comments_extended,
         comments_part,
         end,
         level,
@@ -166,6 +170,22 @@ class SummaryTests(unittest.TestCase):
         full, _ = self.summarize(base, "full")
         for word in ("ProseZebraold", "CommentZebranew", "InsertedZebranew", "zebranew.example"):
             self.assertIn(word, full)
+
+    def test_outline_counts_one_comment_change_for_an_edited_parent(self) -> None:
+        def thread(parent: str) -> None:
+            body = f"<w:p>{start('1')}{start('2')}{run('The cat sat.')}{end('1')}{end('2')}</w:p>"
+            make_docx(self.repo / "thread.docx", body,
+                      extra={"word/comments.xml": comments_part({"1": parent, "2": "I agree."},
+                                                                {"1": "11111111", "2": "22222222"}),
+                             "word/commentsExtended.xml": comments_extended(("11111111", None, "0"),
+                                                                            ("22222222", "11111111", "0"))},
+                      relationships=COMMENTS_REL + COMMENTS_EXT_REL)
+        thread("Please clarify.")
+        base = self.commit("first")
+        thread("Please clarify this.")
+        self.commit("second")
+        text, _ = self.summarize(base, "outline")
+        self.assertIn("- `thread.docx` — changed: Comments (1)\n", text)
 
     def test_statuses_and_eligibility(self) -> None:
         make_docx(self.repo / "docs" / "kept.docx", paragraph("Same."))
