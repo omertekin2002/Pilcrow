@@ -234,6 +234,49 @@ def image_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
     return {"part": part, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
 
 
+def form_field(command: str, data: str, display: str = "", *, name: str | None = "Field1", rsid: str = "") -> str:
+    """A legacy form field as Word writes it: ``data`` is the type-specific part of its w:ffData.
+
+    Checkboxes and dropdowns have no display text; a text input's ``display`` is its value.
+    """
+    named = "" if name is None else f'<w:name w:val="{escape(name)}"/>'
+    runs = '<w:r{rsid}><w:fldChar w:fldCharType="begin"><w:ffData>{named}<w:enabled/><w:calcOnExit w:val="0"/>{data}'
+    runs += '</w:ffData></w:fldChar></w:r><w:r{rsid}><w:instrText xml:space="preserve"> {command} </w:instrText></w:r>'
+    if display:
+        runs += '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' + run(display)
+    runs += '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    return runs.format(rsid=f' w:rsidR="{rsid}"' if rsid else "", named=named, data=data, command=command)
+
+
+def checkbox(checked: str | None = "0", default: str | None = "0", *, name: str | None = "Check1", rsid: str = "") -> str:
+    """A FORMCHECKBOX; "" for ``checked`` or ``default`` writes the element without w:val, None leaves it out."""
+    def on_off(tag: str, value: str | None) -> str:
+        return "" if value is None else f"<w:{tag}/>" if value == "" else f'<w:{tag} w:val="{value}"/>'
+    data = f'<w:checkBox><w:sizeAuto/>{on_off("default", default)}{on_off("checked", checked)}</w:checkBox>'
+    return form_field("FORMCHECKBOX", data, name=name, rsid=rsid)
+
+
+def dropdown(*entries: str, result: str | None = "0", default: str | None = None, name: str | None = "Drop1") -> str:
+    """A FORMDROPDOWN with ``entries``; None leaves w:result or w:default out."""
+    data = "<w:ddList>" + ("" if result is None else f'<w:result w:val="{result}"/>')
+    data += "" if default is None else f'<w:default w:val="{default}"/>'
+    data += "".join(f'<w:listEntry w:val="{escape(entry)}"/>' for entry in entries) + "</w:ddList>"
+    return form_field("FORMDROPDOWN", data, name=name)
+
+
+def checkbox_entry(checked: bool, name: str = "Check1", part: str = "word/document.xml") -> dict[str, Any]:
+    return {"command": "FORMCHECKBOX", "sha256": hashlib.sha256(b"FORMCHECKBOX").hexdigest(), "part": part,
+            "form": {"type": "checkbox", "name": name, "checked": checked}}
+
+
+def dropdown_form(entries: list[str], selected: str | None, name: str = "Drop1") -> dict[str, Any]:
+    return {"type": "dropdown", "name": name, "entries": entries, "selected": selected}
+
+
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
+                   "text form field settings are not compared.")
+
+
 def make_docx(
     path: Path,
     body: str,
@@ -1222,6 +1265,170 @@ class CLITests(unittest.TestCase):
         after = self.exported()
         self.assertEqual(before[0], after[0])
         self.assertNotEqual(before[1], after[1])
+
+    def export_form(self, body: str, **options: Any) -> dict[str, Any]:
+        source = self.root / "essay.docx"
+        make_docx(source, body, **options)
+        self.cli("export", source, "--root", self.root)
+        meta: dict[str, Any] = json.loads(self.exported()[1])
+        return meta
+
+    def test_toggling_a_form_checkbox_is_stale_in_metadata_only(self) -> None:
+        source = self.root / "essay.docx"
+        meta = self.export_form(f"<w:p>{run('The Tenant may sublet: ')}{checkbox('0')}</w:p>")
+        self.assertEqual(meta["fields"], [checkbox_entry(False)])
+        self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
+        before = self.exported()
+        make_docx(source, f"<w:p>{run('The Tenant may sublet: ')}{checkbox('1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+        self.cli("export", source, "--root", self.root)
+        after = self.exported()
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(json.loads(after[1])["fields"], [checkbox_entry(True)])
+
+    def test_checkbox_state_follows_checked_then_default(self) -> None:
+        cases = [
+            (checkbox("1", "0"), True), (checkbox("0", "1"), False), (checkbox("", "0"), True),
+            (checkbox("true", None), True), (checkbox("off", None), False),
+            (checkbox(None, "1"), True), (checkbox(None, "0"), False), (checkbox(None, ""), True),
+            (checkbox(None, None), False), (checkbox("0", name=None), False),
+        ]
+        for xml, checked in cases:
+            with self.subTest(xml=xml):
+                meta = self.export_form(f"<w:p>{xml}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["checked"], checked)
+        self.assertEqual(meta["fields"][0]["form"]["name"], "")
+        # w:default is the state when w:checked is absent, so changing it is stale too.
+        source = self.root / "essay.docx"
+        make_docx(source, f"<w:p>{checkbox(None, '1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+
+    def test_choosing_another_dropdown_entry_is_stale_in_metadata_only(self) -> None:
+        source = self.root / "essay.docx"
+        meta = self.export_form(f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='0')}</w:p>")
+        self.assertEqual(meta["fields"][0]["form"], dropdown_form(["Yes", "No"], "Yes"))
+        self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
+        before = self.exported()
+        make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+        self.cli("export", source, "--root", self.root)
+        after = self.exported()
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(json.loads(after[1])["fields"][0]["form"], dropdown_form(["Yes", "No"], "No"))
+        # Changing the entries, even with the same selection, is stale too.
+        make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', 'Maybe', result='1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+
+    def test_dropdown_selection_is_null_when_it_names_no_entry(self) -> None:
+        cases = [
+            (dropdown("Yes", "No", result=None), "Yes"),  # no w:result: the default entry, 0
+            (dropdown("Yes", "No", result=None, default="1"), "No"),  # no w:result: w:default
+            (dropdown("Yes", "No", result="1", default="0"), "No"),  # w:result wins over w:default
+            (dropdown("Yes", "No", result="+01"), "No"),
+            (dropdown("Yes", "No", result="2"), None),
+            (dropdown("Yes", "No", result="-1"), None),
+            (dropdown("Yes", "No", result="first"), None),
+            (dropdown("Yes", "No", result="99999999999999999999"), None),
+            (dropdown("Yes", "No", result=None, default="5"), None),
+            (dropdown(result=None), None),
+            (dropdown(result="0"), None),
+        ]
+        for xml, selected in cases:
+            with self.subTest(xml=xml):
+                form = self.export_form(f"<w:p>{xml}</w:p>")["fields"][0]["form"]
+                self.assertEqual(form["selected"], selected)
+        self.assertEqual(form["entries"], [])
+
+    def test_form_field_save_churn_keeps_companions_byte_identical(self) -> None:
+        source = self.root / "essay.docx"
+        self.export_form(f"<w:p>{checkbox('1')}{dropdown('Yes', 'No', result='1')}</w:p>")
+        before = self.exported()
+        # Reordered w:ffData children, an instruction split across runs, rsid attributes,
+        # proofing marks and a bookmark between the field's runs.
+        reordered = checkbox("1", rsid="00AB12CD").replace(
+            '<w:name w:val="Check1"/><w:enabled/><w:calcOnExit w:val="0"/>',
+            '<w:calcOnExit w:val="0"/><w:enabled/><w:name w:val="Check1"/>')
+        reordered = reordered.replace(
+            '<w:checkBox><w:sizeAuto/><w:default w:val="0"/><w:checked w:val="1"/></w:checkBox>',
+            '<w:checkBox><w:checked w:val="1"/><w:default w:val="0"/><w:sizeAuto/></w:checkBox>')
+        split = dropdown("Yes", "No", result="1").replace(
+            '<w:r><w:instrText xml:space="preserve"> FORMDROPDOWN </w:instrText></w:r>',
+            '<w:r><w:instrText xml:space="preserve"> FORM</w:instrText></w:r><w:proofErr w:type="spellStart"/>'
+            '<w:bookmarkStart w:id="3" w:name="Drop1"/>'
+            '<w:r w:rsidR="0011AA22"><w:instrText>DROPDOWN </w:instrText></w:r>')
+        split = split.replace('<w:result w:val="1"/><w:listEntry', '<w:listEntry').replace(
+            '<w:listEntry w:val="No"/>', '<w:listEntry w:val="No"/><w:result w:val="1"/>')
+        self.assertNotEqual(split, dropdown("Yes", "No", result="1"))
+        make_docx(source, f'<w:p w:rsidR="00AB12CD">{reordered}{split}</w:p>', churn=True)
+        self.cli("check", source, "--root", self.root)
+        self.cli("export", source, "--root", self.root)
+        self.assertEqual(before, self.exported())
+
+    def test_fields_without_form_data_keep_their_metadata(self) -> None:
+        # Pins the metadata of ordinary fields (a PAGE field and a Zotero citation): it must not
+        # change, so documents without legacy form fields keep their companions.
+        body = (
+            '<w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r>'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+            '<w:p><w:fldSimple w:instr=" ADDIN ZOTERO_ITEM CSL_CITATION {} "><w:r><w:t>(Smith, 2024)</w:t></w:r>'
+            '</w:fldSimple></w:p>'
+        )
+        meta = self.export_form(body)
+        expected = {
+            "schema": 1, "view": "accept-insertions-omit-deletions", "coverage": "partial-prose",
+            "warnings": [
+                "Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).",
+                "Formatting and page layout are not compared; unchanged prose is not an identical document.",
+            ],
+            "review": [], "hyperlinks": [], "lists": [], "list_runs": [], "images": [],
+            "fields": [
+                {"command": "PAGE", "sha256": hashlib.sha256(b"PAGE").hexdigest(), "part": "word/document.xml"},
+                {"command": "ADDIN", "sha256": hashlib.sha256(b"ADDIN ZOTERO_ITEM CSL_CITATION {}").hexdigest(),
+                 "part": "word/document.xml"},
+            ],
+        }
+        self.assertEqual(meta, expected)
+        self.assertEqual(self.exported()[1], (json.dumps(expected, ensure_ascii=False, indent=2,
+                                                         sort_keys=True) + "\n").encode("utf-8"))
+
+    def test_form_fields_in_other_stories_and_tracked_changes(self) -> None:
+        extra = {
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}"><w:p>{checkbox("1", name="InHeader")}</w:p></w:hdr>',
+            "word/footnotes.xml": (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{checkbox("0", name="InNote")}'
+                                   '</w:p></w:footnote></w:footnotes>'),
+        }
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        boxed = f"<w:p>{checkbox('1', name='InBox')}</w:p>"
+        body = (anchored("Boxed:", modern_text_box(boxed))
+                + f'<w:p><w:ins w:id="1" w:author="Ben">{checkbox("1", name="Inserted")}</w:ins></w:p>'
+                + f'<w:p>{run("Kept.")}<w:del w:id="2" w:author="Ben">{checkbox("1", name="Deleted")}</w:del></w:p>'
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        meta = self.export_form(body, extra=extra, relationships=relationships)
+        # Like every field, one inside a tracked deletion is not recorded; an insertion's is.
+        self.assertEqual(meta["fields"], [
+            checkbox_entry(True, "InBox"), checkbox_entry(True, "Inserted"),
+            checkbox_entry(False, "InNote", "word/footnotes.xml"), checkbox_entry(True, "InHeader", "word/header1.xml"),
+        ])
+
+    def test_recorded_form_data_no_longer_warns_but_text_inputs_still_do(self) -> None:
+        behaviour = ('<w:entryMacro w:val="Go"/><w:exitMacro w:val="Done"/><w:helpText w:type="text" w:val="Help"/>'
+                     '<w:statusText w:type="text" w:val="Status"/>')
+        text_input = form_field("FORMTEXT", '<w:textInput><w:type w:val="number"/><w:default w:val="0"/>'
+                                '<w:maxLength w:val="4"/><w:format w:val="0"/></w:textInput>', "1200", name="Rent")
+        body = (f"<w:p>{checkbox('1', '0').replace('<w:enabled/>', '<w:enabled/>' + behaviour)}"
+                f"{dropdown('Yes', 'No', result='1', default='0')}</w:p><w:p>{run('Rent: ')}{text_input}</w:p>")
+        meta = self.export_form(body)
+        unsupported = sorted(w for w in meta["warnings"] if w.startswith("Unsupported Word construct"))
+        self.assertEqual(unsupported, [f"Unsupported Word construct {name}; its semantics are not fully compared."
+                                       for name in ("default", "format", "maxLength", "textInput", "type")])
+        # The text input's value is prose; it records no form state.
+        self.assertIn(b"Rent: 1200", self.exported()[0])
+        self.assertNotIn("form", meta["fields"][2])
+        self.assertEqual([f.get("form", {}).get("type") for f in meta["fields"]], ["checkbox", "dropdown", None])
 
     def test_hyperlink_target_changes_are_metadata_changes(self) -> None:
         body = '<w:p><w:hyperlink r:id="link"><w:r><w:t>Visible link label</w:t></w:r></w:hyperlink></w:p>'
