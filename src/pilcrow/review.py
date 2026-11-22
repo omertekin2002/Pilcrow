@@ -291,8 +291,23 @@ COMMENT_EDITS: list[tuple[tuple[str, ...], Callable[[Entry, Entry], str | None]]
         f"~ re-anchored {describe_comment({**new, 'resolved': None, 'anchor': old.get('anchor'), 'anchor_part': old.get('anchor_part')})}"
         f" → now {anchor(new)}"),
     (("text",), lambda old, new:
-        f"~ edited text of {describe_comment({**old, 'resolved': None})} → {short(new.get('text'))}"),
+        f"~ edited text of {describe_comment({**old, 'parent': new.get('parent'), 'resolved': None})} → {short(new.get('text'))}"),
 ]
+
+
+def through_pairs(view: Sequence[Entry], raw: Sequence[Entry], pairs: dict[int, int]) -> list[Entry]:
+    """``view`` with each reply's parent replaced by its parent's pairing, where it has one.
+
+    ``pairs`` maps a paired parent's position to the position of the new comment it is
+    paired with, so two replies whose parents are paired with each other compare equal
+    however the parent itself changed.
+    """
+    result = []
+    for entry, original in zip(view, raw, strict=True):
+        parent = original.get("reply_to")
+        paired = pairs.get(parent) if isinstance(parent, int) else None
+        result.append(entry if paired is None else {**entry, "parent": {"paired": paired}})
+    return result
 
 
 def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list[str]:
@@ -300,30 +315,54 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
     blocks = aligned(old, new)
     unmatched_old = {i for olds, _ in blocks for i in olds}
     unmatched_new = {j for _, news in blocks for j in news}
-    edits: dict[int, tuple[int, str]] = {}  # old position -> (new position, line)
-    for fields, word in COMMENT_EDITS:
-        def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
-            return canonical({k: v for k, v in entry.items() if k not in fields})
-        old_keys, new_keys = Counter(map(key, old)), Counter(map(key, new))
-        new_position = {key(entry): j for j, entry in enumerate(new)}
-        paired_new = {j for j, _ in edits.values()}
-        for i in sorted(unmatched_old - edits.keys()):
-            k = key(old[i])
-            # The metadata must identify this comment on both sides: exactly one each.
-            if old_keys[k] != 1 or new_keys[k] != 1:
-                continue
-            j = new_position[k]
-            if j not in unmatched_new or j in paired_new or not only_differs(old[i], new[j], *fields):
-                continue
-            line = word(old[i], new[j])
-            if line is not None:
+    # Entries outside the differing blocks are equal and pair up in order.
+    pairs = dict(zip((i for i in range(len(old)) if i not in unmatched_old),
+                     (j for j in range(len(new)) if j not in unmatched_new), strict=True))
+    edits: dict[int, tuple[int, str | None]] = {}  # old position -> (new position, line or None for no change)
+    # Pair parents before their replies: each round compares replies through the pairs of the
+    # rounds before it, and the rounds stop once one pairs nothing, even on a reply_to cycle.
+    found = True
+    while found:
+        found = False
+        new_paired = set(pairs.values())
+        old_now = through_pairs(old, old_raw, pairs)
+        new_now = through_pairs(new, new_raw, {j: j for j in new_paired})
+        for fields, word in [((), None), *COMMENT_EDITS]:
+            def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
+                return canonical({k: v for k, v in entry.items() if k not in fields})
+            old_keys, new_keys = Counter(map(key, old_now)), Counter(map(key, new_now))
+            new_position = {key(entry): j for j, entry in enumerate(new_now)}
+            for i in sorted(unmatched_old - pairs.keys()):
+                k = key(old_now[i])
+                # The metadata must identify this comment on both sides: exactly one each.
+                if old_keys[k] != 1 or new_keys[k] != 1:
+                    continue
+                j = new_position[k]
+                if j not in unmatched_new or j in new_paired:
+                    continue
+                if word is None:
+                    # Equal only through its parent's pairing: a reply whose parent changed. An
+                    # entry equal on its own just moved, and stays removed and added.
+                    if old[i] == new[j]:
+                        continue
+                    line = None
+                elif only_differs(old_now[i], new_now[j], *fields):
+                    line = word(old[i], new[j])
+                    if line is None:
+                        continue
+                else:
+                    continue
+                pairs[i] = j
                 edits[i] = (j, line)
-                paired_new.add(j)
+                new_paired.add(j)
+                found = True
     paired_new = {j for j, _ in edits.values()}
     lines = []
     for olds, news in blocks:
         for i in olds:
-            lines.append(edits[i][1] if i in edits else f"- removed {describe_comment(old[i])}")
+            line = edits[i][1] if i in edits else f"- removed {describe_comment(old[i])}"
+            if line is not None:
+                lines.append(line)
         lines += [f"+ added {describe_comment(new[j])}" for j in news if j not in paired_new]
     return lines
 

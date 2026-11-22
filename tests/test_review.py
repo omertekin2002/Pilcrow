@@ -288,6 +288,102 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 1): "Reply." (open)', lines)
         self.assertIn('+ added reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 2): "Reply." (open)', lines)
 
+    def thread(self, path: Path, parent: str = "Please clarify.", passage: str = "The cat sat.",
+               reply: str = "I agree.", done: str = "0", nested: str | None = None) -> None:
+        """Ada's comment 1 and her reply 2 (and, with ``nested``, a reply 3 to that reply), on one passage."""
+        comments, ids = {"1": parent, "2": reply}, {"1": "11111111", "2": "22222222"}
+        entries = [("11111111", None, done), ("22222222", "11111111", done)]
+        opened, closed = start("1") + start("2"), end("1") + end("2")
+        if nested is not None:
+            comments["3"], ids["3"] = nested, "33333333"
+            entries.append(("33333333", "22222222", done))
+            opened, closed = opened + start("3"), closed + end("3")
+        self.threaded(path, comments, ids, *entries, body=f"<w:p>{opened}{run(passage)}{closed}</w:p>")
+
+    def test_editing_a_parent_does_not_rewrite_its_replies(self) -> None:
+        self.thread(self.old)
+        self.thread(self.new, parent="Please clarify this.")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Comments"),
+                         ['~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."'])
+        # A reply that changed too is worded as an edit, describing its new parent.
+        self.thread(self.new, parent="Please clarify this.", reply="I agree, mostly.")
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."',
+            '~ edited text of reply by Ada to Ada\'s comment "Please clarify this." on "The cat sat.":'
+            ' "I agree." → "I agree, mostly."',
+        ])
+
+    def test_editing_a_commented_sentence_re_anchors_the_thread(self) -> None:
+        self.thread(self.old)
+        self.thread(self.new, passage="The dog sat.")
+        lines = self.section(self.review(), "Comments")
+        self.assertEqual(lines, [
+            '~ re-anchored comment by Ada on "The cat sat.": "Please clarify." → now on "The dog sat."',
+            '~ re-anchored reply by Ada to Ada\'s comment "Please clarify." on "The dog sat.": "I agree."'
+            ' → now on "The dog sat."',
+        ])
+
+    def test_resolving_a_parent_says_nothing_about_its_replies(self) -> None:
+        comments, ids = {"1": "Please clarify.", "2": "I agree."}, {"1": "11111111", "2": "22222222"}
+        body = f"<w:p>{start('1')}{start('2')}{run('The cat sat.')}{end('1')}{end('2')}</w:p>"
+        self.threaded(self.old, comments, ids, ("11111111", None, "0"), ("22222222", "11111111", "0"), body=body)
+        self.threaded(self.new, comments, ids, ("11111111", None, "1"), ("22222222", "11111111", "0"), body=body)
+        self.assertEqual(self.section(self.review(), "Comments"),
+                         ['~ resolved comment by Ada on "The cat sat.": "Please clarify."'])
+
+    def test_removing_a_parent_removes_its_replies(self) -> None:
+        self.thread(self.old)
+        make_docx(self.new, paragraph("The cat sat."))
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '- removed comment by Ada on "The cat sat.": "Please clarify." (open)',
+            '- removed reply by Ada to Ada\'s comment "Please clarify." on "The cat sat.": "I agree." (open)',
+        ])
+        # And the other way round: a new thread is added, parent and reply.
+        make_docx(self.old, paragraph("The cat sat."))
+        self.thread(self.new)
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '+ added comment by Ada on "The cat sat.": "Please clarify." (open)',
+            '+ added reply by Ada to Ada\'s comment "Please clarify." on "The cat sat.": "I agree." (open)',
+        ])
+
+    def test_replies_to_replies_follow_their_edited_parents(self) -> None:
+        self.thread(self.old, nested="Me too.")
+        self.thread(self.new, parent="Please clarify this.", reply="I agree, mostly.", nested="Me too.")
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."',
+            '~ edited text of reply by Ada to Ada\'s comment "Please clarify this." on "The cat sat.":'
+            ' "I agree." → "I agree, mostly."',
+        ])
+
+    def test_a_reply_whose_parent_is_not_paired_is_removed_and_added(self) -> None:
+        # Two parents change at once: neither can be worded as an edit, so neither can their replies.
+        def write(path: Path, first: str, second: str) -> None:
+            comments = {"1": first, "2": second, "3": "Reply."}
+            ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+            body = "".join(f"<w:p>{start(c)}{run('Same passage.')}{end(c)}</w:p>" for c in "12") + \
+                f"<w:p>{start('3')}{run('Passage 3.')}{end('3')}</w:p>"
+            self.threaded(path, comments, ids, ("11111111", None, "0"), ("22222222", None, "0"),
+                          ("33333333", "11111111", "0"), body=body)
+        write(self.old, "Same.", "Same.")
+        write(self.new, "Changed.", "Changed.")
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 1): "Reply." (open)',
+                      lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Changed." on "Same passage." (comment 1): "Reply." (open)',
+                      lines)
+
+    def test_a_reply_to_cycle_ends(self) -> None:
+        # Malformed: each comment names the other as its parent.
+        comments, ids = {"1": "First.", "2": "Second."}, {"1": "11111111", "2": "22222222"}
+        self.threaded(self.old, comments, ids, ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
+        self.threaded(self.new, {"1": "First, edited.", "2": "Second."}, ids,
+                      ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
+        self.assertEqual(self.section(self.review(), "Comments"),
+                         ['~ edited text of reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First."'
+                          ' → "First, edited."'])
+
     def test_long_comment_text_is_shortened(self) -> None:
         long = "word " * 40
         make_docx(self.old, paragraph("Body."))

@@ -85,6 +85,11 @@ and added, or to a notice that the category changed. A reply is matched by its
 parent's author, text, and anchor rather than its recorded position, so inserting
 an earlier comment does not change it; when several comments share that identity,
 the position is compared too, so moving a reply between them is still reported.
+Replies are then compared through their parents' pairing: once a parent is matched
+or worded as an edit, a reply to it counts as having the same parent, so editing,
+re-anchoring, or resolving a parent gives no line for an unchanged reply, and a
+reply that changed too is worded as an edit (describing its new parent). A reply
+whose parent is removed, added, or cannot be paired is still removed and added.
 An image whose media part goes missing or appears is listed as removed and added.
 Long texts are shortened to 80 characters for display.
 
