@@ -151,6 +151,50 @@ def vml_picture(rid: str) -> str:
     return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
 
 
+C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+VML_O = "urn:schemas-microsoft-com:office:office"
+
+
+def graphic(uri: str, content: str) -> str:
+    """An inline DrawingML graphic frame holding ``content``."""
+    return (f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{uri}">'
+            f'{content}</a:graphicData></a:graphic></wp:inline></w:drawing>')
+
+
+def chart(rid: str) -> str:
+    """An inline DrawingML chart referencing a chart part relationship."""
+    return graphic(C, f'<c:chart xmlns:c="{C}" r:id="{rid}"/>')
+
+
+def smartart(data: str, layout: str = "dgmLayout", style: str = "dgmStyle", colors: str = "dgmColors") -> str:
+    """An inline SmartArt diagram referencing its data, layout, quick-style and colour parts."""
+    return graphic(DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="{data}" r:lo="{layout}" r:qs="{style}" r:cs="{colors}"/>')
+
+
+def ole_object(rid: str, prog_id: str = "Excel.Sheet.12", kind: str = "Embed") -> str:
+    """A w:object with its VML preview shape and an o:OLEObject referencing the embedding."""
+    return (f'<w:object><v:shape xmlns:v="{V}" id="_x0000_i1025" style="width:300pt;height:150pt"/>'
+            f'<o:OLEObject xmlns:o="{VML_O}" Type="{kind}" ProgID="{escape(prog_id, {chr(34): "&quot;"})}" '
+            f'ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="{rid}"/></w:object>')
+
+
+def alt_chunk(rid: str) -> str:
+    return f'<w:altChunk r:id="{rid}"/>'
+
+
+def rel(rid: str, kind: str, target: str, *, external: bool = False) -> str:
+    """A relationship of type ``kind`` (e.g. chart, diagramData, oleObject, aFChunk)."""
+    mode = ' TargetMode="External"' if external else ""
+    return f'<Relationship Id="{rid}" Type="{R}/{kind}" Target="{target}"{mode}/>'
+
+
+def part_entry(kind: str, data: str | None, part: str = "word/document.xml", **extra: str) -> dict[str, Any]:
+    """The objects entry for an object whose target part holds ``data`` (None: missing)."""
+    sha = None if data is None else hashlib.sha256(data.encode("utf-8")).hexdigest()
+    return {"kind": kind, "part": part, "sha256": sha, **extra}
+
+
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 
@@ -292,6 +336,40 @@ def comments_extended(*entries: tuple[str, str | None, str | None]) -> str:
         return f'<w15:commentEx w15:paraId="{para}"{parent_xml}{done_xml}/>'
     return (f'<w15:commentsEx xmlns:w15="{W15}" xmlns:mc="{MC}" mc:Ignorable="w15">'
             + "".join(entry(*e) for e in entries) + "</w15:commentsEx>")
+
+
+def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str = "Plan",
+                 chunk: str = "Chunk text") -> dict[str, str]:
+    """The parts a chart, a SmartArt diagram, an embedded workbook and an imported chunk point to."""
+    return {
+        "word/charts/chart1.xml": (f'<c:chartSpace xmlns:c="{C}" xmlns:r="{R}"><c:chart><c:plotArea><c:barChart>'
+                                   f'<c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>{value}</c:v></c:pt>'
+                                   '</c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart>'
+                                   '<c:externalData r:id="rId1"/></c:chartSpace>'),
+        "word/charts/_rels/chart1.xml.rels": (f'<Relationships xmlns="{PKG_R}">'
+                                              + rel("rId1", "package", "../embeddings/chart_workbook.xlsx")
+                                              + "</Relationships>"),
+        "word/embeddings/chart_workbook.xlsx": "chart workbook bytes",
+        "word/diagrams/data1.xml": (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst><dgm:pt modelId="1">'
+                                    f"<dgm:t><a:p><a:r><a:t>{node}</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst>"
+                                    "</dgm:dataModel>"),
+        "word/diagrams/layout1.xml": "<layout/>",
+        "word/diagrams/quickStyle1.xml": "<quickStyle/>",
+        "word/diagrams/colors1.xml": "<colors/>",
+        "word/embeddings/Microsoft_Excel_Worksheet.xlsx": workbook,
+        "word/afchunk.htm": f"<html><body><p>{chunk}</p></body></html>",
+    }
+
+
+# Relationships and a body for object_parts(): every object kind, inline and block-level.
+OBJECT_RELS = (rel("chart", "chart", "charts/chart1.xml") + rel("dgmData", "diagramData", "diagrams/data1.xml")
+               + rel("dgmLayout", "diagramLayout", "diagrams/layout1.xml")
+               + rel("dgmStyle", "diagramQuickStyle", "diagrams/quickStyle1.xml")
+               + rel("dgmColors", "diagramColors", "diagrams/colors1.xml")
+               + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+               + rel("chunk", "aFChunk", "afchunk.htm"))
+OBJECT_BODY = (f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{smartart("dgmData")}</w:r>'
+               f'<w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}')
 
 
 class CLITests(unittest.TestCase):
@@ -1555,6 +1633,139 @@ class CLITests(unittest.TestCase):
                 _, meta = self.export_objects(body, extra=media, relationships=image_rel("fallback", "media/fallback.png"))
                 self.assertEqual(meta["objects"], [equation_entry(form)])
                 self.assertEqual(meta["images"], [])
+
+    def test_chart_diagram_embedded_object_and_chunk_edits_make_check_stale(self) -> None:
+        def write(body: str = OBJECT_BODY, **parts: str) -> None:
+            make_docx(self.root / "essay.docx", body, extra=object_parts(**parts), relationships=OBJECT_RELS)
+
+        write()
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        data = json.loads(meta)
+        parts = object_parts()
+        self.assertEqual(data["objects"], [
+            part_entry("chart", parts["word/charts/chart1.xml"]),
+            part_entry("diagram", parts["word/diagrams/data1.xml"]),
+            part_entry("embedded object", parts["word/embeddings/Microsoft_Excel_Worksheet.xlsx"], prog_id="Excel.Sheet.12"),
+            part_entry("imported chunk", parts["word/afchunk.htm"]),
+        ])
+        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported drawing][Unsupported object]"
+                                                "\n\n[Unsupported altChunk]\n")
+        # Hashed parts are compared now; formatting parts and the chart's workbook still are not.
+        unrendered = sorted(wn.split(";")[0].removeprefix("Unrendered package part: ")
+                            for wn in data["warnings"] if wn.startswith("Unrendered package part"))
+        self.assertEqual(unrendered, ["word/diagrams/colors1.xml", "word/diagrams/layout1.xml",
+                                      "word/diagrams/quickStyle1.xml", "word/embeddings/chart_workbook.xlsx"])
+        self.assertIn("Unsupported object: content is not rendered in prose; inspect the DOCX in Word.", data["warnings"])
+        # Exporting the same document again gives byte-identical companions.
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), (prose, meta))
+        edits: list[dict[str, Any]] = [{"value": "99"}, {"workbook": "workbook v2"}, {"node": "Build"},
+                                       {"chunk": "Other text"}]
+        for edit in edits:
+            with self.subTest(edit=edit):
+                write(**edit)
+                result = self.cli("check", "essay.docx", code=1)
+                self.assertIn("STALE", result.stdout + result.stderr)
+        # Neither workbook a chart reads its values from nor diagram formatting is fingerprinted.
+        changed = object_parts()
+        changed["word/embeddings/chart_workbook.xlsx"] = "edited chart workbook"
+        changed["word/diagrams/colors1.xml"] = "<colors edited='1'/>"
+        make_docx(self.root / "essay.docx", OBJECT_BODY, extra=changed, relationships=OBJECT_RELS)
+        self.cli("check", "essay.docx")
+        # Adding or removing an object is a change too.
+        added = OBJECT_BODY.replace("</w:p>", f'<w:r>{chart("chart")}</w:r></w:p>', 1)
+        removed = OBJECT_BODY.replace(alt_chunk("chunk"), "")
+        for body in (added, removed):
+            with self.subTest(body=body):
+                write(body)
+                self.cli("check", "essay.docx", code=1)
+        write(value="99")
+        self.cli("export", "essay.docx")
+        self.cli("check", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], prose, "object edits must not alter the prose")
+        self.assertNotEqual(after[1], meta)
+
+    def test_objects_in_headers_notes_and_text_boxes_are_recorded_by_part(self) -> None:
+        chart_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart2.xml")}</Relationships>'
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p><w:r>{chart("hc")}</w:r></w:p></w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'<w:p><w:r>{chart("fc")}</w:r></w:p></w:footnote></w:footnotes>')
+        footnote_rels = f'<Relationships xmlns="{PKG_R}">{rel("fc", "chart", "charts/chart3.xml")}</Relationships>'
+        boxed = f'<w:p><w:r>{chart("chart")}</w:r></w:p>'
+        # A chart in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{chart("chart")}</w:r></w:del></w:p>'
+        body = (anchored("Box:", modern_text_box(boxed)) + deleted
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + rel("headerRef", "header", "header1.xml")
+                         + rel("footnotes", "footnotes", "footnotes.xml"))
+        extra = {"word/header1.xml": header, "word/_rels/header1.xml.rels": chart_rels,
+                 "word/footnotes.xml": footnotes, "word/_rels/footnotes.xml.rels": footnote_rels,
+                 "word/charts/chart1.xml": "<body chart/>", "word/charts/chart2.xml": "<header chart/>",
+                 "word/charts/chart3.xml": "<footnote chart/>"}
+        _, meta = self.export_objects(body, extra=extra, relationships=relationships)
+        self.assertEqual(meta["objects"], [
+            part_entry("chart", "<body chart/>"),
+            part_entry("chart", "<footnote chart/>", "word/footnotes.xml"),
+            part_entry("chart", "<header chart/>", "word/header1.xml"),
+        ])
+        self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
+
+    def test_renamed_object_part_with_the_same_content_stays_fresh(self) -> None:
+        body = f'<w:p><w:r>{chart("chart")}</w:r></w:p>'
+        make_docx(self.root / "essay.docx", body, extra={"word/charts/chart1.xml": "<chart/>"},
+                  relationships=rel("chart", "chart", "charts/chart1.xml"))
+        self.cli("export", "essay.docx")
+        make_docx(self.root / "essay.docx", body, extra={"word/charts/chart2.xml": "<chart/>"},
+                  relationships=rel("chart", "chart", "charts/chart2.xml"))
+        self.cli("check", "essay.docx")
+
+    def test_linked_and_missing_object_parts(self) -> None:
+        missing_note = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
+                        "or point to missing parts; those objects are recorded without a hash.")
+        linked = f'<w:p><w:r>{ole_object("link", "Excel.Sheet.12", "Link")}</w:r></w:p>'
+        _, meta = self.export_objects(linked, relationships=rel("link", "oleObject", "file:///C:/data/budget.xlsx", external=True))
+        self.assertEqual(meta["objects"], [{"kind": "embedded object", "part": "word/document.xml",
+                                            "prog_id": "Excel.Sheet.12", "target": "file:///C:/data/budget.xlsx"}])
+        self.assertNotIn(missing_note, meta["warnings"])
+        # A relationship that is missing, one whose part is missing, and a chart with no r:id at all.
+        dangling = (f'<w:p><w:r>{chart("nowhere")}</w:r><w:r>{chart("gone")}</w:r>'
+                    f'<w:r>{graphic(C, f"<c:chart xmlns:c={chr(34)}{C}{chr(34)}/>")}</w:r></w:p>{alt_chunk("gone")}')
+        _, meta = self.export_objects(dangling, relationships=rel("gone", "chart", "charts/chart9.xml"))
+        self.assertEqual(meta["objects"], [part_entry("chart", None)] * 3 + [part_entry("imported chunk", None)])
+        self.assertIn(missing_note, meta["warnings"])
+
+    def test_compatibility_copies_record_one_chart(self) -> None:
+        # Word stores a chart in mc:Choice with a picture of it in mc:Fallback; an object only the
+        # unselected copy references is not hashed, and keeps its unrendered-part warning.
+        fallback = f'<w:r>{vml_picture("fallback")}</w:r><w:r>{ole_object("ole")}</w:r>'
+        inline = (f'<w:p>{run("Chart: ")}<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">'
+                  f'<w:r>{chart("chart")}</w:r></mc:Choice><mc:Fallback>{fallback}</mc:Fallback>'
+                  "</mc:AlternateContent></w:p>")
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14"><w:p><w:r>{chart("chart")}</w:r></w:p>'
+                 f'</mc:Choice><mc:Fallback><w:p>{fallback}</w:p></mc:Fallback></mc:AlternateContent>')
+        extra = {"word/charts/chart1.xml": "<chart/>", "word/media/fallback.png": "fallback bytes",
+                 "word/embeddings/oleObject1.bin": "ole bytes"}
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + image_rel("fallback", "media/fallback.png")
+                         + rel("ole", "oleObject", "embeddings/oleObject1.bin"))
+        for body in (inline, block):
+            with self.subTest(body=body):
+                _, meta = self.export_objects(body, extra=extra, relationships=relationships)
+                self.assertEqual(meta["objects"], [part_entry("chart", "<chart/>")])
+                self.assertEqual(meta["images"], [])
+                unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
+                self.assertEqual(unrendered, [
+                    "Unrendered package part: word/embeddings/oleObject1.bin; changes to its content are not compared.",
+                    "Unrendered package part: word/media/fallback.png; changes to its content are not compared.",
+                ])
+
+    def test_an_imported_chunk_inside_a_paragraph_is_recorded(self) -> None:
+        body = f'<w:p>{run("Before.")}{alt_chunk("chunk")}</w:p>'
+        _, meta = self.export_objects(body, extra={"word/afchunk.htm": "<p>x</p>"},
+                                      relationships=rel("chunk", "aFChunk", "afchunk.htm"))
+        self.assertEqual(meta["objects"], [part_entry("imported chunk", "<p>x</p>")])
 
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")

@@ -21,10 +21,14 @@ try:
         COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
+        OBJECT_BODY,
+        OBJECT_RELS,
         PROJECT,
         R,
         abstract_num,
+        alt_chunk,
         anchored,
+        chart,
         comments_extended,
         comments_part,
         end,
@@ -35,8 +39,11 @@ try:
         make_docx,
         num,
         numbering,
+        object_parts,
+        ole_object,
         paragraph,
         picture,
+        rel,
         run,
         start,
         symbol,
@@ -47,10 +54,14 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
+        OBJECT_BODY,
+        OBJECT_RELS,
         PROJECT,
         R,
         abstract_num,
+        alt_chunk,
         anchored,
+        chart,
         comments_extended,
         comments_part,
         end,
@@ -61,8 +72,11 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         make_docx,
         num,
         numbering,
+        object_parts,
+        ole_object,
         paragraph,
         picture,
+        rel,
         run,
         start,
         symbol,
@@ -493,6 +507,77 @@ class ReviewTests(unittest.TestCase):
         make_docx(self.new, paragraph("Plain.") + f"<w:p>{symbol()}</w:p>")
         lines = self.section(self.review(), "Equations and symbols")
         self.assertEqual(lines, ["+ added symbol 1 (word/document.xml): F061 (Symbol)"])
+
+    def write_objects(self, path: Path, body: str = OBJECT_BODY, relationships: str = OBJECT_RELS,
+                      **parts: str) -> None:
+        make_docx(path, body, extra=object_parts(**parts), relationships=relationships)
+
+    def test_chart_diagram_embedded_object_and_chunk_edits(self) -> None:
+        self.write_objects(self.old)
+        title = "Charts, diagrams and embedded objects"
+        for edit, line in (({"value": "99"}, "~ chart 1 (word/document.xml) changed"),
+                           ({"node": "Build"}, "~ diagram 1 (word/document.xml) changed"),
+                           ({"workbook": "workbook v2"}, "~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed"),
+                           ({"chunk": "Other text"}, "~ imported chunk 1 (word/document.xml) changed")):
+            with self.subTest(edit=edit):
+                self.write_objects(self.new, **edit)
+                report = self.review()
+                self.assertIn("Prose: no changes", report)
+                self.assertEqual(self.section(report, title), [line])
+                self.assertNotIn("Equations and symbols", report)
+                markdown = self.markdown()
+                self.assertIn(f"### {title}\n\n- `~` {line[2:]}\n", markdown)
+        self.write_objects(self.new)
+        self.assertNotIn(title, self.review(code=0))
+
+    def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
+        self.write_objects(self.old)
+        added = OBJECT_BODY.replace("</w:p>", f'<w:r>{chart("chart")}</w:r></w:p>', 1)
+        self.write_objects(self.new, added)
+        (line,) = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertRegex(line, r"^\+ added chart 2 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        self.write_objects(self.new, OBJECT_BODY.replace(alt_chunk("chunk"), ""))
+        (line,) = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertRegex(line, r"^- removed imported chunk 1 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        # A part that goes missing, or a link that changes target, is removed and added.
+        self.write_objects(self.new, relationships=OBJECT_RELS.replace("charts/chart1.xml", "charts/missing.xml"))
+        lines = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r"^- removed chart 1 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        self.assertEqual(lines[1], "+ added chart 1 (word/document.xml): with a missing part")
+        for path, target in ((self.old, "file:///C:/a.xlsx"), (self.new, "file:///C:/b.xlsx")):
+            make_docx(path, f'<w:p><w:r>{ole_object("link", kind="Link")}</w:r></w:p>',
+                      relationships=rel("link", "oleObject", target, external=True))
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"), [
+            "- removed embedded object 1 (Excel.Sheet.12, word/document.xml): linked to file:///C:/a.xlsx",
+            "+ added embedded object 1 (Excel.Sheet.12, word/document.xml): linked to file:///C:/b.xlsx",
+        ])
+
+    def test_object_and_equation_sections_are_separate(self) -> None:
+        def write(path: Path, math: str = "E=mc2", **parts: str) -> None:
+            self.write_objects(path, f"<w:p>{equation(math)}</w:p>" + OBJECT_BODY, **parts)
+
+        write(self.old)
+        write(self.new, value="99")
+        report = self.review()
+        self.assertNotIn("Equations and symbols", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
+        write(self.new, "E=mc3")
+        report = self.review()
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
+
+    def test_markdown_escapes_an_embedded_object_prog_id(self) -> None:
+        prog_id = "Evil*<b>`x`[y](https://example.invalid)"
+        for path, workbook in ((self.old, "v1"), (self.new, "v2")):
+            make_docx(path, f'<w:p><w:r>{ole_object("ole", prog_id)}</w:r></w:p>',
+                      extra={"word/embeddings/oleObject1.bin": workbook},
+                      relationships=rel("ole", "oleObject", "embeddings/oleObject1.bin"))
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         [f"~ embedded object 1 ({prog_id}, word/document.xml) changed"])
+        self.assertIn("- `~` embedded object 1 (Evil\\*&lt;b&gt;\\`x\\`\\[y\\](https\\://example.invalid), "
+                      "word/document.xml) changed\n", self.markdown())
 
     def test_bullet_to_number_list_format_change(self) -> None:
         body = list_item("First.", "1") + list_item("Second.", "1")
