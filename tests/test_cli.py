@@ -259,6 +259,35 @@ def simple_form(text: str = "E=mc2") -> list[Any]:
     return [f"{{{M}}}oMath", [], "", [[f"{{{M}}}r", [], "", [[f"{{{M}}}t", [], text, []]]]]]
 
 
+def math_form(text: str) -> list[Any]:
+    """The canonical form of ``math_run(text)``."""
+    return [f"{{{M}}}r", [], "", [[f"{{{M}}}t", [], text, []]]]
+
+
+def structure(name: str, *args: tuple[str, str], props: str = "") -> str:
+    """An OMML structure m:<name> with its m:<name>Pr properties and (argument, content) children;
+    plain-string content is one math run."""
+    pr = f"<m:{name}Pr>{props}</m:{name}Pr>" if props else ""
+    inner = "".join(f"<m:{arg}>{content if content.startswith('<') or not content else math_run(content)}</m:{arg}>"
+                    for arg, content in args)
+    return f"<m:{name}>{pr}{inner}</m:{name}>"
+
+
+def energy(power: str = "2") -> str:
+    """E=mc² as Word writes it: a run and a superscript."""
+    return math_run("E=m") + structure("sSup", ("e", "c"), ("sup", power))
+
+
+def energy_form(power: str = "2") -> list[Any]:
+    """The canonical form of ``equation(energy(power))``."""
+    return [f"{{{M}}}oMath", [], "", [math_form("E=m"), [f"{{{M}}}sSup", [], "", [
+        [f"{{{M}}}e", [], "", [math_form("c")]], [f"{{{M}}}sup", [], "", [math_form(power)]]]]]]
+
+
+MATH_NOTE = ("Equations are shown as linear [Math: …] text; layout, fonts and alignment are not compared, "
+             "and equation fingerprints are in objects.")
+
+
 def image_rel(rid: str, target: str, *, external: bool = False) -> str:
     mode = ' TargetMode="External"' if external else ""
     return f'<Relationship Id="{rid}" Type="{R}/image" Target="{target}"{mode}/>'
@@ -1901,35 +1930,37 @@ class CLITests(unittest.TestCase):
         prose, meta = self.exported()
         return prose.decode("utf-8"), json.loads(meta)
 
-    def test_equation_and_symbol_edits_make_check_stale_without_changing_prose(self) -> None:
-        def body(math: str = "E=mc2", char: str = "F061", font: str = "Symbol") -> str:
-            return f'<w:p>{run("Energy: ")}{equation(math)}{run(" and ")}{symbol(char, font)}</w:p>'
+    def test_equation_and_symbol_edits_make_check_stale(self) -> None:
+        def body(power: str = "2", char: str = "F061", font: str = "Symbol") -> str:
+            return f'<w:p>{run("Energy: ")}{equation(energy(power))}{run(" and ")}{symbol(char, font)}</w:p>'
 
         prose, meta = self.export_objects(body())
-        self.assertEqual(prose, "Energy: [Unsupported oMath] and [Unsupported sym]\n")
+        self.assertEqual(prose, "Energy: [Math: E=mc^2] and [Unsupported sym]\n")
+        # The fingerprints are what they were before equations had prose.
         self.assertEqual(meta["objects"], [
-            equation_entry(simple_form()),
+            equation_entry(energy_form()),
             {"kind": "symbol", "part": "word/document.xml", "font": "Symbol", "char": "F061"},
         ])
-        self.assertIn("Unsupported oMath: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        self.assertIn(MATH_NOTE, meta["warnings"])
+        self.assertFalse([w for w in meta["warnings"] if "oMath" in w or "XML construct" in w], meta["warnings"])
         self.assertIn("Unsupported sym: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
         companions = self.exported()
         # Exporting the same document again gives byte-identical companions.
         self.cli("export", "essay.docx")
         self.assertEqual(self.exported(), companions)
-        for changed in (body("E=mc3"), body(char="F062"), body(font="Wingdings")):
+        for changed in (body("3"), body(char="F062"), body(font="Wingdings")):
             make_docx(self.root / "essay.docx", changed)
             result = self.cli("check", "essay.docx", code=1)
             self.assertIn("STALE", result.stdout + result.stderr)
         # w:char is a hex number: its letter case is not a change.
         make_docx(self.root / "essay.docx", body(char="f061"))
         self.cli("check", "essay.docx")
-        make_docx(self.root / "essay.docx", body("E=mc3"))
+        make_docx(self.root / "essay.docx", body("3"))
         self.cli("export", "essay.docx")
         self.cli("check", "essay.docx")
         after = self.exported()
-        self.assertEqual(after[0], companions[0], "equation edits must not alter the prose")
-        self.assertEqual(json.loads(after[1])["objects"][0], equation_entry(simple_form("E=mc3")))
+        self.assertEqual(after[0], b"Energy: [Math: E=mc^3] and [Unsupported sym]\n")
+        self.assertEqual(json.loads(after[1])["objects"][0], equation_entry(energy_form("3")))
 
     def test_documents_without_equations_or_symbols_have_no_objects_key(self) -> None:
         _, meta = self.export_objects(paragraph("Plain prose."))
@@ -2017,7 +2048,10 @@ class CLITests(unittest.TestCase):
 
         prose, meta = self.export_objects(body)
         self.assertEqual(meta["objects"], [para_entry(t) for t in "bcim"])
-        self.assertEqual(prose, "Before.\n\n[Table]\n\n[Row]\n\n[Cell]\n\n(empty)\n\n[/Row]\n\n[/Table]\n")
+        # Block-level math is a paragraph of its own; without a text box, every compatibility
+        # copy's prose is read, as for paragraphs, while only the chosen copy is fingerprinted.
+        self.assertEqual(prose, "Before.\n\n[Math: b]\n\n[Table]\n\n[Row]\n\n[Cell]\n\n[Math: c]\n\n[/Row]\n\n"
+                                "[/Table]\n\n[Math: i]\n\n[Math: m]\n\n[Math: f]\n")
         make_docx(self.root / "essay.docx", body.replace(equation("b", para=True), equation("B", para=True)))
         self.cli("check", "essay.docx", code=1)
 
@@ -2633,6 +2667,200 @@ class CLITests(unittest.TestCase):
         result = self.cli("export", "essay.docx")
         self.assertIn("Hidden text is included", result.stderr)
         self.assertIn(b"Hidden words.", self.exported()[0])
+
+
+class EquationTextTests(unittest.TestCase):
+    """Equations as linear [Math: …] text in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-math-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, **options)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def math(self, content: str) -> str:
+        """The prose of one paragraph holding one equation with ``content``."""
+        return self.extract(f"<w:p>{equation(content)}</w:p>")[0]
+
+    def test_each_structure_has_its_linear_text(self) -> None:
+        r = math_run
+        cases = [
+            # Text runs, whitespace collapsed; w:r inside math; formatting adds no text.
+            (r(" a  +\n b "), "a + b"),
+            (f'{r("x")}<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> if </w:t></w:r>{r("y")}', "x if y"),
+            ('<m:r><m:rPr><m:sty m:val="p"/></m:rPr><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr><m:t>z</m:t></m:r>', "z"),
+            # Fractions: an atom (one character, letters only, a number) is not wrapped.
+            (structure("f", ("num", "a"), ("den", "b")), "a/b"),
+            (structure("f", ("num", "a+b"), ("den", "2c")), "(a+b)/(2c)"),
+            (structure("f", ("num", "dy"), ("den", "3.5")), "dy/3.5"),
+            (structure("f", ("num", "n"), ("den", "k"), props='<m:type m:val="noBar"/>'), "n¦k"),
+            (structure("f", ("num", "a"), ("den", "b"), props='<m:type m:val="skw"/>'), "a/b"),
+            # Scripts.
+            (structure("sSup", ("e", "x"), ("sup", "2")), "x^2"),
+            (structure("sSup", ("e", "x"), ("sup", "n+1")), "x^(n+1)"),
+            (structure("sSub", ("e", "x"), ("sub", "i")), "x_i"),
+            (structure("sSubSup", ("e", "x"), ("sub", "i"), ("sup", "2")), "x_i^2"),
+            (structure("sPre", ("sub", "i"), ("sup", "2"), ("e", "x")), "_i^2 x"),
+            # Radicals: a degree shows unless it is hidden or empty.
+            (structure("rad", ("deg", ""), ("e", "x"), props='<m:degHide m:val="1"/>'), "√(x)"),
+            (structure("rad", ("deg", "3"), ("e", "x")), "√(3&x)"),
+            (structure("rad", ("deg", "3"), ("e", "x+1"), props="<m:degHide/>"), "√(x+1)"),
+            (structure("rad", ("deg", ""), ("e", "x"), props='<m:degHide m:val="off"/>'), "√(x)"),
+            # Delimiters: defaults, custom characters, and an empty m:val for none.
+            (structure("d", ("e", "a"), ("e", "b")), "(a|b)"),
+            (structure("d", ("e", "0"), ("e", "1"), props='<m:begChr m:val="["/><m:sepChr m:val=","/>'), "[0,1)"),
+            (structure("d", ("e", "x"), props='<m:begChr m:val="|"/><m:endChr m:val="|"/>'), "|x|"),
+            (structure("d", ("e", "x"), props='<m:begChr m:val=""/><m:endChr m:val="}"/>'), "x}"),
+            # N-ary operators.
+            (structure("nary", ("sub", "i=1"), ("sup", "n"), ("e", structure("sSub", ("e", "x"), ("sub", "i"))),
+                       props='<m:chr m:val="∑"/>'), "∑_(i=1)^n x_i"),
+            (structure("nary", ("sub", "0"), ("sup", "1"), ("e", "f")), "∫_0^1 f"),
+            (structure("nary", ("sub", ""), ("sup", ""), ("e", "x"),
+                       props='<m:chr m:val="∏"/><m:subHide m:val="1"/><m:supHide/>'), "∏x"),
+            (structure("nary", ("sub", "S"), ("sup", "T"), ("e", "x"), props="<m:supHide/>"), "∫_S x"),
+            # Functions and limits.
+            (structure("func", ("fName", "sin"), ("e", "x")), "sin x"),
+            (structure("func", ("fName", structure("limLow", ("e", "lim"), ("lim", "n→∞"))),
+                       ("e", structure("sSub", ("e", "a"), ("sub", "n")))), "lim_(n→∞) a_n"),
+            (structure("limUpp", ("e", "max"), ("lim", "k")), "max^k"),
+            # Accents, bars, group characters.
+            (structure("acc", ("e", "x")), "x̂"),
+            (structure("acc", ("e", "x+y"), props='<m:chr m:val="̃"/>'), "(x+y)̃"),
+            (structure("bar", ("e", "x"), props='<m:pos m:val="top"/>'), "x̅"),
+            (structure("bar", ("e", "x")), "x̲"),
+            (structure("groupChr", ("e", "a+b")), "(a+b)⏟"),
+            (structure("groupChr", ("e", "a"), props='<m:chr m:val="⏞"/><m:pos m:val="top"/>'), "a⏞"),
+            # Boxes and phantoms show their content.
+            (structure("box", ("e", "a+b")), "a+b"),
+            (structure("borderBox", ("e", "E")), "E"),
+            (structure("phant", ("e", "x"), props='<m:show m:val="0"/>'), "x"),
+            # Matrices and equation arrays.
+            ("<m:m><m:mPr><m:mcs><m:mc><m:mcPr><m:count m:val=\"2\"/></m:mcPr></m:mc></m:mcs></m:mPr>"
+             + "".join(f"<m:mr><m:e>{r(a)}</m:e><m:e>{r(b)}</m:e></m:mr>" for a, b in (("a", "b"), ("c", "d")))
+             + "</m:m>", "[a, b; c, d]"),
+            (structure("eqArr", ("e", "x=1"), ("e", "y=2")), "x=1; y=2"),
+            # Nesting: a fraction inside a superscript inside a delimiter.
+            (structure("d", ("e", structure("sSup", ("e", "x"), ("sup", structure("f", ("num", "a+b"), ("den", "2")))))),
+             "(x^((a+b)/2))"),
+            # A delimiter is not wrapped again as an operand.
+            (structure("sSup", ("e", structure("d", ("e", "a+b"))), ("sup", "2")), "(a+b)^2"),
+            (structure("sSup", ("e", structure("d", ("e", "a+b"), props='<m:begChr m:val=""/>')), ("sup", "2")),
+             "(a+b))^2"),
+        ]
+        for content, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.math(content), f"[Math: {expected}]\n")
+
+    def test_an_equation_paragraph_shows_each_equation(self) -> None:
+        display = (f'<m:oMathPara xmlns:m="{M}"><m:oMathParaPr><m:jc m:val="center"/></m:oMathParaPr>'
+                   f'<m:oMath>{math_run("a=1")}</m:oMath><m:oMath>{energy()}</m:oMath></m:oMathPara>')
+        prose, meta = self.extract(f"<w:p>{run('So ')}{display}</w:p>")
+        self.assertEqual(prose, "So [Math: a=1] [Math: E=mc^2]\n")
+        self.assertEqual([entry["kind"] for entry in meta["objects"]], ["equation"])
+        self.assertEqual(self.math(""), "[Math: (empty)]\n")
+        self.assertEqual(self.extract(f'<w:p><m:oMathPara xmlns:m="{M}"/></w:p>')[0], "[Math: (empty)]\n")
+
+    def test_block_level_math_is_its_own_paragraph(self) -> None:
+        cell = f"<w:tbl><w:tr><w:tc>{paragraph('Cell.')}{equation('c', para=True)}</w:tc></w:tr></w:tbl>"
+        body = paragraph("Before.") + equation(energy()) + cell + paragraph("After.")
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "Before.\n\n[Math: E=mc^2]\n\n[Table]\n\n[Row]\n\n[Cell]\n\nCell.\n\n[Math: c]\n\n"
+                                "[/Row]\n\n[/Table]\n\nAfter.\n")
+
+    def test_math_text_is_the_accepted_view(self) -> None:
+        content = (math_run("a") + f'<w:ins w:id="1" w:author="Ada">{math_run("+b")}</w:ins>'
+                   + f'<w:del w:id="2" w:author="Ada">{math_run("+c")}</w:del>'
+                   + f'<w:moveFrom w:id="3" w:author="Ada">{math_run("+d")}</w:moveFrom>'
+                   + f'<w:moveTo w:id="4" w:author="Ada">{math_run("+e")}</w:moveTo>')
+        prose, meta = self.extract(f"<w:p>{equation(content)}</w:p>")
+        self.assertEqual(prose, "[Math: a+b+e]\n")
+        # Tracked changes inside an equation are not listed with the document's, as before.
+        self.assertEqual(meta["review"], [])
+
+    def test_an_unknown_math_element_shows_its_text_and_warns_once(self) -> None:
+        unknown = f"<m:future>{math_run('q')}</m:future>"
+        prose, meta = self.extract(f"<w:p>{equation(unknown + math_run('+') + unknown)}</w:p>")
+        self.assertEqual(prose, "[Math: q+q]\n")
+        self.assertEqual([w for w in meta["warnings"] if "future" in w],
+                         ["Unsupported math construct future; rendered as its text, structure not shown."])
+        self.assertFalse([w for w in meta["warnings"] if "XML construct" in w], meta["warnings"])
+        # A symbol inside an equation keeps its placeholder.
+        prose, meta = self.extract(f"<w:p>{equation(math_run('a') + symbol())}</w:p>")
+        self.assertEqual(prose, "[Math: a[Unsupported sym]]\n")
+        self.assertIn("Unsupported sym: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
+    def test_sentences_never_split_inside_math(self) -> None:
+        body = (f'<w:p>{run("We have ")}{equation("x. Y")}{run(" here. Next one.")}</w:p>'
+                f'<w:p>{run("Count ")}{equation("n! Then")}{run(" ways? Yes.")}</w:p>'
+                f'<w:p>{run("Ends with ")}{equation(math_run("y") + structure("f", ("num", "1"), ("den", "2")))}'
+                f'{run(". Then more.")}</w:p>')
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "We have [Math: x. Y] here.\nNext one.\n\nCount [Math: n! Then] ways?\nYes.\n\n"
+                                "Ends with [Math: y1/2].\nThen more.\n")
+        # Headings, list items and hyperlink text show the same math text.
+        heading = f'<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>{run("Proof of ")}{equation("a. B")}</w:p>'
+        item = f'<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>{run("Item ")}{equation("p! Q")}</w:p>'
+        link = f'<w:p><w:hyperlink w:anchor="eq">{run("See ")}{equation("z")}</w:hyperlink></w:p>'
+        prose, meta = self.extract(heading + item + link)
+        self.assertEqual(prose, "## Proof of [Math: a. B]\n\n- Item [Math: p! Q]\n\nSee [Math: z]\n")
+        self.assertEqual(meta["hyperlinks"], [{"text": "See [Math: z]", "target": "#eq", "part": "word/document.xml"}])
+
+    def test_a_comment_anchor_over_math_holds_its_text(self) -> None:
+        body = f'<w:p>{start("1")}{run("Energy: ")}{equation(energy())}{end("1")}</w:p>'
+        _, meta = self.extract(body, extra={"word/comments.xml": comments_part({"1": "Check units."})},
+                               relationships=COMMENTS_REL)
+        (comment,) = meta["review"]
+        self.assertEqual(comment["anchor"], "Energy: [Math: E=mc^2]")
+
+    def test_deeply_nested_math_fails_cleanly(self) -> None:
+        from pilcrow.extract import DocumentError
+
+        # Rendering costs no more stack per level than the fingerprint: 200 nested fractions
+        # exported before equations had prose, and still do.
+        nested = "x"
+        for _ in range(200):
+            nested = structure("f", ("num", nested), ("den", "y"))
+        prose, _ = self.extract(f"<w:p>{equation(nested)}</w:p>")
+        self.assertTrue(prose.startswith("[Math: " + "(" * 199 + "x/y)/y)/y"), prose[:300])
+        for _ in range(2800):
+            nested = structure("f", ("num", nested), ("den", "y"))
+        with self.assertRaises(DocumentError):
+            self.extract(f"<w:p>{equation(nested)}</w:p>")
+        # As a block of its own, too.
+        with self.assertRaises(DocumentError):
+            self.extract(equation(nested, para=True))
+
+    def test_documents_without_math_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before equations had prose.
+        body = (paragraph("Title", '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>')
+                + paragraph("Dr. Smith wrote this. Art. 5 applies! Is it x. Y? Yes.")
+                + list_item("First item. Second sentence.", "1") + list_item("Nested.", "1", 1)
+                + "<w:tbl><w:tr><w:tc>" + paragraph("Cell text.") + "</w:tc><w:tc/></w:tr></w:tbl>"
+                + f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>'
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                + '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>'
+                + f'<w:p><w:hyperlink r:id="link">{run("A link")}</w:hyperlink>{symbol()}<w:r><w:br/></w:r>'
+                + f'{run("After break.")}</w:p>'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box.")))
+                + anchored("Figure:", picture("img")) + f"<w:p>{checkbox('1')}</w:p>")
+        relationships = (COMMENTS_REL + NUMBERING_REL + image_rel("img", "media/image1.png")
+                         + rel("link", "hyperlink", "https://example.invalid/", external=True))
+        extra = {"word/comments.xml": comments_part({"1": "Please check."}), "word/media/image1.png": "png bytes",
+                 "word/numbering.xml": numbering(abstract_num("0", level(0), level(1, "decimal", "%2.")), num("1", "0"))}
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "8a6483a884064a67cfe3ac935b295872d8ad1d864b2b945332068c8189c038b5",
+            ".meta.json": "8fd177d4171cfe566c5adda90807756c5fdd5596c408381f3b495d36f21208d2",
+        })
 
 
 if __name__ == "__main__":

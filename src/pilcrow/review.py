@@ -645,7 +645,7 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
     new_tracked = [e for e in new_review if e.get("kind") != "comment"]
     old_warnings, new_warnings = a.get("warnings", []), b.get("warnings", [])
     # Both object sections can be unchanged while their entries moved past each other, e.g. a
-    # block-level equation (no prose) moved across a chart: never report "no changes" then.
+    # block-level equation moved across a chart: never report "no changes" then.
     objects_moved = (a.get("objects", []) != b.get("objects", [])
                      and all(objects_of(a, kind) == objects_of(b, kind) for kind in (True, False)))
     found = [
