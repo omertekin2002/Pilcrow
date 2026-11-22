@@ -568,6 +568,18 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("Charts, diagrams and embedded objects", report)
         self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
 
+    def test_an_equation_moved_across_a_chart_is_reported(self) -> None:
+        # A block-level equation has no prose, and each section's own entries stay the same.
+        math = equation("x", para=True)
+        self.write_objects(self.old, math + OBJECT_BODY)
+        self.write_objects(self.new, OBJECT_BODY + math)
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertNotIn("Equations and symbols", report)
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        self.assertIn("\n\nObjects: equations or symbols moved relative to charts, diagrams or embedded objects\n",
+                      report)
+
     def test_markdown_escapes_an_embedded_object_prog_id(self) -> None:
         prog_id = "Evil*<b>`x`[y](https://example.invalid)"
         for path, workbook in ((self.old, "v1"), (self.new, "v2")):

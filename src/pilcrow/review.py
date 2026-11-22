@@ -586,6 +586,10 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
     old_tracked = [e for e in old_review if e.get("kind") != "comment"]
     new_tracked = [e for e in new_review if e.get("kind") != "comment"]
     old_warnings, new_warnings = a.get("warnings", []), b.get("warnings", [])
+    # Both object sections can be unchanged while their entries moved past each other, e.g. a
+    # block-level equation (no prose) moved across a chart: never report "no changes" then.
+    objects_moved = (a.get("objects", []) != b.get("objects", [])
+                     and all(objects_of(a, kind) == objects_of(b, kind) for kind in (True, False)))
     found = [
         notice("Comments", comments_section(old_comments, new_comments), old_comments != new_comments),
         notice("Tracked changes", entries_section(old_tracked, new_tracked, describe_tracked),
@@ -605,6 +609,8 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
                entries_section(numbered_objects(objects_of(a, False)), numbered_objects(objects_of(b, False)),
                                describe_part_object, change_part_object, unnumbered),
                objects_of(a, False) != objects_of(b, False)),
+        Section("Objects", ["equations or symbols moved relative to charts, diagrams or embedded objects"],
+                inline=True) if objects_moved else None,
         notice("Lists", entries_section(a.get("lists", []), b.get("lists", []), describe_list, change_list)
                + entries_section(a.get("list_runs", []), b.get("list_runs", []), describe_run, change_run),
                (a.get("lists"), a.get("list_runs")) != (b.get("lists"), b.get("list_runs"))),

@@ -110,7 +110,10 @@ Charts, diagrams, embedded objects, and imported chunks have their own section,
 numbered by kind the same way; one at the same position whose part's hash changed
 is worded as changed (`~ chart 1 (word/document.xml) changed`, with an embedded
 object's ProgID before the part); a part that goes missing or appears, or a link
-whose target changes, is listed as removed and added.
+whose target changes, is listed as removed and added. An equation or symbol that only
+moved past a chart, diagram, embedded object, or imported chunk (for example a
+block-level equation, which has no prose) is reported as `Objects: equations or
+symbols moved relative to charts, diagrams or embedded objects`.
 Long texts are shortened to 80 characters for display.
 
 ## Normalization and sentence lines
