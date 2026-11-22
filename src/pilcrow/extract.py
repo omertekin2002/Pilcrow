@@ -127,6 +127,114 @@ EQUATION_UNWRAPPED = frozenset({w("ins"), w("moveTo")})
 EQUATION_IGNORED_ATTRIBUTES = frozenset({f"{{{W14}}}paraId", f"{{{W14}}}textId"})
 
 
+def om(name: str) -> str:
+    return f"{{{M}}}{name}"
+
+
+MATH_NOTE = ("Equations are shown as linear [Math: …] text; layout, fonts and alignment are not compared, "
+             "and equation fingerprints are in objects.")
+SYMBOL_WARNING = "Unsupported sym: content is not rendered in prose; inspect the DOCX in Word."
+# An equation's text is held between these marks inside a paragraph until its sentences are split.
+# XML 1.0 text cannot contain either character, so document text never holds them.
+MATH_START, MATH_END = "\x01", "\x02"
+MATH_SPAN = re.compile("\x01([^\x02]*)\x02")
+MATH_HELD = re.compile("\x01([0-9]+)\x02")
+# Math elements whose linear text is their content's text, one after another.
+MATH_CONTAINERS = frozenset(map(om, "oMathPara oMath e num den sub sup deg lim fName mr r".split()))
+# Math structures with a linear form of their own (m:m, a matrix, is read row by row).
+MATH_STRUCTURES = frozenset(map(om, "f sSup sSub sSubSup sPre rad d nary func limLow limUpp acc bar groupChr "
+                                    "box borderBox phant eqArr".split()))
+# A single atom needs no parentheses as an argument: only letters, a number, or one character.
+MATH_ATOM = re.compile(r"[^\W\d_]+|[0-9]+(?:\.[0-9]+)?|.", re.DOTALL)
+
+
+def plain(text: str) -> str:
+    """``text`` without the marks around equation text."""
+    return text.replace(MATH_START, "").replace(MATH_END, "")
+
+
+def math_sentences(text: str) -> list[str]:
+    """Sentence lines of ``text`` that never split inside an equation's [Math: …] text.
+
+    Each marked equation is swapped for a short token while sentences are split, then put
+    back without its marks, so splitting stays linear in the paragraph's length.
+    """
+    held: list[str] = []
+
+    def hold(match: re.Match[str]) -> str:
+        held.append(match[1])
+        return f"{MATH_START}{len(held) - 1}{MATH_END}"
+
+    lines = sentences(MATH_SPAN.sub(hold, text))
+    if not held:
+        return lines
+    return [MATH_HELD.sub(lambda match: held[int(match[1])], line) for line in lines]
+
+
+def math_children(node: Element) -> Iterator[Element]:
+    """A math element's children in the accepted view, as ``equation_form`` reads them, without
+    property elements (``m:*Pr``): those are read only by the structure they belong to."""
+    for child in node:
+        if child.tag in EQUATION_UNWRAPPED:
+            yield from math_children(child)
+        elif child.tag not in EQUATION_DROPPED and not (child.tag.startswith(f"{{{M}}}") and child.tag.endswith("Pr")):
+            yield child
+
+
+# A structure's arguments by local name (e, num, sub, …): each element and its normalised text.
+MathArgs: TypeAlias = dict[str, list[tuple["Element", str]]]
+
+
+def math_arg(args: MathArgs, name: str) -> str:
+    """The first ``name`` argument's text, "" when there is none."""
+    return args[name][0][1] if name in args else ""
+
+
+def math_group(args: MathArgs, name: str) -> str:
+    """An argument as an operand: parenthesised unless it is empty, a single atom, or one visible
+    delimiter (``(a+b)`` is not wrapped again)."""
+    if name not in args:
+        return ""
+    child, text = args[name][0]
+    if not text or MATH_ATOM.fullmatch(text):
+        return text
+    content = list(math_children(child))
+    if len(content) == 1 and content[0].tag == om("d") and all(delimiters(content[0])[::2]):
+        return text
+    return f"({text})"
+
+
+def math_scripts(node: Element, args: MathArgs, hide: bool = False) -> str:
+    """``_sub`` and ``^sup`` of a structure, each left out when empty (or hidden, for m:nary)."""
+    sub = "" if hide and math_flag(node, "subHide") else math_group(args, "sub")
+    sup = "" if hide and math_flag(node, "supHide") else math_group(args, "sup")
+    return ("_" + sub if sub else "") + ("^" + sup if sup else "")
+
+
+def delimiters(node: Element) -> tuple[str, str, str]:
+    """An m:d's beginning, separator and ending characters."""
+    return math_char(node, "begChr", "("), math_char(node, "sepChr", "|"), math_char(node, "endChr", ")")
+
+
+def math_property(node: Element, name: str) -> Element | None:
+    """The ``name`` property of a math structure, from its own m:<structure>Pr element."""
+    props = node.find(node.tag + "Pr")
+    return None if props is None else props.find(om(name))
+
+
+def math_char(node: Element, name: str, default: str) -> str:
+    """A character property (m:chr, m:begChr, …); an empty m:val means no character."""
+    prop = math_property(node, name)
+    value = None if prop is None else prop.get(om("val"))
+    return default if value is None else value
+
+
+def math_flag(node: Element, name: str) -> bool:
+    """An on/off property (m:degHide, m:subHide, …); present without m:val means on."""
+    prop = math_property(node, name)
+    return prop is not None and on_off(prop.get(om("val"), "1"))
+
+
 def equation_form(node: Element) -> list[Any]:
     """The accepted view of an equation as nested lists: tag, sorted attributes, text, children.
 
@@ -508,6 +616,82 @@ class Reader:
             entry["sha256"] = None
         return entry
 
+    def equation_text(self, node: Element) -> str:
+        """An equation as linear text: ``[Math: …]`` per m:oMath, separated by a space.
+
+        It reads the accepted view, like the fingerprint: tracked deletions are left out,
+        insertions kept, and formatting adds no text.
+        """
+        self.warn(MATH_NOTE)
+        if node.tag == om("oMathPara"):
+            maths = [normalize(self.math(child)) for child in math_children(node)] or [""]
+        else:
+            maths = [normalize(self.math(node))]
+        return " ".join(f"[Math: {text or '(empty)'}]" for text in maths)
+
+    def math(self, node: Element) -> str:
+        """The linear text of one math element; arguments of structures are whitespace-normalised.
+
+        Each level of nesting recurses straight into its children, so an equation can nest
+        about as deeply as its fingerprint allows before failing.
+        """
+        tag = node.tag
+        if tag in {om("t"), w("t")}:
+            return re.sub(r"\s", " ", node.text or "")
+        if tag in {w("tab"), w("br"), w("cr")}:
+            return " "
+        if tag == w("sym"):
+            self.warn(SYMBOL_WARNING)
+            return "[Unsupported sym]"
+        if tag == f"{{{MC}}}AlternateContent":
+            branch = self.image_branch(node)
+            return "" if branch is None else "".join([self.math(child) for child in math_children(branch)])
+        if tag == om("m"):
+            rows = [", ".join([normalize(self.math(cell)) for cell in math_children(row) if cell.tag == om("e")])
+                    for row in math_children(node) if row.tag == om("mr")]
+            return "[" + "; ".join(rows) + "]"
+        children = [(child, self.math(child)) for child in math_children(node)]
+        if tag not in MATH_STRUCTURES:
+            if tag.startswith(f"{{{M}}}") and tag not in MATH_CONTAINERS:
+                self.warn(f"Unsupported math construct {tag.rsplit('}', 1)[-1]}; rendered as its text, structure not shown.")
+            return "".join(text for _, text in children)
+        args: MathArgs = {}
+        for child, text in children:
+            args.setdefault(child.tag.rsplit("}", 1)[-1], []).append((child, normalize(text)))
+        if tag == om("f"):
+            bar = "¦" if math_char(node, "type", "bar") == "noBar" else "/"
+            return math_group(args, "num") + bar + math_group(args, "den")
+        if tag in {om("sSup"), om("sSub"), om("sSubSup")}:
+            return math_group(args, "e") + math_scripts(node, args)
+        if tag == om("sPre"):
+            return " ".join(part for part in (math_scripts(node, args), math_group(args, "e")) if part)
+        if tag == om("rad"):
+            degree = "" if math_flag(node, "degHide") else math_arg(args, "deg")
+            return f"√({degree}&{math_arg(args, 'e')})" if degree else f"√({math_arg(args, 'e')})"
+        if tag == om("d"):
+            begin, separator, end = delimiters(node)
+            return begin + separator.join(text for _, text in args.get("e", [])) + end
+        if tag == om("nary"):
+            scripts = math_scripts(node, args, hide=True)
+            operand = math_arg(args, "e")
+            return math_char(node, "chr", "∫") + scripts + (" " if scripts and operand else "") + operand
+        if tag == om("func"):
+            # The space already sets the operand apart: "sin x", "lim_(n→∞) a_n".
+            return " ".join(part for part in (math_arg(args, "fName"), math_arg(args, "e")) if part)
+        if tag in {om("limLow"), om("limUpp")}:
+            limit = math_group(args, "lim")
+            mark = "_" if tag == om("limLow") else "^"
+            return math_group(args, "e") + (mark + limit if limit else "")
+        if tag == om("acc"):
+            return math_group(args, "e") + math_char(node, "chr", "\u0302")
+        if tag == om("bar"):
+            return math_group(args, "e") + ("\u0305" if math_char(node, "pos", "bot") == "top" else "\u0332")
+        if tag == om("groupChr"):
+            return math_group(args, "e") + math_char(node, "chr", "\u23df")
+        if tag == om("eqArr"):
+            return "; ".join(text for _, text in args.get("e", []))
+        return math_arg(args, "e")  # m:box, m:borderBox, m:phant
+
     def emit(self, text: str, anchored: str | None = None) -> str:
         """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
         if not self.unselected:
@@ -607,7 +791,7 @@ class Reader:
             if rid and not rel:
                 self.warn("Some hyperlink relationships are missing; destinations may be incomplete.")
             visible = "".join(self.inline(child) for child in node)
-            self.links.append({"text": normalize(visible), "target": target, "part": self.part})
+            self.links.append({"text": normalize(plain(visible)), "target": target, "part": self.part})
             return visible
         if tag == w("fldChar"):
             kind = attr(node, "fldCharType")
@@ -629,15 +813,20 @@ class Reader:
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
         if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
             return "".join(self.inline(child) for child in branch)
+        if tag in EQUATIONS:
+            self.record_objects(node)
+            # Marked, so sentence splitting never breaks inside it; comment anchors get it unmarked.
+            text = self.equation_text(node)
+            return self.emit(MATH_START + text + MATH_END, text)
         if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
             self.record_images(node)
-        if tag in {w("drawing"), w("pict"), w("object"), w("altChunk"), f"{{{MC}}}AlternateContent", w("sym")} or tag in EQUATIONS:
+        if tag in {w("drawing"), w("pict"), w("object"), w("altChunk"), f"{{{MC}}}AlternateContent", w("sym")}:
             self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
             if not self.unrendered_shape_parts(node):
                 return ""
-        if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
+        if local in {"drawing", "pict", "object", "txbxContent", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
             return self.emit(f"[Unsupported {local}]")
@@ -713,7 +902,7 @@ class Reader:
         return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
 
     def paragraph_text(self, node: Element, text: str) -> str:
-        lines = sentences(text)
+        lines = math_sentences(text)
         if not lines:
             return ""
         props, style_id = self.properties(node)
@@ -726,7 +915,7 @@ class Reader:
             level = min(6, int(heading[1])) if heading else 0
         num = next((p.find("w:numPr", NS) for p in props if p.find("w:numPr", NS) is not None), None)
         if level:
-            return "#" * level + " " + normalize(text)
+            return "#" * level + " " + normalize(plain(text))
         if num is not None:
             # Prose keeps the rule it had before list metadata: the nearest numPr alone decides
             # whether this is a list item and how far it is indented. The inherited numId and
@@ -858,9 +1047,10 @@ class Reader:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
             elif child.tag in EQUATIONS:
-                # Body and cell content may hold math directly; it has no prose, as before.
+                # Body and cell content may hold math directly: it is a paragraph of its own.
                 self.record_objects(child)
-                continue
+                value = self.emit(self.equation_text(child))
+                self.emit("", " ")  # a paragraph boundary, as after a w:p
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag == f"{{{MC}}}AlternateContent":
@@ -932,15 +1122,17 @@ class Reader:
                 elif child.tag in FORM_DATA:
                     visit_form(child)
 
-        def visit(node: Element) -> None:
+        def visit(node: Element, math: bool = False) -> None:
             local = node.tag.rsplit("}", 1)[-1]
+            # Math is rendered as linear text, which warns for math elements it does not know.
+            math = math or node.tag in EQUATIONS
             if node.tag == w("ffData"):
                 visit_form(node)  # form field data whose meaning is recorded, see FORM_DATA
                 return
             if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
                 # Only the copy holding the rendered text box is read.
                 for child in branch:
-                    visit(child)
+                    visit(child, math)
                 return
             if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
                 # A rendered text box: audit its Word content, not the shape markup around it.
@@ -961,10 +1153,10 @@ class Reader:
                     if name.endswith("Change") or name in {"ins", "del", "cellIns", "cellDel", "cellMerge"}:
                         self.warn("Tracked formatting or structure changes are not fully represented; inspect the DOCX.")
                 return
-            if not node.tag.startswith("{" + W + "}"):
+            if not node.tag.startswith("{" + W + "}") and not (math and node.tag.startswith("{" + M + "}")):
                 self.warn(f"Unsupported XML construct {local}; content may be omitted or approximate.")
             for child in node:
-                visit(child)
+                visit(child, math)
         visit(tree)
 
     def render_part(self, part: str, tree: Element) -> str:

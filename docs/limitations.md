@@ -23,7 +23,7 @@ Word XML dialects are unsupported. They must not be relabeled `.docx`.
 | Legacy form fields | A `FORMCHECKBOX` or `FORMDROPDOWN` field's state, which Word keeps in the `w:ffData` of the field's begin `w:fldChar` and never writes as display text, is recorded in its field entry as `form`, so ticking a box or choosing another dropdown entry makes companions stale; a checkbox records its `name` and `checked` (`w:checked`, else `w:default`, else unchecked; an element without `w:val` is checked, as for any on/off value), and a dropdown its `name`, its `entries` (`w:listEntry`, in order) and the `selected` entry's text (the zero-based `w:result`, else `w:default`, else 0; `null` when that index names no entry); the state is not shown in prose; macros, help and status text, enabled state, and checkbox size are not compared and no longer warn; a text input (`FORMTEXT`) records no form state, because its value is already its display text, and its settings (`w:textInput`: type, default, maximum length, format) keep their unsupported-construct warnings; a form field inside a tracked deletion is not recorded, like any field there; content-control (`w:sdt`) checkboxes need no form state, because their glyph is prose text |
 | Text boxes | Text inside modern (`mc:AlternateContent`) and legacy VML text boxes, rendered with the normal paragraph/table rules between `[Text box]` and `[/Text box]` markers right after the anchoring paragraph, in document order; one copy only (the first `mc:Choice` holding text, otherwise `mc:Fallback`); works in table cells, headers/footers, and nested boxes; position, anchoring, wrapping, and shape formatting are not compared and trigger one coverage warning; a shape with no text of its own, such as the continuation boxes of a linked-box chain (the first box holds the whole story), is not a text box here and keeps the placeholder and omission warnings in the next row, so how a story flows across linked boxes is not compared |
 | Images | Placeholders (e.g. `[Unsupported drawing]`, `[Unsupported pict]`) in prose, as for other drawings; every DrawingML (`a:blip`, including its SVG copy) and legacy VML (`v:imagedata`) image in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 and size of its media part (external links by target, never fetched), so swapping, adding, removing, or reordering images makes companions stale; renamed media parts with identical bytes do not; each image's alt text (`wp:docPr/@descr`, else the picture's own `pic:cNvPr/@descr`; a VML shape's `alt`) and alt title (`@title`, recorded apart) is recorded with it, so editing, adding, or removing alt text makes companions stale, while a group's alt text and alt text of charts, diagrams and other non-picture drawings are not recorded; size, position, cropping, and images in comments are not compared and trigger one coverage warning; a missing image relationship or media part is recorded without a hash and warns |
-| Equations and symbols | Placeholders (`[Unsupported oMath]`, `[Unsupported oMathPara]`, `[Unsupported sym]`) and omission warnings in prose; each outermost OMML equation (`m:oMathPara`, or an `m:oMath` outside one) and each `w:sym` in the body, headers/footers, notes, and text boxes is recorded in metadata, so editing, adding, removing, or reordering one makes companions stale; an equation is recorded by the SHA-256 of a canonical form of its accepted view (tracked deletions dropped, insertions kept; run formatting `w:rPr`, control formatting `m:ctrlPr`, `rsid*`/`w14:paraId`/`w14:textId` attributes, proofing marks, bookmarks, and comment markers left out; `m:t` text and the other `m:*Pr` structure kept), so the fingerprint covers OMML structure and text, not how Word draws it, and a formatting-only re-save stays fresh; a symbol is recorded by its font and character code; equations inside tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images |
+| Equations and symbols | Each equation is shown in prose as deterministic linear text, `[Math: …]` (see [Equations as linear text](#equations-as-linear-text)), in its paragraph (inline `m:oMath`/`m:oMathPara`) or as a paragraph of its own (math directly in the body or a table cell), with one coverage note that layout, fonts, and alignment are not compared; `w:sym` keeps the `[Unsupported sym]` placeholder and its omission warning; each outermost OMML equation (`m:oMathPara`, or an `m:oMath` outside one) and each `w:sym` in the body, headers/footers, notes, and text boxes is recorded in metadata, so editing, adding, removing, or reordering one makes companions stale; an equation is recorded by the SHA-256 of a canonical form of its accepted view (tracked deletions dropped, insertions kept; run formatting `w:rPr`, control formatting `m:ctrlPr`, `rsid*`/`w14:paraId`/`w14:textId` attributes, proofing marks, bookmarks, and comment markers left out; `m:t` text and the other `m:*Pr` structure kept), so the fingerprint covers OMML structure and text, not how Word draws it, and a formatting-only re-save stays fresh; a symbol is recorded by its font and character code; equations inside tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images |
 | Charts, SmartArt, embedded objects, imported chunks | Placeholders (`[Unsupported drawing]`, `[Unsupported object]`, `[Unsupported altChunk]`) and omission warnings in prose; each DrawingML chart (`c:chart`), SmartArt diagram (`dgm:relIds`), OLE object (`o:OLEObject`) and imported chunk (`w:altChunk`) in the body, headers/footers, notes, and text boxes is recorded in metadata by the SHA-256 of the raw bytes of the part it points to (the chart part, which holds the cached values a reader sees; the diagram's data part, `r:dm`; the embedding; the chunk), so editing, adding, removing, or reordering one makes companions stale; renaming a part with identical bytes does not; the fingerprint covers the stored part, not how Word draws it, so a Word re-save that rewrites the part without a visible edit also makes companions stale; a chart's embedded workbook, a diagram's layout, quick-style, and colour parts, and the preview images of embedded objects are not compared and keep their unrendered-part warnings; a linked OLE object (external relationship) is recorded by target and never fetched; a missing relationship or part is recorded without a hash and warns; objects in tracked deletions or comments are not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images, so an Office 2016 chart (`cx:chart`, e.g. waterfall or sunburst) whose compatibility copy is a text box is not recorded and its part keeps its unrendered-part warning; a part that cannot be read (e.g. corrupt compressed data) fails the export, as for images |
 | WordArt | Legacy VML WordArt (`v:textpath` with a `string`) shows as `[Unsupported pict]` in prose; its text is recorded in metadata, whitespace-normalised, in the body, headers/footers, notes, and text boxes, so editing, adding, or removing it makes companions stale; WordArt in tracked deletions or comments is not recorded, and only the chosen `mc:AlternateContent` copy is read, as for images; DrawingML WordArt is a text box and renders in prose |
 | Drawings | Omission warnings and placeholders (e.g. `[Unsupported drawing]`) for common inline constructs, including a picture grouped with a text box; no rendering, OCR, object execution, or text extraction from charts, diagrams, or embedded objects |
@@ -116,15 +116,17 @@ objects, and a text change reads `~ WordArt 1 (word/document.xml): "SALE" →
 "CLOSED"`.
 Equations and symbols are numbered by kind (equation 1, 2, … and symbol 1, 2, …);
 an equation at the same position of an aligned block is worded as changed, and a
-symbol as its old and new character and font. Only an equation's fingerprint is
-recorded, so the report cannot say what changed inside it: inspect it in Word.
+symbol as its old and new character and font. An equation's linear text is
+prose, so an edit inside it also shows in the prose diff as `-`/`+` lines (with
+`--word-diff`, the marks land on the changed math text); the linear text does not
+show layout, fonts, or alignment, which only the fingerprint covers.
 Charts, diagrams, embedded objects, and imported chunks have their own section,
 numbered by kind the same way; one at the same position whose part's hash changed
 is worded as changed (`~ chart 1 (word/document.xml) changed`, with an embedded
 object's ProgID before the part); a part that goes missing or appears, or a link
 whose target changes, is listed as removed and added. An equation or symbol that only
-moved past a chart, diagram, embedded object, or imported chunk (for example a
-block-level equation, which has no prose) is reported as `Objects: equations or
+moved past a chart, diagram, embedded object, or imported chunk, while each
+section's own entries stay the same, is also reported as `Objects: equations or
 symbols moved relative to charts, diagrams or embedded objects`.
 A legacy checkbox or dropdown form field at the same position whose state alone
 changed is worded with its old and new state, `~ field 1 (FORMCHECKBOX "Check1")
@@ -171,9 +173,53 @@ Long texts are shortened to 80 characters for display.
 - Heading text stays on one line. Each list item starts with `-`; subsequent
   sentences are indented. Table cells contain normal sentence/paragraph text.
   There are no per-sentence positional IDs or automatic counters.
+- An equation's `[Math: …]` text is never split, even when it holds `. ` before a
+  capital letter, `!`, or `?`; sentence breaks around it follow the rules above.
 - The `.md` is optimized for the ordinary text diff, not faithful Markdown rendering:
   literal Markdown metacharacters in Word are not escaped, and table/text box/unsupported
   markers can coincide with literal document text.
+
+## Equations as linear text
+
+Each equation (`m:oMath`) is shown as `[Math: …]`: a deterministic linear text,
+loosely after UnicodeMath, meant for reading a change, not for pasting into Word or
+LaTeX. An `m:oMathPara` holding several equations shows each as its own `[Math: …]`,
+separated by a space; an equation with no text shows `[Math: (empty)]`.
+
+- It reads the accepted view, like the fingerprint: content in `w:del`/`w:moveFrom`
+  is left out and `w:ins`/`w:moveTo` kept; formatting (`w:rPr`, `m:ctrlPr`, and the
+  `m:*Pr` properties other than those named below) adds no text. Tracked changes
+  inside an equation are not listed with the document's tracked changes, and comment
+  markers inside an equation are not read, as before; a comment range around an
+  equation anchors the same `[Math: …]` text.
+- Text (`m:t`, and `w:t` in a `w:r` inside math) is shown as written; whitespace is
+  collapsed. `w:tab` and `w:br` are a space, and `w:sym` is `[Unsupported sym]`.
+- An **operand** (a script, a limit, a fraction side, a base) is wrapped in parentheses unless
+  it is a single atom: one character, only letters, a number (`12`, `3.5`), or one
+  delimiter with both its characters (`(a+b)` is not wrapped again). An empty
+  argument shows nothing, and an empty script is left out with its `_` or `^`.
+
+| OMML | Linear text |
+| --- | --- |
+| Fraction `m:f` | `num/den`: `a/b`, `(a+b)/(2c)`; `¦` instead of `/` for a `noBar` fraction |
+| Scripts `m:sSup`, `m:sSub`, `m:sSubSup`, `m:sPre` | `x^2`, `x_i`, `x_i^2`, `_i^2 x`; `x^(n+1)` |
+| Radical `m:rad` | `√(x)`; with a degree that `m:degHide` does not hide, `√(3&x)` |
+| Delimiter `m:d` | `m:begChr`, the elements joined by `m:sepChr`, then `m:endChr` (defaults `(`, `\|`, `)`; an empty `m:val` means none): `(a\|b)`, `[0,1)` |
+| N-ary `m:nary` | `m:chr` (default `∫`), then `_sub` and `^sup` unless `m:subHide`/`m:supHide` hide them, then a space and the operand: `∑_(i=1)^n x_i`; without limits, `∑x` |
+| Function `m:func` | the name, a space, and the operand, never wrapped: `sin x`, `sin 2x`, `lim_(n→∞) a_n` |
+| Limits `m:limLow`, `m:limUpp` | `lim_(n→∞)`, `x^k` |
+| Accent `m:acc` | the operand, then `m:chr` (default U+0302, combining circumflex): `x̂` |
+| Bar `m:bar` | the operand, then U+0305 (combining overline) for `m:pos` `top`, else U+0332 (combining low line) |
+| Group character `m:groupChr` | the operand, then `m:chr` (default `⏟`) |
+| `m:box`, `m:borderBox`, `m:phant` | their content (a phantom's content shows even when Word hides it) |
+| Matrix `m:m` | `[a, b; c, d]`: cells joined by `, `, rows by `; ` |
+| Equation array `m:eqArr` | rows joined by `; ` |
+
+Any other math element shows its content's text, and each such element name adds
+one coverage warning, for example `Unsupported math construct foo; rendered as its
+text, structure not shown`. Layout, fonts, alignment, equation numbering, and
+argument sizes are not shown. The equation fingerprint in `objects` stays the
+safety net: an OMML change the linear text misses still makes companions stale.
 
 ## Operational limits
 

@@ -439,7 +439,8 @@ charts, diagrams and embedded objects, lists, and coverage warnings. Entries are
 words, for example `~ resolved comment by Ada on "first sentence.": "Please
 clarify."`, `~ link "Report": https://old.example → https://new.example`, or
 `~ list 1 level 0: bullet → decimal`. An edited equation reads `~ equation 1
-(word/document.xml) changed` and a changed symbol `~ symbol 1
+(word/document.xml) changed`, next to its `-`/`+` `[Math: …]` lines in the prose
+diff, and a changed symbol `~ symbol 1
 (word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
 diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
 changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`.
@@ -555,16 +556,22 @@ headings are not compared.
 Complex tracked structure/layout is limited and reported. Text box text is shown
 between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
 box's position, wrapping, and shape formatting are not compared. Images, charts,
-equations, and embedded objects are not rendered; images are recorded in
+and embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
 companions stale (size, position, and cropping are not compared). An image's alt
 text (its description, and its title when it has one) is recorded with it, so
 editing, adding, or removing alt text makes companions stale too; screen readers
 read it, but it is not shown in the prose. Legacy VML WordArt is not rendered
 either; its text is recorded in metadata, so editing it makes companions stale.
-Equations and Word symbols (`w:sym`) are recorded in metadata by a fingerprint of
-their OMML structure and text (formatting and revision IDs left out) and by font
-and character code, so editing, adding, or removing one makes companions stale.
+Equations are shown in prose as linear text, for example `[Math: E=mc^2]` or
+`[Math: ∑_(i=1)^n x_i]` (the notation is in
+[Equations as linear text](docs/limitations.md#equations-as-linear-text)), so an edit
+inside an equation shows in the prose diff; layout, fonts, and alignment are not
+shown. Equations and Word symbols (`w:sym`) are also recorded in metadata by a
+fingerprint of their OMML structure and text (formatting and revision IDs left out)
+and by font and character code, so editing, adding, or removing one makes
+companions stale even where the linear text does not show the change. Symbols stay
+`[Unsupported sym]` in prose.
 Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
 (`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
 chart part, the diagram's data part, the embedding, the chunk), so editing a
@@ -646,6 +653,12 @@ documents containing an image with alt text, or legacy VML WordArt, report stale
 companions once, because their image entries in `.meta.json` now have an `alt`
 (or `alt_title`) key, and WordArt is recorded in `objects`. Run `pilcrow export`
 and commit the refreshed companions. Documents without them are unaffected.
+
+Upgrading from a version that showed equations as `[Unsupported oMath]`:
+documents containing an equation report stale companions once, because their
+prose now shows each equation as `[Math: …]` text and their coverage warnings
+changed. Run `pilcrow export` and commit the refreshed companions. Documents
+without equations are unaffected.
 
 Run the generated-fixture suite:
 

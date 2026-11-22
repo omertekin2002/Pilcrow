@@ -35,6 +35,7 @@ try:
         described_picture,
         dropdown,
         end,
+        energy,
         equation,
         image_rel,
         level,
@@ -72,6 +73,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         described_picture,
         dropdown,
         end,
+        energy,
         equation,
         image_rel,
         level,
@@ -593,14 +595,18 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('- `~` WordArt 1 (word/document.xml)\\: "SALE" → "\\*SALE\\* + added chart 1"\n', self.markdown())
 
     def test_equation_and_symbol_edits(self) -> None:
-        def write(path: Path, math: str = "E=mc2", char: str = "F061", font: str = "Symbol") -> None:
-            make_docx(path, f'<w:p>{run("Energy: ")}{equation(math)}{symbol(char, font)}</w:p>')
+        def write(path: Path, power: str = "2", char: str = "F061", font: str = "Symbol") -> None:
+            make_docx(path, f'<w:p>{run("Energy: ")}{equation(energy(power))}{symbol(char, font)}</w:p>')
 
         write(self.old)
-        write(self.new, "E=mc3")
+        write(self.new, "3")
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        # The prose shows what changed inside the equation; the fingerprint says which one changed.
+        self.assertIn("\n-Energy: [Math: E=mc^2][Unsupported sym]\n+Energy: [Math: E=mc^3][Unsupported sym]\n", report)
         self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Energy: [Math: E=mc^[-2-]{+3+}][Unsupported sym]\n", marked)
+        self.assertIn("\nEquations and symbols:\n~ equation 1 (word/document.xml) changed\n", marked)
         write(self.new, char="F062")
         self.assertEqual(self.section(self.review(), "Equations and symbols"),
                          ["~ symbol 1 (word/document.xml): F061 (Symbol) → F062 (Symbol)"])
@@ -690,12 +696,13 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
 
     def test_an_equation_moved_across_a_chart_is_reported(self) -> None:
-        # A block-level equation has no prose, and each section's own entries stay the same.
+        # Each section's own entries stay the same; the prose shows the block-level equation moving.
         math = equation("x", para=True)
         self.write_objects(self.old, math + OBJECT_BODY)
         self.write_objects(self.new, OBJECT_BODY + math)
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        self.assertIn("\n-[Math: x]\n", report)
+        self.assertIn("\n+[Math: x]\n", report)
         self.assertNotIn("Equations and symbols", report)
         self.assertNotIn("Charts, diagrams and embedded objects", report)
         self.assertIn("\n\nObjects: equations or symbols moved relative to charts, diagrams or embedded objects\n",
