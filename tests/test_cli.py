@@ -1736,6 +1736,15 @@ class CLITests(unittest.TestCase):
         prose, meta, stderr = self.export_images(paragraph("Plain prose."))
         self.assertEqual(meta["images"], [])
 
+    def review_report(self, old: str, new: str) -> str:
+        """``pilcrow review old new``'s report, which must find a change; read as the UTF-8 it is
+        written in, not the locale encoding ``cli`` decodes with (cp1252 on Windows)."""
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(PROJECT / "src"), str(PROJECT)))}
+        result = subprocess.run([sys.executable, "-m", "pilcrow", "review", old, new], cwd=self.root, env=env,
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result)
+        return result.stdout.decode("utf-8")
+
     def write_described(self, body: str, path: str = "essay.docx") -> None:
         make_docx(self.root / path, body, extra={"word/media/image1.png": "picture bytes"},
                   relationships=image_rel("rId5", "media/image1.png"))
@@ -1762,9 +1771,9 @@ class CLITests(unittest.TestCase):
             with self.subTest(descr=descr):
                 self.write_described(figure(descr))
                 self.cli("check", "essay.docx", code=1)
-                result = self.cli("review", "old.docx", "essay.docx", code=1)
-                self.assertIn(f"Images:\n{line}\n", result.stdout)
-                self.assertIn("Prose: no changes", result.stdout)
+                report = self.review_report("old.docx", "essay.docx")
+                self.assertIn(f"Images:\n{line}\n", report)
+                self.assertIn("Prose: no changes", report)
         # Adding alt text to an image that had none is a change too.
         self.write_described(figure(None))
         self.cli("export", "essay.docx")
@@ -1775,8 +1784,8 @@ class CLITests(unittest.TestCase):
         self.write_described(figure(None), "old.docx")
         self.write_described(figure("A red cat"))
         self.cli("check", "essay.docx", code=1)
-        result = self.cli("review", "old.docx", "essay.docx", code=1)
-        self.assertIn('Images:\n~ image 1 (word/document.xml) alt text: (none) → "A red cat"\n', result.stdout)
+        report = self.review_report("old.docx", "essay.docx")
+        self.assertIn('Images:\n~ image 1 (word/document.xml) alt text: (none) → "A red cat"\n', report)
 
     def test_alt_text_reads_the_same_from_either_attribute(self) -> None:
         def alt(body: str) -> list[dict[str, Any]]:
@@ -1853,9 +1862,9 @@ class CLITests(unittest.TestCase):
         write("SALE", "old.docx")
         write("CLOSED")
         self.cli("check", "essay.docx", code=1)
-        result = self.cli("review", "old.docx", "essay.docx", code=1)
+        report = self.review_report("old.docx", "essay.docx")
         self.assertIn('Charts, diagrams and embedded objects:\n~ WordArt 1 (word/document.xml): "SALE" → "CLOSED"\n',
-                      result.stdout)
+                      report)
         # Whitespace is normalised like other recorded text.
         write("  SALE\n ")
         self.cli("check", "essay.docx")
