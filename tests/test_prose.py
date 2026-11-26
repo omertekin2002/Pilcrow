@@ -1,4 +1,4 @@
-"""Sentence segmentation: identical output to the original algorithm, in linear time.
+"""Sentence segmentation: matches a naive oracle, in linear time.
 
 Run with ``python -m unittest discover -s tests -v`` from the project root.
 """
@@ -10,14 +10,24 @@ import re
 import time
 import unittest
 
-from pilcrow.prose import ABBREVIATIONS, BOUNDARY, normalize, sentences
+from pilcrow.prose import (
+    ABBREVIATIONS,
+    BOUNDARY,
+    NUMBER_ABBREVIATIONS,
+    normalize,
+    sentences,
+)
+
+# The abbreviation list before issue #54 added "cf" and "viz".
+LEGACY_ABBREVIATIONS = ABBREVIATIONS - {"cf", "viz"}
 
 
-def reference_sentences(text: str) -> list[str]:
-    """The algorithm before issue #26, kept verbatim as an oracle.
+def legacy_sentences(text: str) -> list[str]:
+    """The algorithm before issue #26, kept verbatim with its abbreviation list.
 
     It is quadratic in the length of one line: every boundary copies the line up to
-    that point and searches it for the token before the full stop.
+    that point and searches it for the token before the full stop. Its output is what
+    companions exported before issue #54 contain.
     """
     result = []
     for line in text.split("\n"):
@@ -27,7 +37,7 @@ def reference_sentences(text: str) -> list[str]:
             end = match.end()
             prefix = line[:match.start() + 1]
             token = re.search(r"([\w.]+)\.$", prefix)
-            if token and (token[1].lower() in ABBREVIATIONS
+            if token and (token[1].lower() in LEGACY_ABBREVIATIONS
                           or re.fullmatch(r"(?:[A-Za-z]\.)*[A-Za-z]", token[1])):
                 continue
             result.append(line[start: end].strip())
@@ -36,6 +46,87 @@ def reference_sentences(text: str) -> list[str]:
             result.append(line[start:])
     return result
 
+
+def reference_sentences(text: str) -> list[str]:
+    """``legacy_sentences`` plus the rules of issue #54, written naively as an oracle.
+
+    Each rule is a regex over the whole line before or after the boundary, not the
+    linear scan ``sentences`` uses, so the two implementations stay independent.
+    """
+    result = []
+    for line in text.split("\n"):
+        line = normalize(line)
+        start = 0
+        for match in BOUNDARY.finditer(line):
+            end = match.end()
+            prefix = line[:match.start() + 1]
+            suffix = line[end:]
+            token = re.search(r"([\w.]+)\.$", prefix)
+            # Rule 1: the next word starts lowercase.
+            if re.match(r"\S", suffix) and suffix[0].islower():
+                continue
+            if token and (token[1].lower() in LEGACY_ABBREVIATIONS
+                          or re.fullmatch(r"(?:[A-Za-z]\.)*[A-Za-z]", token[1])
+                          # Rule 2: always joined.
+                          or re.fullmatch(r"cf|viz", token[1], re.IGNORECASE)
+                          # Rule 3: joined before a digit.
+                          or (re.fullmatch(r"approx|ca|chap|ch|secs?|arts?|paras?|fn|nos|"
+                                           r"jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec",
+                                           token[1], re.IGNORECASE)
+                              and re.match(r"\d", suffix))):
+                continue
+            result.append(line[start: end].strip())
+            start = end
+        if line[start:]:
+            result.append(line[start:])
+    return result
+
+
+# Issue #54: each of these is one sentence (the legacy algorithm split each of them).
+JOINED = [
+    "See Art. 5 of the Act.",
+    "As in para. 12 above.",
+    "Under Sec. 3.2 we agree.",
+    "See ch. 4 for more.",
+    "Due Sept. 4 at noon.",
+    "Since Jan. 2020 it grew.",
+    "It is approx. 3 m long.",
+    "There were ca. 40 people.",
+    "Cf. Smith 2020 for details.",
+    "She has a Ph.D. in physics.",
+    "Acme Inc. was founded.",
+    "Max. load is 5 kg.",
+    "See p. 5 and nos. 3 and 4.",
+    "Compare viz. Table 2 and CF. Jones.",
+    "See Fn. 12 and chap. 3, secs. 4 and arts. 5-6, paras. 7 and 8.",
+    "Dated Feb. 1, Mar. 2, Apr. 3, Jun. 4, Jul. 5, Aug. 6, Sep. 7, Oct. 8, Nov. 9 and DEC. 10.",
+    "Une phrase. élégante suite.",
+]
+
+# Exact output, including the splits issue #54 keeps.
+EXPECTED = {
+    "Acme Inc. She left.": ["Acme Inc.", "She left."],
+    "It was Jan. Then it snowed.": ["It was Jan.", "Then it snowed."],
+    "See Art. The rest.": ["See Art.", "The rest."],
+    "One. Two.": ["One.", "Two."],
+    "Really? Yes! Absolutely... Fine.": ["Really?", "Yes!", "Absolutely...", "Fine."],
+    "He said “Stop.” Then he left.": ["He said “Stop.”", "Then he left."],
+    "J. R. R. Tolkien wrote it. C. S. Lewis read it.": ["J. R. R. Tolkien wrote it.", "C. S. Lewis read it."],
+    "Born in the U.S.A. in 1970. Moved to the U.K. later.": ["Born in the U.S.A. in 1970.", "Moved to the U.K. later."],
+    "Absolutely... fine. Wait! what? Okay.": ["Absolutely... fine.", "Wait! what?", "Okay."],
+    "Max. 5 kg. The rest.": ["Max.", "5 kg.", "The rest."],
+    "Read ch. 4. Then ch. 5.": ["Read ch. 4.", "Then ch. 5."],
+    "In Art. “5” and Sec. (3).": ["In Art.", "“5” and Sec.", "(3)."],
+    "Done in Dec. 2. And May. 3 more.": ["Done in Dec. 2.", "And May.", "3 more."],
+    "The unit is \u212a. Next.": ["The unit is \u212a.", "Next."],
+    **{text: [text] for text in JOINED},
+}
+
+# CORPUS entries whose output issue #54 changes; every other entry is unchanged.
+CHANGED_BY_54 = {
+    "under_score_word. digits123. 456. Next.",
+    ". leading boundary. Next.",
+}
 
 CORPUS = [
     "",
@@ -91,6 +182,9 @@ CORPUS = [
     "Line break after abbreviation e.g.\nNew line starts here. Ok.",
     "MR. SHOUTING. DR. WHO. VS. THEM.",
     "Al. Gore. AL. Gore.",
+    "under_score_word. digits123. 456. Next.",
+    ". leading boundary. Next.",
+    *EXPECTED,
 ]
 
 FRAGMENTS = [
@@ -98,7 +192,9 @@ FRAGMENTS = [
     "e.g", "i.e", "E.g", "Dr", "dr", "Mr", "Mrs", "Ms", "Prof", "St", "vs", "etc", "et al",
     "fig", "Figs", "eq", "Refs", "vol", "no", "pp", "3.14", "1.2.3", "42", "café", "naïve",
     "Ω", "Жук", "日本", "snake_case", "a.b", "...", "", "“", "”", "‘", "’", "\"", "'", "(", ")",
-    "[", "]", "[1]",
+    "[", "]", "[1]", "cf", "Cf", "VIZ", "approx", "ca", "Ch", "chap", "Sec", "secs", "Art",
+    "arts", "para", "Paras", "fn", "nos", "Jan", "sept", "Sep", "DEC", "May", "Inc", "Ph.D",
+    "5", "2020", "3.2", "élan", "in", "ß",
 ]
 PUNCTUATION = ["", "", ".", ".", ".", "!", "?", "...", "?!", ".”", ".’", '."', ".'", ".)", ".]",
                "!)", "?”", ".”)", ","]
@@ -117,6 +213,27 @@ def random_text(rng: random.Random) -> str:
 
 
 class SentenceTests(unittest.TestCase):
+    def test_expected_sentences(self) -> None:
+        for text, expected in EXPECTED.items():
+            with self.subTest(text=text):
+                self.assertEqual(sentences(text), expected)
+
+    def test_joined_cases_were_split_before(self) -> None:
+        for text in JOINED:
+            with self.subTest(text=text):
+                self.assertGreater(len(legacy_sentences(text)), 1)
+
+    def test_corpus_unaffected_by_54_is_unchanged(self) -> None:
+        # Companions of documents without the forms issue #54 joins stay byte-identical.
+        for text in CORPUS:
+            if text in EXPECTED:
+                continue
+            with self.subTest(text=text):
+                if text in CHANGED_BY_54:
+                    self.assertNotEqual(sentences(text), legacy_sentences(text))
+                else:
+                    self.assertEqual(sentences(text), legacy_sentences(text))
+
     def test_matches_reference_on_corpus(self) -> None:
         for text in CORPUS:
             with self.subTest(text=text):
@@ -134,6 +251,15 @@ class SentenceTests(unittest.TestCase):
             for variant in (abbreviation, abbreviation.upper(), abbreviation.capitalize()):
                 text = f"Before {variant}. after. Then {variant}.” more! End {variant}."
                 with self.subTest(text=text):
+                    self.assertEqual(sentences(text), reference_sentences(text))
+
+    def test_number_abbreviations_join_only_before_a_digit(self) -> None:
+        for abbreviation in sorted(NUMBER_ABBREVIATIONS):
+            for variant in (abbreviation, abbreviation.upper(), abbreviation.capitalize()):
+                text = f"See {variant}. 12 here. Then {variant}. Next. Or {variant}. (3) too."
+                with self.subTest(text=text):
+                    self.assertEqual(sentences(text), [f"See {variant}. 12 here.", f"Then {variant}.",
+                                                       "Next.", f"Or {variant}.", "(3) too."])
                     self.assertEqual(sentences(text), reference_sentences(text))
 
     def test_long_paragraph_splits_in_linear_time(self) -> None:

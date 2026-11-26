@@ -21,23 +21,37 @@ try:
         COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
+        OBJECT_BODY,
+        OBJECT_RELS,
         PROJECT,
         R,
         abstract_num,
+        alt_chunk,
         anchored,
+        chart,
+        checkbox,
         comments_extended,
         comments_part,
+        described_picture,
+        dropdown,
         end,
+        energy,
+        equation,
         image_rel,
         level,
         list_item,
         make_docx,
         num,
         numbering,
+        object_parts,
+        ole_object,
         paragraph,
         picture,
+        rel,
         run,
         start,
+        symbol,
+        vml_wordart,
     )
     from .test_textconv import tree
 except ImportError:  # discovered with -s tests: the directory itself is on sys.path
@@ -45,23 +59,37 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         COMMENTS_EXT_REL,
         COMMENTS_REL,
         NUMBERING_REL,
+        OBJECT_BODY,
+        OBJECT_RELS,
         PROJECT,
         R,
         abstract_num,
+        alt_chunk,
         anchored,
+        chart,
+        checkbox,
         comments_extended,
         comments_part,
+        described_picture,
+        dropdown,
         end,
+        energy,
+        equation,
         image_rel,
         level,
         list_item,
         make_docx,
         num,
         numbering,
+        object_parts,
+        ole_object,
         paragraph,
         picture,
+        rel,
         run,
         start,
+        symbol,
+        vml_wordart,
     )
     from test_textconv import tree  # type: ignore[no-redef]
 
@@ -288,6 +316,135 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 1): "Reply." (open)', lines)
         self.assertIn('+ added reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 2): "Reply." (open)', lines)
 
+    def thread(self, path: Path, parent: str = "Please clarify.", passage: str = "The cat sat.",
+               reply: str = "I agree.", done: str = "0", nested: str | None = None) -> None:
+        """Ada's comment 1 and her reply 2 (and, with ``nested``, a reply 3 to that reply), on one passage."""
+        comments, ids = {"1": parent, "2": reply}, {"1": "11111111", "2": "22222222"}
+        entries = [("11111111", None, done), ("22222222", "11111111", done)]
+        opened, closed = start("1") + start("2"), end("1") + end("2")
+        if nested is not None:
+            comments["3"], ids["3"] = nested, "33333333"
+            entries.append(("33333333", "22222222", done))
+            opened, closed = opened + start("3"), closed + end("3")
+        self.threaded(path, comments, ids, *entries, body=f"<w:p>{opened}{run(passage)}{closed}</w:p>")
+
+    def test_editing_a_parent_does_not_rewrite_its_replies(self) -> None:
+        self.thread(self.old)
+        self.thread(self.new, parent="Please clarify this.")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Comments"),
+                         ['~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."'])
+        # A reply that changed too is worded as an edit, describing its new parent.
+        self.thread(self.new, parent="Please clarify this.", reply="I agree, mostly.")
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."',
+            '~ edited text of reply by Ada to Ada\'s comment "Please clarify this." on "The cat sat.":'
+            ' "I agree." → "I agree, mostly."',
+        ])
+
+    def test_editing_a_commented_sentence_re_anchors_the_thread(self) -> None:
+        self.thread(self.old)
+        self.thread(self.new, passage="The dog sat.")
+        lines = self.section(self.review(), "Comments")
+        self.assertEqual(lines, [
+            '~ re-anchored comment by Ada on "The cat sat.": "Please clarify." → now on "The dog sat."',
+            '~ re-anchored reply by Ada to Ada\'s comment "Please clarify." on "The dog sat.": "I agree."'
+            ' → now on "The dog sat."',
+        ])
+
+    def test_resolving_a_parent_says_nothing_about_its_replies(self) -> None:
+        comments, ids = {"1": "Please clarify.", "2": "I agree."}, {"1": "11111111", "2": "22222222"}
+        body = f"<w:p>{start('1')}{start('2')}{run('The cat sat.')}{end('1')}{end('2')}</w:p>"
+        self.threaded(self.old, comments, ids, ("11111111", None, "0"), ("22222222", "11111111", "0"), body=body)
+        self.threaded(self.new, comments, ids, ("11111111", None, "1"), ("22222222", "11111111", "0"), body=body)
+        self.assertEqual(self.section(self.review(), "Comments"),
+                         ['~ resolved comment by Ada on "The cat sat.": "Please clarify."'])
+
+    def test_removing_a_parent_removes_its_replies(self) -> None:
+        self.thread(self.old)
+        make_docx(self.new, paragraph("The cat sat."))
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '- removed comment by Ada on "The cat sat.": "Please clarify." (open)',
+            '- removed reply by Ada to Ada\'s comment "Please clarify." on "The cat sat.": "I agree." (open)',
+        ])
+        # And the other way round: a new thread is added, parent and reply.
+        make_docx(self.old, paragraph("The cat sat."))
+        self.thread(self.new)
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '+ added comment by Ada on "The cat sat.": "Please clarify." (open)',
+            '+ added reply by Ada to Ada\'s comment "Please clarify." on "The cat sat.": "I agree." (open)',
+        ])
+
+    def test_replies_to_replies_follow_their_edited_parents(self) -> None:
+        self.thread(self.old, nested="Me too.")
+        self.thread(self.new, parent="Please clarify this.", reply="I agree, mostly.", nested="Me too.")
+        self.assertEqual(self.section(self.review(), "Comments"), [
+            '~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."',
+            '~ edited text of reply by Ada to Ada\'s comment "Please clarify this." on "The cat sat.":'
+            ' "I agree." → "I agree, mostly."',
+        ])
+
+    def test_a_reply_whose_parent_is_not_paired_is_removed_and_added(self) -> None:
+        # Two parents change at once: neither can be worded as an edit, so neither can their replies.
+        def write(path: Path, first: str, second: str) -> None:
+            comments = {"1": first, "2": second, "3": "Reply."}
+            ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+            body = "".join(f"<w:p>{start(c)}{run('Same passage.')}{end(c)}</w:p>" for c in "12") + \
+                f"<w:p>{start('3')}{run('Passage 3.')}{end('3')}</w:p>"
+            self.threaded(path, comments, ids, ("11111111", None, "0"), ("22222222", None, "0"),
+                          ("33333333", "11111111", "0"), body=body)
+        write(self.old, "Same.", "Same.")
+        write(self.new, "Changed.", "Changed.")
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Same." on "Same passage." (comment 1): "Reply." (open)',
+                      lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Changed." on "Same passage." (comment 1): "Reply." (open)',
+                      lines)
+
+    def test_editing_a_parent_with_identical_replies_does_not_rewrite_them(self) -> None:
+        def write(path: Path, parent: str) -> None:
+            comments = {"1": parent, "2": "Agreed.", "3": "Agreed."}
+            ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+            body = f"<w:p>{start('1')}{start('2')}{start('3')}{run('The cat sat.')}{end('1')}{end('2')}{end('3')}</w:p>"
+            self.threaded(path, comments, ids, ("11111111", None, "0"), ("22222222", "11111111", "0"),
+                          ("33333333", "11111111", "0"), body=body)
+        write(self.old, "Please clarify.")
+        write(self.new, "Please clarify this.")
+        self.assertEqual(self.section(self.review(), "Comments"),
+                         ['~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."'])
+
+    def test_a_nested_reply_whose_parent_is_not_paired_is_removed_and_added(self) -> None:
+        # When the root comment is replaced (text and resolved both change, so not paired), its
+        # reply is removed and added, and a nested reply under that reply is removed and added too
+        # (neither silently kept when unchanged nor reported as edited through its parent's raw identity).
+        ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+        body = f"<w:p>{start('1')}{start('2')}{start('3')}{run('The cat sat.')}{end('1')}{end('2')}{end('3')}</w:p>"
+        for new_nested in ("Deep.", "Deep, edited."):
+            with self.subTest(new_nested=new_nested):
+                self.threaded(self.old, {"1": "Old root.", "2": "Middle.", "3": "Deep."}, ids,
+                              ("11111111", None, "0"), ("22222222", "11111111", "0"), ("33333333", "22222222", "0"),
+                              body=body)
+                self.threaded(self.new, {"1": "New root.", "2": "Middle.", "3": new_nested}, ids,
+                              ("11111111", None, "1"), ("22222222", "11111111", "0"), ("33333333", "22222222", "0"),
+                              body=body)
+                lines = self.section(self.review(), "Comments")
+                self.assertIn('- removed reply by Ada to Ada\'s comment "Middle." on "The cat sat.": "Deep." (open)', lines)
+                self.assertIn(f'+ added reply by Ada to Ada\'s comment "Middle." on "The cat sat.": "{new_nested}" (open)',
+                              lines)
+                self.assertFalse([line for line in lines if line.startswith("~")], lines)
+
+    def test_a_reply_to_cycle_ends(self) -> None:
+        # Malformed: each comment names the other as its parent, so neither has a paired parent.
+        comments, ids = {"1": "First.", "2": "Second."}, {"1": "11111111", "2": "22222222"}
+        self.threaded(self.old, comments, ids, ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
+        self.threaded(self.new, {"1": "First, edited.", "2": "Second."}, ids,
+                      ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First." (open)', lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First, edited." (open)', lines)
+        self.assertFalse([line for line in lines if line.startswith("~")], lines)
+
     def test_long_comment_text_is_shortened(self) -> None:
         long = "word " * 40
         make_docx(self.old, paragraph("Body."))
@@ -317,6 +474,58 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("Prose: no changes", report)
         self.assertEqual(self.section(report, "Hyperlinks"),
                          ['~ link "Visible label": https://example.invalid/first → https://example.invalid/second'])
+
+    def write_forms(self, old: str, new: str) -> None:
+        for path, field in ((self.old, old), (self.new, new)):
+            make_docx(path, f"<w:p>{run('Sublet: ')}{field}</w:p>")
+
+    def test_ticking_a_form_checkbox(self) -> None:
+        self.write_forms(checkbox("0"), checkbox("1"))
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
+                         ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked → checked'])
+        self.write_forms(checkbox(None, "1"), checkbox(None, "0"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: checked → unchecked'])
+
+    def test_choosing_another_dropdown_entry(self) -> None:
+        self.write_forms(dropdown("Yes", "No", result="0"), dropdown("Yes", "No", result="1"))
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"'])
+        self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", "Maybe", result="1"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed'])
+        self.write_forms(dropdown("Yes", "No", result="0"), dropdown("No", "Yes", result="0"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed; "Yes" → "No"'])
+        self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", result="7"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "No" → (no entry selected)'])
+
+    def test_unnamed_and_renamed_form_fields(self) -> None:
+        self.write_forms(checkbox("0", name=None), checkbox("1", name=None))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ["~ field 1 (FORMCHECKBOX) in word/document.xml: unchecked → checked"])
+        # A renamed field, or one that changed kind, is not worded as a state change.
+        self.write_forms(checkbox("0"), checkbox("1", name="Other"))
+        self.assertEqual(self.section(self.review(), "Fields"), [
+            '- removed field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked',
+            '+ added field 1 (FORMCHECKBOX "Other") in word/document.xml: checked'])
+        self.write_forms(checkbox("1"), dropdown("Yes", result="0"))
+        self.assertEqual(self.section(self.review(), "Fields"), [
+            '- removed field 1 (FORMCHECKBOX "Check1") in word/document.xml: checked',
+            '+ added field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes"'])
+
+    def test_markdown_escapes_form_field_names_and_entries(self) -> None:
+        self.write_forms(dropdown("*Yes*", "[No](x)", result="0", name="<b>|"),
+                         dropdown("*Yes*", "[No](x)", result="1", name="<b>|"))
+        self.assertEqual(self.section(self.review(), "Fields"),
+                         ['~ field 1 (FORMDROPDOWN "<b>|") in word/document.xml: "*Yes*" → "[No](x)"'])
+        self.assertIn('- `~` field 1 (FORMDROPDOWN "&lt;b&gt;\\|") in word/document.xml\\: '
+                      '"\\*Yes\\*" → "\\[No\\](x)"\n', self.markdown())
 
     def test_image_swap(self) -> None:
         for path, data in ((self.old, "first picture"), (self.new, "second picture")):
@@ -356,6 +565,201 @@ class ReviewTests(unittest.TestCase):
         (line,) = self.section(self.review(), "Images")
         self.assertRegex(line, r"^\+ added image 1 \(word/document\.xml\): 14 bytes, sha256 [0-9a-f]{12}, "
                                r"linked to https://example\.invalid/b\.png$")
+
+    def write_alt(self, path: Path, descr: str | None, *, title: str | None = None, data: str = "picture") -> None:
+        make_docx(path, anchored("Figure:", described_picture("rId5", descr, title=title)),
+                  extra={"word/media/image1.png": data}, relationships=image_rel("rId5", "media/image1.png"))
+
+    def test_alt_text_changes(self) -> None:
+        self.write_alt(self.old, "A red cat")
+        self.write_alt(self.new, "A blue dog")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Images"),
+                         ['~ image 1 (word/document.xml) alt text: "A red cat" → "A blue dog"'])
+        self.write_alt(self.new, None)
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) alt text: "A red cat" → (none)'])
+        self.write_alt(self.old, None)
+        self.write_alt(self.new, "A red cat", title="Cat")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) alt text: (none) → "A red cat"; alt title: (none) → "Cat"'])
+        self.write_alt(self.old, "A red cat", data="first")
+        self.write_alt(self.new, "A blue dog", data="second")
+        self.assertEqual(self.section(self.review(), "Images"),
+                         ['~ image 1 (word/document.xml) replaced; alt text: "A red cat" → "A blue dog"'])
+        self.write_alt(self.new, "A red cat", data="first")
+        self.assertNotIn("Images", self.review(code=0))
+        # An added or removed image shows its alt text.
+        make_docx(self.old, paragraph("Figure:"))
+        self.write_alt(self.new, "A red cat", title="Cat")
+        (line,) = self.section(self.review(), "Images")
+        self.assertRegex(line, r'^\+ added image 1 \(word/document\.xml\): 7 bytes, sha256 [0-9a-f]{12}, '
+                               r'alt text "A red cat", alt title "Cat"$')
+
+    def test_alt_text_stays_on_one_line_and_is_escaped_in_markdown(self) -> None:
+        self.write_alt(self.old, "A *red* cat\n+ added image 9")
+        self.write_alt(self.new, "[A dog](https://example.invalid) <b>")
+        line = '~ image 1 (word/document.xml) alt text: "A *red* cat + added image 9" → "[A dog](https://example.invalid) <b>"'
+        self.assertEqual(self.section(self.review(), "Images"), [line])
+        self.assertIn('- `~` image 1 (word/document.xml) alt text\\: "A \\*red\\* cat + added image 9" → '
+                      '"\\[A dog\\](https\\://example.invalid) &lt;b&gt;"\n', self.markdown())
+
+    def test_wordart_changes(self) -> None:
+        title = "Charts, diagrams and embedded objects"
+
+        def write(path: Path, *texts: str) -> None:
+            make_docx(path, "".join(f"<w:p><w:r>{vml_wordart(t)}</w:r></w:p>" for t in texts))
+
+        write(self.old, "SALE")
+        write(self.new, "CLOSED")
+        report = self.review()
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, title), ['~ WordArt 1 (word/document.xml): "SALE" → "CLOSED"'])
+        self.assertIn(f'### {title}\n\n- `~` WordArt 1 (word/document.xml)\\: "SALE" → "CLOSED"\n', self.markdown())
+        write(self.new, "SALE", "OPEN")
+        self.assertEqual(self.section(self.review(), title), ['+ added WordArt 2 (word/document.xml): "OPEN"'])
+        write(self.new)
+        self.assertEqual(self.section(self.review(), title), ['- removed WordArt 1 (word/document.xml): "SALE"'])
+        # Document text in the report stays on one line and renders literally in Markdown.
+        write(self.new, "*SALE*\n+ added chart 1")
+        self.assertEqual(self.section(self.review(), title),
+                         ['~ WordArt 1 (word/document.xml): "SALE" → "*SALE* + added chart 1"'])
+        self.assertIn('- `~` WordArt 1 (word/document.xml)\\: "SALE" → "\\*SALE\\* + added chart 1"\n', self.markdown())
+
+    def test_equation_and_symbol_edits(self) -> None:
+        def write(path: Path, power: str = "2", char: str = "F061", font: str = "Symbol") -> None:
+            make_docx(path, f'<w:p>{run("Energy: ")}{equation(energy(power))}{symbol(char, font)}</w:p>')
+
+        write(self.old)
+        write(self.new, "3")
+        report = self.review()
+        # The prose shows what changed inside the equation; the fingerprint says which one changed.
+        self.assertIn("\n-Energy: [Math: E=mc^2][Unsupported sym]\n+Energy: [Math: E=mc^3][Unsupported sym]\n", report)
+        self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Energy: [Math: E=mc^[-2-]{+3+}][Unsupported sym]\n", marked)
+        self.assertIn("\nEquations and symbols:\n~ equation 1 (word/document.xml) changed\n", marked)
+        write(self.new, char="F062")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"),
+                         ["~ symbol 1 (word/document.xml): F061 (Symbol) → F062 (Symbol)"])
+        write(self.new, font="Wingdings")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"),
+                         ["~ symbol 1 (word/document.xml): F061 (Symbol) → F061 (Wingdings)"])
+        write(self.new)
+        self.assertNotIn("Equations and symbols", self.review(code=0))
+
+    def test_equations_and_symbols_are_numbered_by_kind_and_added_or_removed(self) -> None:
+        def write(path: Path, *maths: str) -> None:
+            make_docx(path, f'<w:p>{symbol()}{"".join(equation(m) for m in maths)}{symbol("F062")}</w:p>')
+
+        write(self.old, "a", "b")
+        write(self.new, "a", "c")
+        self.assertEqual(self.section(self.review(), "Equations and symbols"), ["~ equation 2 (word/document.xml) changed"])
+        write(self.new, "z", "a", "b")
+        (added,) = self.section(self.review(), "Equations and symbols")
+        self.assertRegex(added, r"^\+ added equation 1 \(word/document\.xml\), sha256 [0-9a-f]{12}$")
+        write(self.new, "b")
+        (removed,) = self.section(self.review(), "Equations and symbols")
+        self.assertRegex(removed, r"^- removed equation 1 \(word/document\.xml\), sha256 [0-9a-f]{12}$")
+        # Companions from before objects were recorded have no key: read as no objects.
+        make_docx(self.old, paragraph("Plain."))
+        make_docx(self.new, paragraph("Plain.") + f"<w:p>{symbol()}</w:p>")
+        lines = self.section(self.review(), "Equations and symbols")
+        self.assertEqual(lines, ["+ added symbol 1 (word/document.xml): F061 (Symbol)"])
+
+    def write_objects(self, path: Path, body: str = OBJECT_BODY, relationships: str = OBJECT_RELS,
+                      **parts: str) -> None:
+        make_docx(path, body, extra=object_parts(**parts), relationships=relationships)
+
+    def test_chart_diagram_embedded_object_and_chunk_edits(self) -> None:
+        self.write_objects(self.old)
+        title = "Charts, diagrams and embedded objects"
+        for edit, line in (({"value": "99"}, "~ chart 1 (word/document.xml) changed"),
+                           ({"node": "Build"}, "~ diagram 1 (word/document.xml) changed"),
+                           ({"workbook": "workbook v2"}, "~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed"),
+                           ({"chunk": "Other text"}, "~ imported chunk 1 (word/document.xml) changed")):
+            with self.subTest(edit=edit):
+                self.write_objects(self.new, **edit)
+                report = self.review()
+                self.assertIn("Prose: no changes", report)
+                self.assertEqual(self.section(report, title), [line])
+                self.assertNotIn("Equations and symbols", report)
+                markdown = self.markdown()
+                self.assertIn(f"### {title}\n\n- `~` {line[2:]}\n", markdown)
+        self.write_objects(self.new)
+        self.assertNotIn(title, self.review(code=0))
+
+    def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
+        self.write_objects(self.old)
+        added = OBJECT_BODY.replace("</w:p>", f'<w:r>{chart("chart")}</w:r></w:p>', 1)
+        self.write_objects(self.new, added)
+        (line,) = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertRegex(line, r"^\+ added chart 2 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        self.write_objects(self.new, OBJECT_BODY.replace(alt_chunk("chunk"), ""))
+        (line,) = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertRegex(line, r"^- removed imported chunk 1 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        # A part that goes missing, or a link that changes target, is removed and added.
+        self.write_objects(self.new, relationships=OBJECT_RELS.replace("charts/chart1.xml", "charts/missing.xml"))
+        lines = self.section(self.review(), "Charts, diagrams and embedded objects")
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r"^- removed chart 1 \(word/document\.xml\): sha256 [0-9a-f]{12}$")
+        self.assertEqual(lines[1], "+ added chart 1 (word/document.xml): with a missing part")
+        for path, target in ((self.old, "file:///C:/a.xlsx"), (self.new, "file:///C:/b.xlsx")):
+            make_docx(path, f'<w:p><w:r>{ole_object("link", kind="Link")}</w:r></w:p>',
+                      relationships=rel("link", "oleObject", target, external=True))
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"), [
+            "- removed embedded object 1 (Excel.Sheet.12, word/document.xml): linked to file:///C:/a.xlsx",
+            "+ added embedded object 1 (Excel.Sheet.12, word/document.xml): linked to file:///C:/b.xlsx",
+        ])
+
+    def test_object_and_equation_sections_are_separate(self) -> None:
+        def write(path: Path, math: str = "E=mc2", **parts: str) -> None:
+            self.write_objects(path, f"<w:p>{equation(math)}</w:p>" + OBJECT_BODY, **parts)
+
+        write(self.old)
+        write(self.new, value="99")
+        report = self.review()
+        self.assertNotIn("Equations and symbols", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
+        write(self.new, "E=mc3")
+        report = self.review()
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        self.assertEqual(self.section(report, "Equations and symbols"), ["~ equation 1 (word/document.xml) changed"])
+
+    def test_an_equation_moved_across_a_chart_is_reported(self) -> None:
+        # Each section's own entries stay the same; the prose shows the block-level equation moving.
+        math = equation("x", para=True)
+        self.write_objects(self.old, math + OBJECT_BODY)
+        self.write_objects(self.new, OBJECT_BODY + math)
+        report = self.review()
+        self.assertIn("\n-[Math: x]\n", report)
+        self.assertIn("\n+[Math: x]\n", report)
+        self.assertNotIn("Equations and symbols", report)
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        self.assertIn("\n\nObjects: equations or symbols moved relative to charts, diagrams or embedded objects\n",
+                      report)
+
+    def write_ole(self, prog_id_xml: str) -> None:
+        """An old and new OLE object whose embeddings differ; ``prog_id_xml`` is the raw attribute value."""
+        for path, workbook in ((self.old, "v1"), (self.new, "v2")):
+            obj = ole_object("ole", "PROG").replace('ProgID="PROG"', f'ProgID="{prog_id_xml}"')
+            make_docx(path, f"<w:p><w:r>{obj}</w:r></w:p>", extra={"word/embeddings/oleObject1.bin": workbook},
+                      relationships=rel("ole", "oleObject", "embeddings/oleObject1.bin"))
+
+    def test_markdown_escapes_an_embedded_object_prog_id(self) -> None:
+        self.write_ole("Evil*&lt;b&gt;`x`[y](https://example.invalid)")
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         ["~ embedded object 1 (Evil*<b>`x`[y](https://example.invalid), word/document.xml) changed"])
+        self.assertIn("- `~` embedded object 1 (Evil\\*&lt;b&gt;\\`x\\`\\[y\\](https\\://example.invalid), "
+                      "word/document.xml) changed\n", self.markdown())
+
+    def test_a_line_break_in_a_prog_id_stays_on_its_line(self) -> None:
+        # An attribute can carry a line break as a character reference.
+        self.write_ole("X&#10;+ added chart 7")
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         ["~ embedded object 1 (X + added chart 7, word/document.xml) changed"])
 
     def test_bullet_to_number_list_format_change(self) -> None:
         body = list_item("First.", "1") + list_item("Second.", "1")
@@ -475,6 +879,17 @@ class ReviewTests(unittest.TestCase):
                           "### Hyperlinks", "### Warnings", "### Coverage warnings (either side)"])
         # The prose diff itself is verbatim.
         self.assertIn(f"+{hostile}\n", report[fence:])
+
+    def test_www_after_an_underscore_is_not_autolinked(self) -> None:
+        # GFM links "www." after "_", so its dot is escaped there too, not only after a word boundary.
+        note = "see build_www.example.invalid and _WWW.other.invalid"
+        make_docx(self.old, paragraph("Body."))
+        make_docx(self.new, f"<w:p>{start('1')}{run('Body.')}{end('1')}</w:p>",
+                  extra={"word/comments.xml": comments_part({"1": note})}, relationships=COMMENTS_REL)
+        self.review()
+        section = self.markdown().split("### Comments\n\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(section, '- `+` added comment by Ada on "Body."\\: '
+                                  '"see build\\_www\\.example.invalid and \\_WWW\\.other.invalid"')
 
     def test_markdown_header_labels_are_code_spans(self) -> None:
         make_docx(self.old, paragraph("Same."))
@@ -976,6 +1391,18 @@ class MarkdownEscapingTests(unittest.TestCase):
         self.assertEqual(escape("$x$ ~~s~~ _u_"), "\\$x\\$ \\~\\~s\\~\\~ \\_u\\_")
         self.assertEqual(escape("see www.example.invalid or a@b.invalid"),
                          "see www\\.example.invalid or a\\@b.invalid")
+        # GFM links a "www." at the start or after whitespace, "*", "_", "~" or "(", in any case;
+        # "_" is a word character, so a word boundary alone missed it.
+        for raw, escaped in (("see _www.example.invalid", "see \\_www\\.example.invalid"),
+                             ("a_b_www.x.invalid", "a\\_b\\_www\\.x.invalid"),
+                             ("*www.a.invalid", "\\*www\\.a.invalid"),
+                             ("~www.a.invalid", "\\~www\\.a.invalid"),
+                             ("(www.a.invalid", "(www\\.a.invalid"),
+                             ("www.a.invalid", "www\\.a.invalid"),
+                             ("see WWW.a.invalid and _Www.b.invalid", "see WWW\\.a.invalid and \\_Www\\.b.invalid")):
+            self.assertEqual(escape(raw), escaped)
+        # GFM links no "www." straight after a letter or digit, so it stays as it was.
+        self.assertEqual(escape("awww.example.invalid 3www.x.invalid"), "awww.example.invalid 3www.x.invalid")
         self.assertEqual(escape("back\\slash"), "back\\\\slash")
         self.assertEqual(escape("plain words, 1.5 (ok)"), "plain words, 1.5 (ok)")
 

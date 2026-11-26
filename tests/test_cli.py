@@ -131,6 +131,7 @@ def numbering(*definitions: str) -> str:
 
 
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+IMAGE_ALT_NOTE = "Images are compared by content hash and alt text; size, position, and cropping are not compared."
 MISSING_IMAGE_NOTE = (
     "Some image relationships are missing or point to missing parts; "
     "those images are recorded without a hash."
@@ -151,6 +152,142 @@ def vml_picture(rid: str) -> str:
     return f'<w:pict><v:shape xmlns:v="{V}" id="Picture 1" style="width:72pt;height:72pt"><v:imagedata r:id="{rid}"/></v:shape></w:pict>'
 
 
+def quoted(value: str) -> str:
+    """``value`` escaped for a double-quoted XML attribute."""
+    return escape(value, {'"': "&quot;", "\n": "&#10;"})
+
+
+def described_picture(rid: str, descr: str | None = None, *, own: str | None = None,
+                      title: str | None = None) -> str:
+    """An inline DrawingML picture with alt text on its wp:docPr (``descr``, ``title``) and on
+    its pic:cNvPr (``own``), as Word writes it; None leaves an attribute out."""
+    def attributes(**values: str | None) -> str:
+        return "".join(f' {key}="{quoted(value)}"' for key, value in values.items() if value is not None)
+    return (f'<w:drawing><wp:inline xmlns:wp="{WP}"><wp:extent cx="914400" cy="914400"/>'
+            f'<wp:docPr id="1" name="Picture 1"{attributes(descr=descr, title=title)}/>'
+            f'<a:graphic xmlns:a="{A}"><a:graphicData uri="{PIC}"><pic:pic xmlns:pic="{PIC}">'
+            f'<pic:nvPicPr><pic:cNvPr id="0" name="cat.png"{attributes(descr=own)}/><pic:cNvPicPr/></pic:nvPicPr>'
+            f'<pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>'
+            '</wp:inline></w:drawing>')
+
+
+def vml_wordart(text: str) -> str:
+    """Legacy VML WordArt: a v:shape drawing ``text`` along its v:textpath, with the shape type
+    Word writes next to it (whose own v:textpath has no text)."""
+    return (f'<w:pict><v:shapetype xmlns:v="{V}" id="_x0000_t136" coordsize="21600,21600" o:spt="136" '
+            f'xmlns:o="urn:schemas-microsoft-com:office:office" path="m@7,l@8,m@5,21600l@6,21600e">'
+            '<v:path textpathok="t" o:connecttype="custom"/><v:textpath on="t" fitshape="t"/></v:shapetype>'
+            f'<v:shape xmlns:v="{V}" id="WordArt 1" type="#_x0000_t136" style="width:200pt;height:50pt" fillcolor="black">'
+            f'<v:textpath style="font-family:&quot;Arial Black&quot;;v-text-kern:t" trim="t" fitpath="t" '
+            f'string="{quoted(text)}"/></v:shape></w:pict>')
+
+
+def wordart_entry(text: str, part: str = "word/document.xml") -> dict[str, Any]:
+    return {"kind": "WordArt", "part": part, "text": text}
+
+
+C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+VML_O = "urn:schemas-microsoft-com:office:office"
+
+
+def graphic(uri: str, content: str) -> str:
+    """An inline DrawingML graphic frame holding ``content``."""
+    return (f'<w:drawing><wp:inline xmlns:wp="{WP}"><a:graphic xmlns:a="{A}"><a:graphicData uri="{uri}">'
+            f'{content}</a:graphicData></a:graphic></wp:inline></w:drawing>')
+
+
+def chart(rid: str) -> str:
+    """An inline DrawingML chart referencing a chart part relationship."""
+    return graphic(C, f'<c:chart xmlns:c="{C}" r:id="{rid}"/>')
+
+
+def smartart(data: str, layout: str = "dgmLayout", style: str = "dgmStyle", colors: str = "dgmColors") -> str:
+    """An inline SmartArt diagram referencing its data, layout, quick-style and colour parts."""
+    return graphic(DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="{data}" r:lo="{layout}" r:qs="{style}" r:cs="{colors}"/>')
+
+
+def ole_object(rid: str, prog_id: str = "Excel.Sheet.12", kind: str = "Embed") -> str:
+    """A w:object with its VML preview shape and an o:OLEObject referencing the embedding."""
+    return (f'<w:object><v:shape xmlns:v="{V}" id="_x0000_i1025" style="width:300pt;height:150pt"/>'
+            f'<o:OLEObject xmlns:o="{VML_O}" Type="{kind}" ProgID="{escape(prog_id, {chr(34): "&quot;"})}" '
+            f'ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="{rid}"/></w:object>')
+
+
+def alt_chunk(rid: str) -> str:
+    return f'<w:altChunk r:id="{rid}"/>'
+
+
+def rel(rid: str, kind: str, target: str, *, external: bool = False) -> str:
+    """A relationship of type ``kind`` (e.g. chart, diagramData, oleObject, aFChunk)."""
+    mode = ' TargetMode="External"' if external else ""
+    return f'<Relationship Id="{rid}" Type="{R}/{kind}" Target="{target}"{mode}/>'
+
+
+def part_entry(kind: str, data: str | None, part: str = "word/document.xml", **extra: str) -> dict[str, Any]:
+    """The objects entry for an object whose target part holds ``data`` (None: missing)."""
+    sha = None if data is None else hashlib.sha256(data.encode("utf-8")).hexdigest()
+    return {"kind": kind, "part": part, "sha256": sha, **extra}
+
+
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+
+def math_run(text: str) -> str:
+    return f"<m:r><m:t>{escape(text)}</m:t></m:r>"
+
+
+def equation(content: str = "E=mc2", *, para: bool = False) -> str:
+    """An OMML equation (m:oMath, or m:oMathPara around one); a plain string is one math run."""
+    inner = content if content.startswith("<") else math_run(content)
+    math = f'<m:oMath xmlns:m="{M}">{inner}</m:oMath>'
+    return f'<m:oMathPara xmlns:m="{M}">{math}</m:oMathPara>' if para else math
+
+
+def symbol(char: str = "F061", font: str = "Symbol") -> str:
+    return f'<w:r><w:sym w:font="{font}" w:char="{char}"/></w:r>'
+
+
+def equation_entry(form: list[Any], part: str = "word/document.xml") -> dict[str, Any]:
+    """The objects entry for an equation whose canonical form is ``form``."""
+    data = json.dumps(form, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {"kind": "equation", "part": part, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def simple_form(text: str = "E=mc2") -> list[Any]:
+    """The canonical form of ``equation(text)``."""
+    return [f"{{{M}}}oMath", [], "", [[f"{{{M}}}r", [], "", [[f"{{{M}}}t", [], text, []]]]]]
+
+
+def math_form(text: str) -> list[Any]:
+    """The canonical form of ``math_run(text)``."""
+    return [f"{{{M}}}r", [], "", [[f"{{{M}}}t", [], text, []]]]
+
+
+def structure(name: str, *args: tuple[str, str], props: str = "") -> str:
+    """An OMML structure m:<name> with its m:<name>Pr properties and (argument, content) children;
+    plain-string content is one math run."""
+    pr = f"<m:{name}Pr>{props}</m:{name}Pr>" if props else ""
+    inner = "".join(f"<m:{arg}>{content if content.startswith('<') or not content else math_run(content)}</m:{arg}>"
+                    for arg, content in args)
+    return f"<m:{name}>{pr}{inner}</m:{name}>"
+
+
+def energy(power: str = "2") -> str:
+    """E=mc² as Word writes it: a run and a superscript."""
+    return math_run("E=m") + structure("sSup", ("e", "c"), ("sup", power))
+
+
+def energy_form(power: str = "2") -> list[Any]:
+    """The canonical form of ``equation(energy(power))``."""
+    return [f"{{{M}}}oMath", [], "", [math_form("E=m"), [f"{{{M}}}sSup", [], "", [
+        [f"{{{M}}}e", [], "", [math_form("c")]], [f"{{{M}}}sup", [], "", [math_form(power)]]]]]]
+
+
+MATH_NOTE = ("Equations are shown as linear [Math: …] text; layout, fonts and alignment are not compared, "
+             "and equation fingerprints are in objects.")
+
+
 def image_rel(rid: str, target: str, *, external: bool = False) -> str:
     mode = ' TargetMode="External"' if external else ""
     return f'<Relationship Id="{rid}" Type="{R}/image" Target="{target}"{mode}/>'
@@ -159,6 +296,49 @@ def image_rel(rid: str, target: str, *, external: bool = False) -> str:
 def image_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
     raw = data.encode("utf-8")
     return {"part": part, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def form_field(command: str, data: str, display: str = "", *, name: str | None = "Field1", rsid: str = "") -> str:
+    """A legacy form field as Word writes it: ``data`` is the type-specific part of its w:ffData.
+
+    Checkboxes and dropdowns have no display text; a text input's ``display`` is its value.
+    """
+    named = "" if name is None else f'<w:name w:val="{escape(name)}"/>'
+    runs = '<w:r{rsid}><w:fldChar w:fldCharType="begin"><w:ffData>{named}<w:enabled/><w:calcOnExit w:val="0"/>{data}'
+    runs += '</w:ffData></w:fldChar></w:r><w:r{rsid}><w:instrText xml:space="preserve"> {command} </w:instrText></w:r>'
+    if display:
+        runs += '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' + run(display)
+    runs += '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    return runs.format(rsid=f' w:rsidR="{rsid}"' if rsid else "", named=named, data=data, command=command)
+
+
+def checkbox(checked: str | None = "0", default: str | None = "0", *, name: str | None = "Check1", rsid: str = "") -> str:
+    """A FORMCHECKBOX; "" for ``checked`` or ``default`` writes the element without w:val, None leaves it out."""
+    def on_off(tag: str, value: str | None) -> str:
+        return "" if value is None else f"<w:{tag}/>" if value == "" else f'<w:{tag} w:val="{value}"/>'
+    data = f'<w:checkBox><w:sizeAuto/>{on_off("default", default)}{on_off("checked", checked)}</w:checkBox>'
+    return form_field("FORMCHECKBOX", data, name=name, rsid=rsid)
+
+
+def dropdown(*entries: str, result: str | None = "0", default: str | None = None, name: str | None = "Drop1") -> str:
+    """A FORMDROPDOWN with ``entries``; None leaves w:result or w:default out."""
+    data = "<w:ddList>" + ("" if result is None else f'<w:result w:val="{result}"/>')
+    data += "" if default is None else f'<w:default w:val="{default}"/>'
+    data += "".join(f'<w:listEntry w:val="{escape(entry)}"/>' for entry in entries) + "</w:ddList>"
+    return form_field("FORMDROPDOWN", data, name=name)
+
+
+def checkbox_entry(checked: bool, name: str = "Check1", part: str = "word/document.xml") -> dict[str, Any]:
+    return {"command": "FORMCHECKBOX", "sha256": hashlib.sha256(b"FORMCHECKBOX").hexdigest(), "part": part,
+            "form": {"type": "checkbox", "name": name, "checked": checked}}
+
+
+def dropdown_form(entries: list[str], selected: str | None, name: str = "Drop1") -> dict[str, Any]:
+    return {"type": "dropdown", "name": name, "entries": entries, "selected": selected}
+
+
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
+                   "text form field settings are not compared.")
 
 
 def make_docx(
@@ -263,6 +443,40 @@ def comments_extended(*entries: tuple[str, str | None, str | None]) -> str:
         return f'<w15:commentEx w15:paraId="{para}"{parent_xml}{done_xml}/>'
     return (f'<w15:commentsEx xmlns:w15="{W15}" xmlns:mc="{MC}" mc:Ignorable="w15">'
             + "".join(entry(*e) for e in entries) + "</w15:commentsEx>")
+
+
+def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str = "Plan",
+                 chunk: str = "Chunk text") -> dict[str, str]:
+    """The parts a chart, a SmartArt diagram, an embedded workbook and an imported chunk point to."""
+    return {
+        "word/charts/chart1.xml": (f'<c:chartSpace xmlns:c="{C}" xmlns:r="{R}"><c:chart><c:plotArea><c:barChart>'
+                                   f'<c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>{value}</c:v></c:pt>'
+                                   '</c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart>'
+                                   '<c:externalData r:id="rId1"/></c:chartSpace>'),
+        "word/charts/_rels/chart1.xml.rels": (f'<Relationships xmlns="{PKG_R}">'
+                                              + rel("rId1", "package", "../embeddings/chart_workbook.xlsx")
+                                              + "</Relationships>"),
+        "word/embeddings/chart_workbook.xlsx": "chart workbook bytes",
+        "word/diagrams/data1.xml": (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst><dgm:pt modelId="1">'
+                                    f"<dgm:t><a:p><a:r><a:t>{node}</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst>"
+                                    "</dgm:dataModel>"),
+        "word/diagrams/layout1.xml": "<layout/>",
+        "word/diagrams/quickStyle1.xml": "<quickStyle/>",
+        "word/diagrams/colors1.xml": "<colors/>",
+        "word/embeddings/Microsoft_Excel_Worksheet.xlsx": workbook,
+        "word/afchunk.htm": f"<html><body><p>{chunk}</p></body></html>",
+    }
+
+
+# Relationships and a body for object_parts(): every object kind, inline and block-level.
+OBJECT_RELS = (rel("chart", "chart", "charts/chart1.xml") + rel("dgmData", "diagramData", "diagrams/data1.xml")
+               + rel("dgmLayout", "diagramLayout", "diagrams/layout1.xml")
+               + rel("dgmStyle", "diagramQuickStyle", "diagrams/quickStyle1.xml")
+               + rel("dgmColors", "diagramColors", "diagrams/colors1.xml")
+               + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+               + rel("chunk", "aFChunk", "afchunk.htm"))
+OBJECT_BODY = (f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{smartart("dgmData")}</w:r>'
+               f'<w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}')
 
 
 class CLITests(unittest.TestCase):
@@ -1116,6 +1330,170 @@ class CLITests(unittest.TestCase):
         self.assertEqual(before[0], after[0])
         self.assertNotEqual(before[1], after[1])
 
+    def export_form(self, body: str, **options: Any) -> dict[str, Any]:
+        source = self.root / "essay.docx"
+        make_docx(source, body, **options)
+        self.cli("export", source, "--root", self.root)
+        meta: dict[str, Any] = json.loads(self.exported()[1])
+        return meta
+
+    def test_toggling_a_form_checkbox_is_stale_in_metadata_only(self) -> None:
+        source = self.root / "essay.docx"
+        meta = self.export_form(f"<w:p>{run('The Tenant may sublet: ')}{checkbox('0')}</w:p>")
+        self.assertEqual(meta["fields"], [checkbox_entry(False)])
+        self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
+        before = self.exported()
+        make_docx(source, f"<w:p>{run('The Tenant may sublet: ')}{checkbox('1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+        self.cli("export", source, "--root", self.root)
+        after = self.exported()
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(json.loads(after[1])["fields"], [checkbox_entry(True)])
+
+    def test_checkbox_state_follows_checked_then_default(self) -> None:
+        cases = [
+            (checkbox("1", "0"), True), (checkbox("0", "1"), False), (checkbox("", "0"), True),
+            (checkbox("true", None), True), (checkbox("off", None), False),
+            (checkbox(None, "1"), True), (checkbox(None, "0"), False), (checkbox(None, ""), True),
+            (checkbox(None, None), False), (checkbox("0", name=None), False),
+        ]
+        for xml, checked in cases:
+            with self.subTest(xml=xml):
+                meta = self.export_form(f"<w:p>{xml}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["checked"], checked)
+        self.assertEqual(meta["fields"][0]["form"]["name"], "")
+        # w:default is the state when w:checked is absent, so changing it is stale too.
+        source = self.root / "essay.docx"
+        make_docx(source, f"<w:p>{checkbox(None, '1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+
+    def test_choosing_another_dropdown_entry_is_stale_in_metadata_only(self) -> None:
+        source = self.root / "essay.docx"
+        meta = self.export_form(f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='0')}</w:p>")
+        self.assertEqual(meta["fields"][0]["form"], dropdown_form(["Yes", "No"], "Yes"))
+        self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
+        before = self.exported()
+        make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+        self.cli("export", source, "--root", self.root)
+        after = self.exported()
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(json.loads(after[1])["fields"][0]["form"], dropdown_form(["Yes", "No"], "No"))
+        # Changing the entries, even with the same selection, is stale too.
+        make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', 'Maybe', result='1')}</w:p>")
+        self.cli("check", source, "--root", self.root, code=1)
+
+    def test_dropdown_selection_is_null_when_it_names_no_entry(self) -> None:
+        cases = [
+            (dropdown("Yes", "No", result=None), "Yes"),  # no w:result: the default entry, 0
+            (dropdown("Yes", "No", result=None, default="1"), "No"),  # no w:result: w:default
+            (dropdown("Yes", "No", result="1", default="0"), "No"),  # w:result wins over w:default
+            (dropdown("Yes", "No", result="+01"), "No"),
+            (dropdown("Yes", "No", result="2"), None),
+            (dropdown("Yes", "No", result="-1"), None),
+            (dropdown("Yes", "No", result="first"), None),
+            (dropdown("Yes", "No", result="99999999999999999999"), None),
+            (dropdown("Yes", "No", result=None, default="5"), None),
+            (dropdown(result=None), None),
+            (dropdown(result="0"), None),
+        ]
+        for xml, selected in cases:
+            with self.subTest(xml=xml):
+                form = self.export_form(f"<w:p>{xml}</w:p>")["fields"][0]["form"]
+                self.assertEqual(form["selected"], selected)
+        self.assertEqual(form["entries"], [])
+
+    def test_form_field_save_churn_keeps_companions_byte_identical(self) -> None:
+        source = self.root / "essay.docx"
+        self.export_form(f"<w:p>{checkbox('1')}{dropdown('Yes', 'No', result='1')}</w:p>")
+        before = self.exported()
+        # Reordered w:ffData children, an instruction split across runs, rsid attributes,
+        # proofing marks and a bookmark between the field's runs.
+        reordered = checkbox("1", rsid="00AB12CD").replace(
+            '<w:name w:val="Check1"/><w:enabled/><w:calcOnExit w:val="0"/>',
+            '<w:calcOnExit w:val="0"/><w:enabled/><w:name w:val="Check1"/>')
+        reordered = reordered.replace(
+            '<w:checkBox><w:sizeAuto/><w:default w:val="0"/><w:checked w:val="1"/></w:checkBox>',
+            '<w:checkBox><w:checked w:val="1"/><w:default w:val="0"/><w:sizeAuto/></w:checkBox>')
+        split = dropdown("Yes", "No", result="1").replace(
+            '<w:r><w:instrText xml:space="preserve"> FORMDROPDOWN </w:instrText></w:r>',
+            '<w:r><w:instrText xml:space="preserve"> FORM</w:instrText></w:r><w:proofErr w:type="spellStart"/>'
+            '<w:bookmarkStart w:id="3" w:name="Drop1"/>'
+            '<w:r w:rsidR="0011AA22"><w:instrText>DROPDOWN </w:instrText></w:r>')
+        split = split.replace('<w:result w:val="1"/><w:listEntry', '<w:listEntry').replace(
+            '<w:listEntry w:val="No"/>', '<w:listEntry w:val="No"/><w:result w:val="1"/>')
+        self.assertNotEqual(split, dropdown("Yes", "No", result="1"))
+        make_docx(source, f'<w:p w:rsidR="00AB12CD">{reordered}{split}</w:p>', churn=True)
+        self.cli("check", source, "--root", self.root)
+        self.cli("export", source, "--root", self.root)
+        self.assertEqual(before, self.exported())
+
+    def test_fields_without_form_data_keep_their_metadata(self) -> None:
+        # Pins the metadata of ordinary fields (a PAGE field and a Zotero citation): it must not
+        # change, so documents without legacy form fields keep their companions.
+        body = (
+            '<w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r>'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+            '<w:p><w:fldSimple w:instr=" ADDIN ZOTERO_ITEM CSL_CITATION {} "><w:r><w:t>(Smith, 2024)</w:t></w:r>'
+            '</w:fldSimple></w:p>'
+        )
+        meta = self.export_form(body)
+        expected = {
+            "schema": 1, "view": "accept-insertions-omit-deletions", "coverage": "partial-prose",
+            "warnings": [
+                "Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).",
+                "Formatting and page layout are not compared; unchanged prose is not an identical document.",
+            ],
+            "review": [], "hyperlinks": [], "lists": [], "list_runs": [], "images": [],
+            "fields": [
+                {"command": "PAGE", "sha256": hashlib.sha256(b"PAGE").hexdigest(), "part": "word/document.xml"},
+                {"command": "ADDIN", "sha256": hashlib.sha256(b"ADDIN ZOTERO_ITEM CSL_CITATION {}").hexdigest(),
+                 "part": "word/document.xml"},
+            ],
+        }
+        self.assertEqual(meta, expected)
+        self.assertEqual(self.exported()[1], (json.dumps(expected, ensure_ascii=False, indent=2,
+                                                         sort_keys=True) + "\n").encode("utf-8"))
+
+    def test_form_fields_in_other_stories_and_tracked_changes(self) -> None:
+        extra = {
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}"><w:p>{checkbox("1", name="InHeader")}</w:p></w:hdr>',
+            "word/footnotes.xml": (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{checkbox("0", name="InNote")}'
+                                   '</w:p></w:footnote></w:footnotes>'),
+        }
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        boxed = f"<w:p>{checkbox('1', name='InBox')}</w:p>"
+        body = (anchored("Boxed:", modern_text_box(boxed))
+                + f'<w:p><w:ins w:id="1" w:author="Ben">{checkbox("1", name="Inserted")}</w:ins></w:p>'
+                + f'<w:p>{run("Kept.")}<w:del w:id="2" w:author="Ben">{checkbox("1", name="Deleted")}</w:del></w:p>'
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        meta = self.export_form(body, extra=extra, relationships=relationships)
+        # Like every field, one inside a tracked deletion is not recorded; an insertion's is.
+        self.assertEqual(meta["fields"], [
+            checkbox_entry(True, "InBox"), checkbox_entry(True, "Inserted"),
+            checkbox_entry(False, "InNote", "word/footnotes.xml"), checkbox_entry(True, "InHeader", "word/header1.xml"),
+        ])
+
+    def test_recorded_form_data_no_longer_warns_but_text_inputs_still_do(self) -> None:
+        behaviour = ('<w:entryMacro w:val="Go"/><w:exitMacro w:val="Done"/><w:helpText w:type="text" w:val="Help"/>'
+                     '<w:statusText w:type="text" w:val="Status"/>')
+        text_input = form_field("FORMTEXT", '<w:textInput><w:type w:val="number"/><w:default w:val="0"/>'
+                                '<w:maxLength w:val="4"/><w:format w:val="0"/></w:textInput>', "1200", name="Rent")
+        body = (f"<w:p>{checkbox('1', '0').replace('<w:enabled/>', '<w:enabled/>' + behaviour)}"
+                f"{dropdown('Yes', 'No', result='1', default='0')}</w:p><w:p>{run('Rent: ')}{text_input}</w:p>")
+        meta = self.export_form(body)
+        unsupported = sorted(w for w in meta["warnings"] if w.startswith("Unsupported Word construct"))
+        self.assertEqual(unsupported, [f"Unsupported Word construct {name}; its semantics are not fully compared."
+                                       for name in ("default", "format", "maxLength", "textInput", "type")])
+        # The text input's value is prose; it records no form state.
+        self.assertIn(b"Rent: 1200", self.exported()[0])
+        self.assertNotIn("form", meta["fields"][2])
+        self.assertEqual([f.get("form", {}).get("type") for f in meta["fields"]], ["checkbox", "dropdown", None])
+
     def test_hyperlink_target_changes_are_metadata_changes(self) -> None:
         body = '<w:p><w:hyperlink r:id="link"><w:r><w:t>Visible link label</w:t></w:r></w:hyperlink></w:p>'
         source = self.root / "essay.docx"
@@ -1386,6 +1764,446 @@ class CLITests(unittest.TestCase):
         self.assertNotIn(IMAGE_NOTE, meta["warnings"])
         prose, meta, stderr = self.export_images(paragraph("Plain prose."))
         self.assertEqual(meta["images"], [])
+
+    def review_report(self, old: str, new: str) -> str:
+        """``pilcrow review old new``'s report, which must find a change; read as the UTF-8 it is
+        written in, not the locale encoding ``cli`` decodes with (cp1252 on Windows)."""
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(PROJECT / "src"), str(PROJECT)))}
+        result = subprocess.run([sys.executable, "-m", "pilcrow", "review", old, new], cwd=self.root, env=env,
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result)
+        return result.stdout.decode("utf-8")
+
+    def write_described(self, body: str, path: str = "essay.docx") -> None:
+        make_docx(self.root / path, body, extra={"word/media/image1.png": "picture bytes"},
+                  relationships=image_rel("rId5", "media/image1.png"))
+
+    def test_alt_text_edits_make_check_stale_and_review_names_them(self) -> None:
+        def figure(descr: str | None) -> str:
+            # Word writes the same description on the drawing and on the picture.
+            return anchored("Figure:", described_picture("rId5", descr, own=descr))
+
+        self.write_described(figure("A red cat"))
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        data = json.loads(meta)
+        self.assertEqual(data["images"], [{**image_entry("picture bytes"), "alt": "A red cat"}])
+        self.assertIn(IMAGE_ALT_NOTE, data["warnings"])
+        self.assertNotIn(IMAGE_NOTE, data["warnings"])
+        self.assertEqual(prose, b"Figure:[Unsupported drawing]\n", "alt text is not rendered in prose")
+        self.write_described(figure("A red cat"), "old.docx")
+        for descr, line in (
+            ("A blue dog", '~ image 1 (word/document.xml) alt text: "A red cat" → "A blue dog"'),
+            (None, '~ image 1 (word/document.xml) alt text: "A red cat" → (none)'),
+            ("", '~ image 1 (word/document.xml) alt text: "A red cat" → (none)'),
+        ):
+            with self.subTest(descr=descr):
+                self.write_described(figure(descr))
+                self.cli("check", "essay.docx", code=1)
+                report = self.review_report("old.docx", "essay.docx")
+                self.assertIn(f"Images:\n{line}\n", report)
+                self.assertIn("Prose: no changes", report)
+        # Adding alt text to an image that had none is a change too.
+        self.write_described(figure(None))
+        self.cli("export", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], prose)
+        self.assertEqual(json.loads(after[1])["images"], [image_entry("picture bytes")])
+        self.assertIn(IMAGE_NOTE, json.loads(after[1])["warnings"])
+        self.write_described(figure(None), "old.docx")
+        self.write_described(figure("A red cat"))
+        self.cli("check", "essay.docx", code=1)
+        report = self.review_report("old.docx", "essay.docx")
+        self.assertIn('Images:\n~ image 1 (word/document.xml) alt text: (none) → "A red cat"\n', report)
+
+    def test_alt_text_reads_the_same_from_either_attribute(self) -> None:
+        def alt(body: str) -> list[dict[str, Any]]:
+            self.write_described(body)
+            self.cli("export", "essay.docx")
+            images: list[dict[str, Any]] = json.loads(self.exported()[1])["images"]
+            return images
+
+        expected = [{**image_entry("picture bytes"), "alt": "A red cat"}]
+        # On the drawing only, on the picture only, or spread over lines: one recorded value.
+        self.assertEqual(alt(anchored("", described_picture("rId5", "A red cat"))), expected)
+        self.assertEqual(alt(anchored("", described_picture("rId5", own="A red cat"))), expected)
+        self.assertEqual(alt(anchored("", described_picture("rId5", " A red\n  cat ", own="A red cat"))), expected)
+        self.cli("check", "essay.docx")
+        self.write_described(anchored("", described_picture("rId5", own="A red cat")))
+        self.cli("check", "essay.docx")
+        # The drawing's description wins over the picture's own, as in Word's alt text pane.
+        self.assertEqual(alt(anchored("", described_picture("rId5", "A red cat", own="A cat"))), expected)
+        # A title is recorded apart from the description, and only when present.
+        self.assertEqual(alt(anchored("", described_picture("rId5", title="Cat"))),
+                         [{**image_entry("picture bytes"), "alt_title": "Cat"}])
+        self.assertEqual(alt(anchored("", described_picture("rId5", "", own=" ", title=""))),
+                         [image_entry("picture bytes")])
+        # A legacy VML picture keeps its alt text on the shape.
+        vml = vml_picture("rId5").replace('id="Picture 1"', 'id="Picture 1" alt="A red cat"')
+        self.assertEqual(alt(anchored("", vml)), expected)
+
+    def test_grouped_pictures_keep_their_own_alt_text(self) -> None:
+        def member(rid: str, descr: str | None) -> str:
+            props = "" if descr is None else f' descr="{descr}"'
+            return (f'<pic:pic xmlns:pic="{PIC}"><pic:nvPicPr><pic:cNvPr id="2" name="p"{props}/></pic:nvPicPr>'
+                    f'<pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic>')
+        group = (f'<w:drawing><wp:anchor xmlns:wp="{WP}"><wp:docPr id="1" name="Group 1" descr="Two pets"/>'
+                 f'<a:graphic xmlns:a="{A}"><a:graphicData uri="{WPG}"><wpg:wgp xmlns:wpg="{WPG}">'
+                 f'{member("rId5", "A red cat")}{member("rId6", None)}</wpg:wgp></a:graphicData></a:graphic>'
+                 '</wp:anchor></w:drawing>')
+        make_docx(self.root / "essay.docx", anchored("Group:", group),
+                  extra={"word/media/image1.png": "cat bytes", "word/media/image2.png": "dog bytes"},
+                  relationships=image_rel("rId5", "media/image1.png") + image_rel("rId6", "media/image2.png"))
+        self.cli("export", "essay.docx")
+        self.assertEqual(json.loads(self.exported()[1])["images"],
+                         [{**image_entry("cat bytes"), "alt": "A red cat"}, image_entry("dog bytes")])
+
+    def test_documents_without_alt_text_or_wordart_keep_their_companions(self) -> None:
+        # Companions exported by agent/improvements before alt text and WordArt were recorded
+        # (87a23c6): DrawingML, described-but-empty and VML pictures, and a WordArt shape type
+        # with no text, must export byte for byte the same.
+        shape_type = vml_wordart("unused").split("<v:shape ")[0] + "</w:pict>"
+        body = (paragraph("Caption above.") + anchored("Figure:", picture("rId5"))
+                + anchored("Described:", described_picture("rId6")) + anchored("Legacy:", vml_picture("rId7"))
+                + anchored("Shape type:", shape_type))
+        make_docx(self.root / "essay.docx", body, extra={f"word/media/image{i}.png": f"picture {i}" for i in (5, 6, 7)},
+                  relationships="".join(image_rel(f"rId{i}", f"media/image{i}.png") for i in (5, 6, 7)))
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(hashlib.sha256(prose).hexdigest(),
+                         "37997d7537bbac3bd80770076952b402b2538528a7fd7efef5d99ea6f9ff8959", prose)
+        self.assertEqual(hashlib.sha256(meta).hexdigest(),
+                         "bf59117831f52348f3221f581f11cef4d2ebcd040d2dc6c0f19a750b89a928e8", meta)
+        self.assertNotIn("objects", json.loads(meta))
+
+    def test_wordart_text_edits_make_check_stale_and_review_names_them(self) -> None:
+        def write(text: str, path: str = "essay.docx") -> None:
+            make_docx(self.root / path, anchored("Banner:", vml_wordart(text)))
+
+        write("SALE")
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        self.assertEqual(prose, b"Banner:[Unsupported pict]\n", "WordArt is still not rendered in prose")
+        data = json.loads(meta)
+        self.assertEqual(data["objects"], [wordart_entry("SALE")])
+        self.assertIn("Unsupported pict: content is not rendered in prose; inspect the DOCX in Word.", data["warnings"])
+        self.assertEqual(data["images"], [])
+        write("SALE", "old.docx")
+        write("CLOSED")
+        self.cli("check", "essay.docx", code=1)
+        report = self.review_report("old.docx", "essay.docx")
+        self.assertIn('Charts, diagrams and embedded objects:\n~ WordArt 1 (word/document.xml): "SALE" → "CLOSED"\n',
+                      report)
+        # Whitespace is normalised like other recorded text.
+        write("  SALE\n ")
+        self.cli("check", "essay.docx")
+
+    def test_wordart_follows_tracked_deletions_and_compatibility_copies(self) -> None:
+        def objects(body: str) -> list[dict[str, Any]] | None:
+            _, meta = self.export_objects(body)
+            return meta.get("objects")
+
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{vml_wordart("Gone")}</w:r></w:del></w:p>'
+        self.assertIsNone(objects(deleted))
+        moved = f'<w:p>{run("Kept.")}<w:moveFrom w:id="1" w:author="Ada"><w:r>{vml_wordart("Gone")}</w:r></w:moveFrom></w:p>'
+        self.assertIsNone(objects(moved))
+        inserted = f'<w:p>{run("Kept.")}<w:ins w:id="1" w:author="Ada"><w:r>{vml_wordart("New")}</w:r></w:ins></w:p>'
+        self.assertEqual(objects(inserted), [wordart_entry("New")])
+        both = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="v">{vml_wordart("SALE")}</mc:Choice>'
+                f'<mc:Fallback>{vml_wordart("SALE")}</mc:Fallback></mc:AlternateContent>')
+        self.assertEqual(objects(f"<w:p><w:r>{both}</w:r></w:p>"), [wordart_entry("SALE")])
+        block = both.replace(vml_wordart("SALE"), f'<w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>')
+        self.assertEqual(objects(block), [wordart_entry("SALE")])
+        # In document order with other objects, and by story part.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p><w:r>{vml_wordart("Head")}</w:r></w:p></w:hdr>'
+        body = (f'<w:p><w:r>{vml_wordart("One")}</w:r>{symbol()}<w:r>{vml_wordart("Two")}</w:r></w:p>'
+                '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        _, meta = self.export_objects(body, extra={"word/header1.xml": header},
+                                      relationships=f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>')
+        self.assertEqual(meta["objects"], [
+            wordart_entry("One"), {"kind": "symbol", "part": "word/document.xml", "font": "Symbol", "char": "F061"},
+            wordart_entry("Two"), wordart_entry("Head", "word/header1.xml")])
+
+    def export_objects(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        make_docx(self.root / "essay.docx", body, **options)
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        return prose.decode("utf-8"), json.loads(meta)
+
+    def test_equation_and_symbol_edits_make_check_stale(self) -> None:
+        def body(power: str = "2", char: str = "F061", font: str = "Symbol") -> str:
+            return f'<w:p>{run("Energy: ")}{equation(energy(power))}{run(" and ")}{symbol(char, font)}</w:p>'
+
+        prose, meta = self.export_objects(body())
+        self.assertEqual(prose, "Energy: [Math: E=mc^2] and [Unsupported sym]\n")
+        # The fingerprints are what they were before equations had prose.
+        self.assertEqual(meta["objects"], [
+            equation_entry(energy_form()),
+            {"kind": "symbol", "part": "word/document.xml", "font": "Symbol", "char": "F061"},
+        ])
+        self.assertIn(MATH_NOTE, meta["warnings"])
+        self.assertFalse([w for w in meta["warnings"] if "oMath" in w or "XML construct" in w], meta["warnings"])
+        self.assertIn("Unsupported sym: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+        companions = self.exported()
+        # Exporting the same document again gives byte-identical companions.
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), companions)
+        for changed in (body("3"), body(char="F062"), body(font="Wingdings")):
+            make_docx(self.root / "essay.docx", changed)
+            result = self.cli("check", "essay.docx", code=1)
+            self.assertIn("STALE", result.stdout + result.stderr)
+        # w:char is a hex number: its letter case is not a change.
+        make_docx(self.root / "essay.docx", body(char="f061"))
+        self.cli("check", "essay.docx")
+        make_docx(self.root / "essay.docx", body("3"))
+        self.cli("export", "essay.docx")
+        self.cli("check", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], b"Energy: [Math: E=mc^3] and [Unsupported sym]\n")
+        self.assertEqual(json.loads(after[1])["objects"][0], equation_entry(energy_form("3")))
+
+    def test_documents_without_equations_or_symbols_have_no_objects_key(self) -> None:
+        _, meta = self.export_objects(paragraph("Plain prose."))
+        self.assertNotIn("objects", meta)
+        # A tracked deletion is not in the accepted view: its equation and symbol are not recorded.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{equation()}</w:r>{symbol()}</w:del></w:p>'
+        _, meta = self.export_objects(deleted)
+        self.assertNotIn("objects", meta)
+        inserted = f'<w:p>{run("Kept.")}<w:ins w:id="1" w:author="Ada">{equation()}{symbol()}</w:ins></w:p>'
+        _, meta = self.export_objects(inserted)
+        self.assertEqual([entry["kind"] for entry in meta["objects"]], ["equation", "symbol"])
+
+    def test_equations_in_notes_headers_and_text_boxes_are_recorded_by_part(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p>{equation("h")}</w:p></w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'<w:p>{equation("f")}</w:p></w:footnote></w:footnotes>')
+        boxed = f'<w:p>{equation("t")}</w:p>'
+        # An equation paragraph: one entry for the m:oMathPara, not one per m:oMath inside it.
+        display = (f'<m:oMathPara xmlns:m="{M}"><m:oMath>{math_run("a")}</m:oMath>'
+                   f'<m:oMath>{math_run("b")}</m:oMath></m:oMathPara>')
+        body = (f'<w:p>{equation("b")}</w:p>' + anchored("Box:", modern_text_box(boxed)) + f"<w:p>{display}</w:p>"
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        _, meta = self.export_objects(body, extra={"word/header1.xml": header, "word/footnotes.xml": footnotes},
+                                      relationships=relationships)
+        para_form = [f"{{{M}}}oMathPara", [], "", [simple_form("a"), simple_form("b")]]
+        self.assertEqual(meta["objects"], [
+            equation_entry(simple_form("b")), equation_entry(simple_form("t")), equation_entry(para_form),
+            equation_entry(simple_form("f"), "word/footnotes.xml"),
+            equation_entry(simple_form("h"), "word/header1.xml"),
+        ])
+
+    def test_equation_fingerprint_is_the_accepted_view_without_formatting(self) -> None:
+        def write(inner: str) -> None:
+            make_docx(self.root / "essay.docx", f"<w:p>{equation(inner)}</w:p>")
+
+        base = (f'<m:sSup><m:e>{math_run("E")}</m:e><m:sup>{math_run("2")}</m:sup></m:sSup>'
+                f'<m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr><m:sub/><m:sup/><m:e>{math_run("x")}</m:e></m:nary>')
+        write(base)
+        self.cli("export", "essay.docx")
+        fresh = [
+            # Run and control character formatting, revision IDs, proofing marks, bookmarks, comment markers.
+            base.replace("<m:r>", '<m:r><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/><w:i/></w:rPr>'),
+            base.replace("<m:naryPr>", '<m:naryPr><m:ctrlPr><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr></m:ctrlPr>'),
+            base.replace("<m:r>", '<m:r w:rsidR="00A1B2C3" w:rsidRPr="00D4E5F6">'),
+            base.replace("<m:sSup>", '<w:proofErr w:type="spellStart"/><w:bookmarkStart w:id="0" w:name="_Ref1"/><m:sSup>')
+            .replace("</m:nary>", '</m:nary><w:bookmarkEnd w:id="0"/><w:proofErr w:type="spellEnd"/>'),
+            base.replace("<m:sSup>", '<w:commentRangeStart w:id="3"/><m:sSup>')
+            .replace("</m:sSup>", '</m:sSup><w:commentRangeEnd w:id="3"/><w:commentReference w:id="3"/>'),
+            # A tracked deletion is not in the accepted view.
+            base + f'<w:del w:id="9" w:author="Ada" w:date="2026-01-01T00:00:00Z">{math_run("+1")}</w:del>',
+            # A tracked insertion of the same content is the same accepted view.
+            base.replace(math_run("x"), f'<w:ins w:id="7" w:author="Ada">{math_run("x")}</w:ins>'),
+        ]
+        for variant in fresh:
+            with self.subTest(variant=variant):
+                write(variant)
+                self.cli("check", "essay.docx")
+        stale = [
+            base + f'<w:ins w:id="9" w:author="Ada">{math_run("+1")}</w:ins>',
+            base.replace(math_run("2"), math_run("3")),
+            base.replace(math_run("x"), math_run(" x")),  # m:t text is kept exactly
+            base.replace('m:val="∑"', 'm:val="∏"'),  # structure properties carry meaning
+            base.replace("<m:sSup>", "<m:sSub>").replace("</m:sSup>", "</m:sSub>").replace("m:sup>", "m:sub>", 2),
+        ]
+        for variant in stale:
+            with self.subTest(variant=variant):
+                write(variant)
+                self.cli("check", "essay.docx", code=1)
+
+    def test_block_level_equations_are_recorded(self) -> None:
+        # OOXML allows math directly in the body, a table cell, a block-level insertion, and a
+        # block-level compatibility copy; deleted block-level math is not in the accepted view.
+        cell = f"<w:tbl><w:tr><w:tc>{equation('c', para=True)}</w:tc></w:tr></w:tbl>"
+        inserted = f'<w:ins w:id="1" w:author="Ada">{equation("i", para=True)}</w:ins>'
+        deleted = f'<w:del w:id="2" w:author="Ada">{equation("d", para=True)}</w:del>'
+        compatible = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">{equation("m", para=True)}'
+                      f'</mc:Choice><mc:Fallback>{equation("f", para=True)}</mc:Fallback></mc:AlternateContent>')
+        body = paragraph("Before.") + equation("b", para=True) + cell + inserted + deleted + compatible
+
+        def para_entry(text: str) -> dict[str, Any]:
+            return equation_entry([f"{{{M}}}oMathPara", [], "", [simple_form(text)]])
+
+        prose, meta = self.export_objects(body)
+        self.assertEqual(meta["objects"], [para_entry(t) for t in "bcim"])
+        # Block-level math is a paragraph of its own; only the chosen compatibility copy renders.
+        self.assertEqual(prose, "Before.\n\n[Math: b]\n\n[Table]\n\n[Row]\n\n[Cell]\n\n[Math: c]\n\n[/Row]\n\n"
+                                "[/Table]\n\n[Math: i]\n\n[Math: m]\n")
+        make_docx(self.root / "essay.docx", body.replace(equation("b", para=True), equation("B", para=True)))
+        self.cli("check", "essay.docx", code=1)
+
+    def test_compatibility_copies_record_one_equation(self) -> None:
+        inline = (f'<w:p>{run("Formula: ")}<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m">'
+                  f'{equation(para=True)}</mc:Choice><mc:Fallback><w:r>{vml_picture("fallback")}</w:r></mc:Fallback>'
+                  "</mc:AlternateContent></w:p>")
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="m"><w:p>{equation()}</w:p></mc:Choice>'
+                 f'<mc:Fallback>{anchored("", vml_picture("fallback"))}</mc:Fallback></mc:AlternateContent>')
+        media = {"word/media/fallback.png": "fallback bytes"}
+        para_form = [f"{{{M}}}oMathPara", [], "", [simple_form()]]
+        for body, form, expected_prose in (
+            (inline, para_form, "Formula: [Math: E=mc2]\n"),
+            (block, simple_form(), "[Math: E=mc2]\n"),
+        ):
+            with self.subTest(body=body):
+                prose, meta = self.export_objects(body, extra=media, relationships=image_rel("fallback", "media/fallback.png"))
+                self.assertEqual(prose, expected_prose)
+                self.assertEqual(meta["objects"], [equation_entry(form)])
+                self.assertEqual(meta["images"], [])
+
+    def test_chart_diagram_embedded_object_and_chunk_edits_make_check_stale(self) -> None:
+        def write(body: str = OBJECT_BODY, **parts: str) -> None:
+            make_docx(self.root / "essay.docx", body, extra=object_parts(**parts), relationships=OBJECT_RELS)
+
+        write()
+        self.cli("export", "essay.docx")
+        prose, meta = self.exported()
+        data = json.loads(meta)
+        parts = object_parts()
+        self.assertEqual(data["objects"], [
+            part_entry("chart", parts["word/charts/chart1.xml"]),
+            part_entry("diagram", parts["word/diagrams/data1.xml"]),
+            part_entry("embedded object", parts["word/embeddings/Microsoft_Excel_Worksheet.xlsx"], prog_id="Excel.Sheet.12"),
+            part_entry("imported chunk", parts["word/afchunk.htm"]),
+        ])
+        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported drawing][Unsupported object]"
+                                                "\n\n[Unsupported altChunk]\n")
+        # Hashed parts are compared now; formatting parts and the chart's workbook still are not.
+        unrendered = sorted(wn.split(";")[0].removeprefix("Unrendered package part: ")
+                            for wn in data["warnings"] if wn.startswith("Unrendered package part"))
+        self.assertEqual(unrendered, ["word/diagrams/colors1.xml", "word/diagrams/layout1.xml",
+                                      "word/diagrams/quickStyle1.xml", "word/embeddings/chart_workbook.xlsx"])
+        self.assertIn("Unsupported object: content is not rendered in prose; inspect the DOCX in Word.", data["warnings"])
+        # Exporting the same document again gives byte-identical companions.
+        self.cli("export", "essay.docx")
+        self.assertEqual(self.exported(), (prose, meta))
+        edits: list[dict[str, Any]] = [{"value": "99"}, {"workbook": "workbook v2"}, {"node": "Build"},
+                                       {"chunk": "Other text"}]
+        for edit in edits:
+            with self.subTest(edit=edit):
+                write(**edit)
+                result = self.cli("check", "essay.docx", code=1)
+                self.assertIn("STALE", result.stdout + result.stderr)
+        # Neither workbook a chart reads its values from nor diagram formatting is fingerprinted.
+        changed = object_parts()
+        changed["word/embeddings/chart_workbook.xlsx"] = "edited chart workbook"
+        changed["word/diagrams/colors1.xml"] = "<colors edited='1'/>"
+        make_docx(self.root / "essay.docx", OBJECT_BODY, extra=changed, relationships=OBJECT_RELS)
+        self.cli("check", "essay.docx")
+        # Adding or removing an object is a change too.
+        added = OBJECT_BODY.replace("</w:p>", f'<w:r>{chart("chart")}</w:r></w:p>', 1)
+        removed = OBJECT_BODY.replace(alt_chunk("chunk"), "")
+        for body in (added, removed):
+            with self.subTest(body=body):
+                write(body)
+                self.cli("check", "essay.docx", code=1)
+        write(value="99")
+        self.cli("export", "essay.docx")
+        self.cli("check", "essay.docx")
+        after = self.exported()
+        self.assertEqual(after[0], prose, "object edits must not alter the prose")
+        self.assertNotEqual(after[1], meta)
+
+    def test_objects_in_headers_notes_and_text_boxes_are_recorded_by_part(self) -> None:
+        chart_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart2.xml")}</Relationships>'
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}"><w:p><w:r>{chart("hc")}</w:r></w:p></w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}" xmlns:r="{R}"><w:footnote w:id="1">'
+                     f'<w:p><w:r>{chart("fc")}</w:r></w:p></w:footnote></w:footnotes>')
+        footnote_rels = f'<Relationships xmlns="{PKG_R}">{rel("fc", "chart", "charts/chart3.xml")}</Relationships>'
+        boxed = f'<w:p><w:r>{chart("chart")}</w:r></w:p>'
+        # A chart in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{chart("chart")}</w:r></w:del></w:p>'
+        body = (anchored("Box:", modern_text_box(boxed)) + deleted
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + rel("headerRef", "header", "header1.xml")
+                         + rel("footnotes", "footnotes", "footnotes.xml"))
+        extra = {"word/header1.xml": header, "word/_rels/header1.xml.rels": chart_rels,
+                 "word/footnotes.xml": footnotes, "word/_rels/footnotes.xml.rels": footnote_rels,
+                 "word/charts/chart1.xml": "<body chart/>", "word/charts/chart2.xml": "<header chart/>",
+                 "word/charts/chart3.xml": "<footnote chart/>"}
+        _, meta = self.export_objects(body, extra=extra, relationships=relationships)
+        self.assertEqual(meta["objects"], [
+            part_entry("chart", "<body chart/>"),
+            part_entry("chart", "<footnote chart/>", "word/footnotes.xml"),
+            part_entry("chart", "<header chart/>", "word/header1.xml"),
+        ])
+        self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
+
+    def test_renamed_object_part_with_the_same_content_stays_fresh(self) -> None:
+        body = f'<w:p><w:r>{chart("chart")}</w:r></w:p>'
+        make_docx(self.root / "essay.docx", body, extra={"word/charts/chart1.xml": "<chart/>"},
+                  relationships=rel("chart", "chart", "charts/chart1.xml"))
+        self.cli("export", "essay.docx")
+        make_docx(self.root / "essay.docx", body, extra={"word/charts/chart2.xml": "<chart/>"},
+                  relationships=rel("chart", "chart", "charts/chart2.xml"))
+        self.cli("check", "essay.docx")
+
+    def test_linked_and_missing_object_parts(self) -> None:
+        missing_note = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
+                        "or point to missing parts; those objects are recorded without a hash.")
+        linked = f'<w:p><w:r>{ole_object("link", "Excel.Sheet.12", "Link")}</w:r></w:p>'
+        _, meta = self.export_objects(linked, relationships=rel("link", "oleObject", "file:///C:/data/budget.xlsx", external=True))
+        self.assertEqual(meta["objects"], [{"kind": "embedded object", "part": "word/document.xml",
+                                            "prog_id": "Excel.Sheet.12", "target": "file:///C:/data/budget.xlsx"}])
+        self.assertNotIn(missing_note, meta["warnings"])
+        # A relationship that is missing, one whose part is missing, and a chart with no r:id at all.
+        dangling = (f'<w:p><w:r>{chart("nowhere")}</w:r><w:r>{chart("gone")}</w:r>'
+                    f'<w:r>{graphic(C, f"<c:chart xmlns:c={chr(34)}{C}{chr(34)}/>")}</w:r></w:p>{alt_chunk("gone")}')
+        _, meta = self.export_objects(dangling, relationships=rel("gone", "chart", "charts/chart9.xml"))
+        self.assertEqual(meta["objects"], [part_entry("chart", None)] * 3 + [part_entry("imported chunk", None)])
+        self.assertIn(missing_note, meta["warnings"])
+
+    def test_compatibility_copies_record_one_chart(self) -> None:
+        # Word stores a chart in mc:Choice with a picture of it in mc:Fallback; an object only the
+        # unselected copy references is not hashed, and keeps its unrendered-part warning.
+        fallback = f'<w:r>{vml_picture("fallback")}</w:r><w:r>{ole_object("ole")}</w:r>'
+        inline = (f'<w:p>{run("Chart: ")}<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">'
+                  f'<w:r>{chart("chart")}</w:r></mc:Choice><mc:Fallback>{fallback}</mc:Fallback>'
+                  "</mc:AlternateContent></w:p>")
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14"><w:p><w:r>{chart("chart")}</w:r></w:p>'
+                 f'</mc:Choice><mc:Fallback><w:p>{fallback}</w:p></mc:Fallback></mc:AlternateContent>')
+        extra = {"word/charts/chart1.xml": "<chart/>", "word/media/fallback.png": "fallback bytes",
+                 "word/embeddings/oleObject1.bin": "ole bytes"}
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + image_rel("fallback", "media/fallback.png")
+                         + rel("ole", "oleObject", "embeddings/oleObject1.bin"))
+        for body in (inline, block):
+            with self.subTest(body=body):
+                _, meta = self.export_objects(body, extra=extra, relationships=relationships)
+                self.assertEqual(meta["objects"], [part_entry("chart", "<chart/>")])
+                self.assertEqual(meta["images"], [])
+                unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
+                self.assertEqual(unrendered, [
+                    "Unrendered package part: word/embeddings/oleObject1.bin; changes to its content are not compared.",
+                    "Unrendered package part: word/media/fallback.png; changes to its content are not compared.",
+                ])
+
+    def test_an_imported_chunk_inside_a_paragraph_is_recorded(self) -> None:
+        body = f'<w:p>{run("Before.")}{alt_chunk("chunk")}</w:p>'
+        _, meta = self.export_objects(body, extra={"word/afchunk.htm": "<p>x</p>"},
+                                      relationships=rel("chunk", "aFChunk", "afchunk.htm"))
+        self.assertEqual(meta["objects"], [part_entry("imported chunk", "<p>x</p>")])
 
     def test_deeply_nested_text_boxes_fail_cleanly(self) -> None:
         content = paragraph("Innermost.")
@@ -1852,6 +2670,200 @@ class CLITests(unittest.TestCase):
         result = self.cli("export", "essay.docx")
         self.assertIn("Hidden text is included", result.stderr)
         self.assertIn(b"Hidden words.", self.exported()[0])
+
+
+class EquationTextTests(unittest.TestCase):
+    """Equations as linear [Math: …] text in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-math-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, **options)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def math(self, content: str) -> str:
+        """The prose of one paragraph holding one equation with ``content``."""
+        return self.extract(f"<w:p>{equation(content)}</w:p>")[0]
+
+    def test_each_structure_has_its_linear_text(self) -> None:
+        r = math_run
+        cases = [
+            # Text runs, whitespace collapsed; w:r inside math; formatting adds no text.
+            (r(" a  +\n b "), "a + b"),
+            (f'{r("x")}<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> if </w:t></w:r>{r("y")}', "x if y"),
+            ('<m:r><m:rPr><m:sty m:val="p"/></m:rPr><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr><m:t>z</m:t></m:r>', "z"),
+            # Fractions: an atom (one character, letters only, a number) is not wrapped.
+            (structure("f", ("num", "a"), ("den", "b")), "a/b"),
+            (structure("f", ("num", "a+b"), ("den", "2c")), "(a+b)/(2c)"),
+            (structure("f", ("num", "dy"), ("den", "3.5")), "dy/3.5"),
+            (structure("f", ("num", "n"), ("den", "k"), props='<m:type m:val="noBar"/>'), "n¦k"),
+            (structure("f", ("num", "a"), ("den", "b"), props='<m:type m:val="skw"/>'), "a/b"),
+            # Scripts.
+            (structure("sSup", ("e", "x"), ("sup", "2")), "x^2"),
+            (structure("sSup", ("e", "x"), ("sup", "n+1")), "x^(n+1)"),
+            (structure("sSub", ("e", "x"), ("sub", "i")), "x_i"),
+            (structure("sSubSup", ("e", "x"), ("sub", "i"), ("sup", "2")), "x_i^2"),
+            (structure("sPre", ("sub", "i"), ("sup", "2"), ("e", "x")), "_i^2 x"),
+            # Radicals: a degree shows unless it is hidden or empty.
+            (structure("rad", ("deg", ""), ("e", "x"), props='<m:degHide m:val="1"/>'), "√(x)"),
+            (structure("rad", ("deg", "3"), ("e", "x")), "√(3&x)"),
+            (structure("rad", ("deg", "3"), ("e", "x+1"), props="<m:degHide/>"), "√(x+1)"),
+            (structure("rad", ("deg", ""), ("e", "x"), props='<m:degHide m:val="off"/>'), "√(x)"),
+            # Delimiters: defaults, custom characters, and an empty m:val for none.
+            (structure("d", ("e", "a"), ("e", "b")), "(a|b)"),
+            (structure("d", ("e", "0"), ("e", "1"), props='<m:begChr m:val="["/><m:sepChr m:val=","/>'), "[0,1)"),
+            (structure("d", ("e", "x"), props='<m:begChr m:val="|"/><m:endChr m:val="|"/>'), "|x|"),
+            (structure("d", ("e", "x"), props='<m:begChr m:val=""/><m:endChr m:val="}"/>'), "x}"),
+            # N-ary operators.
+            (structure("nary", ("sub", "i=1"), ("sup", "n"), ("e", structure("sSub", ("e", "x"), ("sub", "i"))),
+                       props='<m:chr m:val="∑"/>'), "∑_(i=1)^n x_i"),
+            (structure("nary", ("sub", "0"), ("sup", "1"), ("e", "f")), "∫_0^1 f"),
+            (structure("nary", ("sub", ""), ("sup", ""), ("e", "x"),
+                       props='<m:chr m:val="∏"/><m:subHide m:val="1"/><m:supHide/>'), "∏x"),
+            (structure("nary", ("sub", "S"), ("sup", "T"), ("e", "x"), props="<m:supHide/>"), "∫_S x"),
+            # Functions and limits.
+            (structure("func", ("fName", "sin"), ("e", "x")), "sin x"),
+            (structure("func", ("fName", structure("limLow", ("e", "lim"), ("lim", "n→∞"))),
+                       ("e", structure("sSub", ("e", "a"), ("sub", "n")))), "lim_(n→∞) a_n"),
+            (structure("limUpp", ("e", "max"), ("lim", "k")), "max^k"),
+            # Accents, bars, group characters.
+            (structure("acc", ("e", "x")), "x̂"),
+            (structure("acc", ("e", "x+y"), props='<m:chr m:val="̃"/>'), "(x+y)̃"),
+            (structure("bar", ("e", "x"), props='<m:pos m:val="top"/>'), "x̅"),
+            (structure("bar", ("e", "x")), "x̲"),
+            (structure("groupChr", ("e", "a+b")), "(a+b)⏟"),
+            (structure("groupChr", ("e", "a"), props='<m:chr m:val="⏞"/><m:pos m:val="top"/>'), "a⏞"),
+            # Boxes and phantoms show their content.
+            (structure("box", ("e", "a+b")), "a+b"),
+            (structure("borderBox", ("e", "E")), "E"),
+            (structure("phant", ("e", "x"), props='<m:show m:val="0"/>'), "x"),
+            # Matrices and equation arrays.
+            ("<m:m><m:mPr><m:mcs><m:mc><m:mcPr><m:count m:val=\"2\"/></m:mcPr></m:mc></m:mcs></m:mPr>"
+             + "".join(f"<m:mr><m:e>{r(a)}</m:e><m:e>{r(b)}</m:e></m:mr>" for a, b in (("a", "b"), ("c", "d")))
+             + "</m:m>", "[a, b; c, d]"),
+            (structure("eqArr", ("e", "x=1"), ("e", "y=2")), "x=1; y=2"),
+            # Nesting: a fraction inside a superscript inside a delimiter.
+            (structure("d", ("e", structure("sSup", ("e", "x"), ("sup", structure("f", ("num", "a+b"), ("den", "2")))))),
+             "(x^((a+b)/2))"),
+            # A delimiter is not wrapped again as an operand.
+            (structure("sSup", ("e", structure("d", ("e", "a+b"))), ("sup", "2")), "(a+b)^2"),
+            (structure("sSup", ("e", structure("d", ("e", "a+b"), props='<m:begChr m:val=""/>')), ("sup", "2")),
+             "(a+b))^2"),
+        ]
+        for content, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.math(content), f"[Math: {expected}]\n")
+
+    def test_an_equation_paragraph_shows_each_equation(self) -> None:
+        display = (f'<m:oMathPara xmlns:m="{M}"><m:oMathParaPr><m:jc m:val="center"/></m:oMathParaPr>'
+                   f'<m:oMath>{math_run("a=1")}</m:oMath><m:oMath>{energy()}</m:oMath></m:oMathPara>')
+        prose, meta = self.extract(f"<w:p>{run('So ')}{display}</w:p>")
+        self.assertEqual(prose, "So [Math: a=1] [Math: E=mc^2]\n")
+        self.assertEqual([entry["kind"] for entry in meta["objects"]], ["equation"])
+        self.assertEqual(self.math(""), "[Math: (empty)]\n")
+        self.assertEqual(self.extract(f'<w:p><m:oMathPara xmlns:m="{M}"/></w:p>')[0], "[Math: (empty)]\n")
+
+    def test_block_level_math_is_its_own_paragraph(self) -> None:
+        cell = f"<w:tbl><w:tr><w:tc>{paragraph('Cell.')}{equation('c', para=True)}</w:tc></w:tr></w:tbl>"
+        body = paragraph("Before.") + equation(energy()) + cell + paragraph("After.")
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "Before.\n\n[Math: E=mc^2]\n\n[Table]\n\n[Row]\n\n[Cell]\n\nCell.\n\n[Math: c]\n\n"
+                                "[/Row]\n\n[/Table]\n\nAfter.\n")
+
+    def test_math_text_is_the_accepted_view(self) -> None:
+        content = (math_run("a") + f'<w:ins w:id="1" w:author="Ada">{math_run("+b")}</w:ins>'
+                   + f'<w:del w:id="2" w:author="Ada">{math_run("+c")}</w:del>'
+                   + f'<w:moveFrom w:id="3" w:author="Ada">{math_run("+d")}</w:moveFrom>'
+                   + f'<w:moveTo w:id="4" w:author="Ada">{math_run("+e")}</w:moveTo>')
+        prose, meta = self.extract(f"<w:p>{equation(content)}</w:p>")
+        self.assertEqual(prose, "[Math: a+b+e]\n")
+        # Tracked changes inside an equation are not listed with the document's, as before.
+        self.assertEqual(meta["review"], [])
+
+    def test_an_unknown_math_element_shows_its_text_and_warns_once(self) -> None:
+        unknown = f"<m:future>{math_run('q')}</m:future>"
+        prose, meta = self.extract(f"<w:p>{equation(unknown + math_run('+') + unknown)}</w:p>")
+        self.assertEqual(prose, "[Math: q+q]\n")
+        self.assertEqual([w for w in meta["warnings"] if "future" in w],
+                         ["Unsupported math construct future; rendered as its text, structure not shown."])
+        self.assertFalse([w for w in meta["warnings"] if "XML construct" in w], meta["warnings"])
+        # A symbol inside an equation keeps its placeholder.
+        prose, meta = self.extract(f"<w:p>{equation(math_run('a') + symbol())}</w:p>")
+        self.assertEqual(prose, "[Math: a[Unsupported sym]]\n")
+        self.assertIn("Unsupported sym: content is not rendered in prose; inspect the DOCX in Word.", meta["warnings"])
+
+    def test_sentences_never_split_inside_math(self) -> None:
+        body = (f'<w:p>{run("We have ")}{equation("x. Y")}{run(" here. Next one.")}</w:p>'
+                f'<w:p>{run("Count ")}{equation("n! Then")}{run(" ways? Yes.")}</w:p>'
+                f'<w:p>{run("Ends with ")}{equation(math_run("y") + structure("f", ("num", "1"), ("den", "2")))}'
+                f'{run(". Then more.")}</w:p>')
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "We have [Math: x. Y] here.\nNext one.\n\nCount [Math: n! Then] ways?\nYes.\n\n"
+                                "Ends with [Math: y1/2].\nThen more.\n")
+        # Headings, list items and hyperlink text show the same math text.
+        heading = f'<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr>{run("Proof of ")}{equation("a. B")}</w:p>'
+        item = f'<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>{run("Item ")}{equation("p! Q")}</w:p>'
+        link = f'<w:p><w:hyperlink w:anchor="eq">{run("See ")}{equation("z")}</w:hyperlink></w:p>'
+        prose, meta = self.extract(heading + item + link)
+        self.assertEqual(prose, "## Proof of [Math: a. B]\n\n- Item [Math: p! Q]\n\nSee [Math: z]\n")
+        self.assertEqual(meta["hyperlinks"], [{"text": "See [Math: z]", "target": "#eq", "part": "word/document.xml"}])
+
+    def test_a_comment_anchor_over_math_holds_its_text(self) -> None:
+        body = f'<w:p>{start("1")}{run("Energy: ")}{equation(energy())}{end("1")}</w:p>'
+        _, meta = self.extract(body, extra={"word/comments.xml": comments_part({"1": "Check units."})},
+                               relationships=COMMENTS_REL)
+        (comment,) = meta["review"]
+        self.assertEqual(comment["anchor"], "Energy: [Math: E=mc^2]")
+
+    def test_deeply_nested_math_fails_cleanly(self) -> None:
+        from pilcrow.extract import DocumentError
+
+        # Rendering costs no more stack per level than the fingerprint: 200 nested fractions
+        # exported before equations had prose, and still do.
+        nested = "x"
+        for _ in range(200):
+            nested = structure("f", ("num", nested), ("den", "y"))
+        prose, _ = self.extract(f"<w:p>{equation(nested)}</w:p>")
+        self.assertTrue(prose.startswith("[Math: " + "(" * 199 + "x/y)/y)/y"), prose[:300])
+        for _ in range(2800):
+            nested = structure("f", ("num", nested), ("den", "y"))
+        with self.assertRaises(DocumentError):
+            self.extract(f"<w:p>{equation(nested)}</w:p>")
+        # As a block of its own, too.
+        with self.assertRaises(DocumentError):
+            self.extract(equation(nested, para=True))
+
+    def test_documents_without_math_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before equations had prose.
+        body = (paragraph("Title", '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>')
+                + paragraph("Dr. Smith wrote this. Art. 5 applies! Is it x. Y? Yes.")
+                + list_item("First item. Second sentence.", "1") + list_item("Nested.", "1", 1)
+                + "<w:tbl><w:tr><w:tc>" + paragraph("Cell text.") + "</w:tc><w:tc/></w:tr></w:tbl>"
+                + f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>'
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                + '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>'
+                + f'<w:p><w:hyperlink r:id="link">{run("A link")}</w:hyperlink>{symbol()}<w:r><w:br/></w:r>'
+                + f'{run("After break.")}</w:p>'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box.")))
+                + anchored("Figure:", picture("img")) + f"<w:p>{checkbox('1')}</w:p>")
+        relationships = (COMMENTS_REL + NUMBERING_REL + image_rel("img", "media/image1.png")
+                         + rel("link", "hyperlink", "https://example.invalid/", external=True))
+        extra = {"word/comments.xml": comments_part({"1": "Please check."}), "word/media/image1.png": "png bytes",
+                 "word/numbering.xml": numbering(abstract_num("0", level(0), level(1, "decimal", "%2.")), num("1", "0"))}
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "8a6483a884064a67cfe3ac935b295872d8ad1d864b2b945332068c8189c038b5",
+            ".meta.json": "8fd177d4171cfe566c5adda90807756c5fdd5596c408381f3b495d36f21208d2",
+        })
 
 
 if __name__ == "__main__":

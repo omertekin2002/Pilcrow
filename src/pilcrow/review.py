@@ -205,10 +205,10 @@ def aligned(old: Sequence[Entry], new: Sequence[Entry],
 
 
 def entries_section(old: Sequence[Entry], new: Sequence[Entry], describe: Callable[[Entry, int], str],
-                    change: Change | None = None) -> list[str]:
+                    change: Change | None = None, key: Callable[[Entry], str] = canonical) -> list[str]:
     """Removed/added lines, with ``change`` wording pairs in the same position of a replaced block."""
     lines = []
-    for olds, news in aligned(old, new):
+    for olds, news in aligned(old, new, key):
         changes: list[str] = []
         unpaired_old, unpaired_new = list(olds), list(news)
         if change is not None:
@@ -291,8 +291,34 @@ COMMENT_EDITS: list[tuple[tuple[str, ...], Callable[[Entry, Entry], str | None]]
         f"~ re-anchored {describe_comment({**new, 'resolved': None, 'anchor': old.get('anchor'), 'anchor_part': old.get('anchor_part')})}"
         f" → now {anchor(new)}"),
     (("text",), lambda old, new:
-        f"~ edited text of {describe_comment({**old, 'resolved': None})} → {short(new.get('text'))}"),
+        f"~ edited text of {describe_comment({**old, 'parent': new.get('parent'), 'resolved': None})} → {short(new.get('text'))}"),
 ]
+
+
+def valid_parent(raw: Sequence[Entry], index: int) -> int | None:
+    """The parent comment position of ``raw[index]`` when it names an existing comment, else None."""
+    parent = raw[index].get("reply_to")
+    return parent if isinstance(parent, int) and 0 <= parent < len(raw) else None
+
+
+def through_pairs(view: Sequence[Entry], raw: Sequence[Entry], pairs: dict[int, int], side: str) -> list[Entry]:
+    """``view`` with each reply's parent replaced by its parent's pairing, or an unpaired marker.
+
+    ``pairs`` maps a paired parent's position to the position of the new comment it is
+    paired with, so two replies whose parents are paired with each other compare equal
+    however the parent itself changed, while a reply whose parent is not paired cannot
+    match through its parent's raw identity.
+    """
+    result = []
+    for index, entry in enumerate(view):
+        parent = valid_parent(raw, index)
+        if parent is None:
+            result.append(entry)
+        elif parent in pairs:
+            result.append({**entry, "parent": {"paired": pairs[parent]}})
+        else:
+            result.append({**entry, "parent": {"unpaired": side, "index": parent}})
+    return result
 
 
 def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list[str]:
@@ -300,30 +326,84 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
     blocks = aligned(old, new)
     unmatched_old = {i for olds, _ in blocks for i in olds}
     unmatched_new = {j for _, news in blocks for j in news}
-    edits: dict[int, tuple[int, str]] = {}  # old position -> (new position, line)
-    for fields, word in COMMENT_EDITS:
-        def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
-            return canonical({k: v for k, v in entry.items() if k not in fields})
-        old_keys, new_keys = Counter(map(key, old)), Counter(map(key, new))
-        new_position = {key(entry): j for j, entry in enumerate(new)}
-        paired_new = {j for j, _ in edits.values()}
-        for i in sorted(unmatched_old - edits.keys()):
-            k = key(old[i])
-            # The metadata must identify this comment on both sides: exactly one each.
-            if old_keys[k] != 1 or new_keys[k] != 1:
+    # Entries outside the differing blocks are equal and pair up in order.
+    pairs = dict(zip((i for i in range(len(old)) if i not in unmatched_old),
+                     (j for j in range(len(new)) if j not in unmatched_new), strict=True))
+    # A matched reply only counts as unchanged when its parent is paired with its new parent;
+    # hold back any others until a later round pairs their parents, or leave them unmatched.
+    pruned: set[tuple[int, int]] = set()
+    while True:
+        drop = [(i, j) for i, j in pairs.items()
+                if (op := valid_parent(old_raw, i)) is not None
+                and pairs.get(op) != valid_parent(new_raw, j)]
+        if not drop:
+            break
+        for i, j in drop:
+            del pairs[i]
+            pruned.add((i, j))
+    if pruned:
+        anchors = [*sorted(pairs.items()), (len(old), len(new))]
+        blocks, prev_i, prev_j = [], 0, 0
+        for i, j in anchors:
+            if i > prev_i or j > prev_j:
+                blocks.append((list(range(prev_i, i)), list(range(prev_j, j))))
+            prev_i, prev_j = i + 1, j + 1
+        unmatched_old = {i for olds, _ in blocks for i in olds}
+        unmatched_new = {j for _, news in blocks for j in news}
+    edits: dict[int, tuple[int, str | None]] = {}  # old position -> (new position, line or None for no change)
+    # Pair parents before their replies: each round compares replies through the pairs of the
+    # rounds before it, and the rounds stop once one pairs nothing, even on a reply_to cycle.
+    found = True
+    while found:
+        found = False
+        new_paired = set(pairs.values())
+        old_now = through_pairs(old, old_raw, pairs, "old")
+        new_now = through_pairs(new, new_raw, {j: j for j in new_paired}, "new")
+        # Exact matches through a paired parent: pair in order even for identical replies.
+        by_key: dict[str, list[int]] = {}
+        for j in sorted(unmatched_new - new_paired):
+            by_key.setdefault(canonical(new_now[j]), []).append(j)
+        for i in sorted(unmatched_old - pairs.keys()):
+            candidates = by_key.get(canonical(old_now[i]))
+            if not candidates:
                 continue
-            j = new_position[k]
-            if j not in unmatched_new or j in paired_new or not only_differs(old[i], new[j], *fields):
+            # Match a reply whose parent changed, or one aligned in place before its parent paired;
+            # an entry equal on its own that moved stays removed and added.
+            match = next((c for c in candidates if old[i] != new[c] or (i, c) in pruned), None)
+            if match is None:
                 continue
-            line = word(old[i], new[j])
-            if line is not None:
+            candidates.remove(match)
+            pairs[i] = match
+            edits[i] = (match, None)
+            new_paired.add(match)
+            found = True
+        for fields, word in COMMENT_EDITS:
+            def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
+                return canonical({k: v for k, v in entry.items() if k not in fields})
+            old_keys, new_keys = Counter(map(key, old_now)), Counter(map(key, new_now))
+            new_position = {key(entry): j for j, entry in enumerate(new_now)}
+            for i in sorted(unmatched_old - pairs.keys()):
+                k = key(old_now[i])
+                # The metadata must identify this comment on both sides: exactly one each.
+                if old_keys[k] != 1 or new_keys[k] != 1:
+                    continue
+                j = new_position[k]
+                if j not in unmatched_new or j in new_paired or not only_differs(old_now[i], new_now[j], *fields):
+                    continue
+                line = word(old[i], new[j])
+                if line is None:
+                    continue
+                pairs[i] = j
                 edits[i] = (j, line)
-                paired_new.add(j)
+                new_paired.add(j)
+                found = True
     paired_new = {j for j, _ in edits.values()}
     lines = []
     for olds, news in blocks:
         for i in olds:
-            lines.append(edits[i][1] if i in edits else f"- removed {describe_comment(old[i])}")
+            line = edits[i][1] if i in edits else f"- removed {describe_comment(old[i])}"
+            if line is not None:
+                lines.append(line)
         lines += [f"+ added {describe_comment(new[j])}" for j in news if j not in paired_new]
     return lines
 
@@ -348,14 +428,53 @@ def change_link(old: Entry, new: Entry, _: int, __: int) -> str | None:
     return None
 
 
+def form_of(entry: Entry) -> Entry:
+    """A field's legacy form state (checkbox or dropdown), or {} for any other field."""
+    form = entry.get("form")
+    return form if isinstance(form, dict) else {}
+
+
+def field_label(entry: Entry) -> str:
+    """"FORMCHECKBOX "Check1"" for a named form field, else the field's command."""
+    command = entry.get("command") or "empty"
+    name = form_of(entry).get("name")
+    return f"{command} {short(name)}" if name else command
+
+
+def form_state(form: Entry) -> str:
+    """A checkbox's state or a dropdown's selected entry, as the review words it."""
+    if form.get("type") == "checkbox":
+        return "checked" if form.get("checked") else "unchecked"
+    selected = form.get("selected")
+    return short(selected) if isinstance(selected, str) else "(no entry selected)"
+
+
 def describe_field(entry: Entry, position: int) -> str:
-    return f"field {position + 1} ({entry.get('command') or 'empty'}) in {entry.get('part')}"
+    form = form_of(entry)
+    state = f": {form_state(form)}" if form.get("type") in ("checkbox", "dropdown") else ""
+    return f"field {position + 1} ({field_label(entry)}) in {entry.get('part')}{state}"
 
 
 def change_field(old: Entry, new: Entry, _: int, j: int) -> str | None:
     if only_differs(old, new, "sha256"):
         return f"~ field {j + 1} ({new.get('command') or 'empty'}) in {new.get('part')}: instruction changed"
+    if only_differs(old, new, "form"):
+        a, b = form_of(old), form_of(new)
+        # A form field whose kind or name changed, or that gained or lost its form data, is removed and added.
+        if not only_differs(a, b, "checked", "entries", "selected") or a.get("type") not in ("checkbox", "dropdown"):
+            return None
+        details = []
+        if a.get("entries") != b.get("entries"):
+            details.append("entries changed")
+        if (a.get("checked"), a.get("selected")) != (b.get("checked"), b.get("selected")):
+            details.append(f"{form_state(a)} → {form_state(b)}")
+        if details:
+            return f"~ field {j + 1} ({field_label(new)}) in {new.get('part')}: " + "; ".join(details)
     return None
+
+
+# Alt text metadata keys and how the review names them.
+ALT_TEXT = (("alt", "alt text"), ("alt_title", "alt title"))
 
 
 def describe_image(entry: Entry, position: int) -> str:
@@ -366,11 +485,18 @@ def describe_image(entry: Entry, position: int) -> str:
         sources.append("with a missing media part" if sha is None else f"{entry.get('bytes')} bytes, sha256 {sha[:12]}")
     if "target" in entry:
         sources.append(f"linked to {entry['target']}")
-    return f"image {position + 1} ({entry.get('part')}): {', '.join(sources) or 'no source'}"
+    labels = [f"{name} {short(entry[key])}" for key, name in ALT_TEXT if entry.get(key)]
+    return f"image {position + 1} ({entry.get('part')}): {', '.join(sources) or 'no source'}" + "".join(
+        f", {label}" for label in labels)
+
+
+def alt_value(entry: Entry, key: str) -> str:
+    value = entry.get(key)
+    return short(value) if value else "(none)"
 
 
 def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
-    """Word a hash or link change of one image; anything else falls back to removed/added."""
+    """Word a hash, link or alt text change of one image; anything else falls back to removed/added."""
     if old.get("part") != new.get("part") or ("sha256" in old) != ("sha256" in new):
         return None
     details = []
@@ -380,7 +506,97 @@ def change_image(old: Entry, new: Entry, _: int, j: int) -> str | None:
         details.append("replaced")
     if old.get("target") != new.get("target"):
         details.append(f"link changed: {old.get('target') or '(none)'} → {new.get('target') or '(none)'}")
+    details += [f"{name}: {alt_value(old, key)} → {alt_value(new, key)}"
+                for key, name in ALT_TEXT if old.get(key) != new.get(key)]
     return f"~ image {j + 1} ({new.get('part')}) " + "; ".join(details) if details else None
+
+
+# Object kinds shown under "Equations and symbols"; every other kind (chart, diagram,
+# embedded object, imported chunk, WordArt) is shown under "Charts, diagrams and embedded objects".
+FORMULA_KINDS = frozenset({"equation", "symbol"})
+
+
+def objects_of(metadata: Entry, formulas: bool) -> list[Entry]:
+    """The ``objects`` entries of one section: equations and symbols, or every other kind."""
+    return [e for e in metadata.get("objects", []) if (e.get("kind") in FORMULA_KINDS) == formulas]
+
+
+def numbered_objects(objects: Sequence[Entry]) -> list[Entry]:
+    """Objects, each with its 1-based number among its own kind."""
+    counts: Counter[str] = Counter()
+    result = []
+    for entry in objects:
+        counts[entry.get("kind", "")] += 1
+        result.append({**entry, "number": counts[entry.get("kind", "")]})
+    return result
+
+
+def unnumbered(entry: Entry) -> str:
+    """An object's identity for alignment: its number shifts when an earlier one is added."""
+    return canonical({k: v for k, v in entry.items() if k != "number"})
+
+
+def symbol_char(entry: Entry) -> str:
+    return f"{entry.get('char') or '(no char)'} ({entry.get('font') or 'no font'})"
+
+
+def describe_object(entry: Entry, _: int) -> str:
+    kind = entry.get("kind")
+    label = f"{kind} {entry.get('number')} ({entry.get('part')})"
+    if kind == "symbol":
+        return f"{label}: {symbol_char(entry)}"
+    if kind == "equation":
+        return f"{label}, sha256 {str(entry.get('sha256'))[:12]}"
+    return label
+
+
+def one_spaced(value: Any) -> str:
+    """Document-controlled text on one line, so it cannot start a line of its own in a text report."""
+    return " ".join(str(value).split())
+
+
+def part_label(entry: Entry) -> str:
+    """"chart 1 (word/document.xml)", with an embedded object's ProgID before the part."""
+    prog_id = one_spaced(entry.get("prog_id") or "")
+    place = f"{prog_id}, {entry.get('part')}" if prog_id else entry.get("part")
+    return f"{entry.get('kind')} {entry.get('number')} ({place})"
+
+
+def describe_part_object(entry: Entry, _: int) -> str:
+    if entry.get("kind") == "WordArt":
+        return f"{part_label(entry)}: {short(entry.get('text'))}"
+    sources = []
+    if "sha256" in entry:
+        sha = entry["sha256"]
+        sources.append("with a missing part" if sha is None else f"sha256 {sha[:12]}")
+    if "target" in entry:
+        sources.append(f"linked to {one_spaced(entry['target'])}")
+    return f"{part_label(entry)}: {', '.join(sources) or 'no source'}"
+
+
+def change_part_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
+    """Word a content change of one chart, diagram, embedded object or imported chunk.
+
+    Only a hash change between two present parts, or a WordArt text change, is an edit;
+    anything else falls back to removed/added.
+    """
+    if old.get("kind") == new.get("kind") == "WordArt" and only_differs(old, new, "text", "number"):
+        return f"~ {part_label(new)}: {short(old.get('text'))} → {short(new.get('text'))}"
+    if None in (old.get("sha256"), new.get("sha256")) or not only_differs(old, new, "sha256", "number"):
+        return None
+    return f"~ {part_label(new)} changed"
+
+
+def change_object(old: Entry, new: Entry, _: int, __: int) -> str | None:
+    """Word an edit to one equation or symbol; anything else falls back to removed/added."""
+    if old.get("kind") != new.get("kind") or old.get("part") != new.get("part"):
+        return None
+    label = f"{new.get('kind')} {new.get('number')} ({new.get('part')})"
+    if new.get("kind") == "equation" and only_differs(old, new, "sha256", "number"):
+        return f"~ {label} changed"
+    if new.get("kind") == "symbol" and only_differs(old, new, "font", "char", "number"):
+        return f"~ {label}: {symbol_char(old)} → {symbol_char(new)}"
+    return None
 
 
 def describe_level(level: Entry) -> str:
@@ -469,6 +685,10 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
     old_tracked = [e for e in old_review if e.get("kind") != "comment"]
     new_tracked = [e for e in new_review if e.get("kind") != "comment"]
     old_warnings, new_warnings = a.get("warnings", []), b.get("warnings", [])
+    # Both object sections can be unchanged while their entries moved past each other, e.g. a
+    # block-level equation moved across a chart: never report "no changes" then.
+    objects_moved = (a.get("objects", []) != b.get("objects", [])
+                     and all(objects_of(a, kind) == objects_of(b, kind) for kind in (True, False)))
     found = [
         notice("Comments", comments_section(old_comments, new_comments), old_comments != new_comments),
         notice("Tracked changes", entries_section(old_tracked, new_tracked, describe_tracked),
@@ -480,6 +700,16 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
                a.get("fields") != b.get("fields")),
         notice("Images", entries_section(a.get("images", []), b.get("images", []), describe_image, change_image),
                a.get("images") != b.get("images")),
+        notice("Equations and symbols",
+               entries_section(numbered_objects(objects_of(a, True)), numbered_objects(objects_of(b, True)),
+                               describe_object, change_object, unnumbered),
+               objects_of(a, True) != objects_of(b, True)),
+        notice("Charts, diagrams and embedded objects",
+               entries_section(numbered_objects(objects_of(a, False)), numbered_objects(objects_of(b, False)),
+                               describe_part_object, change_part_object, unnumbered),
+               objects_of(a, False) != objects_of(b, False)),
+        Section("Objects", ["equations or symbols moved relative to charts, diagrams or embedded objects"],
+                inline=True) if objects_moved else None,
         notice("Lists", entries_section(a.get("lists", []), b.get("lists", []), describe_list, change_list)
                + entries_section(a.get("list_runs", []), b.get("list_runs", []), describe_run, change_run),
                (a.get("lists"), a.get("list_runs")) != (b.get("lists"), b.get("list_runs"))),
@@ -487,7 +717,7 @@ def build(old: Extraction, new: Extraction, marks: bool = False) -> Report:
                + [f"+ added: {w}" for w in new_warnings if w not in old_warnings],
                old_warnings != new_warnings),
     ]
-    known = {"review", "hyperlinks", "fields", "images", "lists", "list_runs", "warnings"}
+    known = {"review", "hyperlinks", "fields", "images", "objects", "lists", "list_runs", "warnings"}
     sections = [s for s in found if s is not None]
     sections += [Section("Metadata", [f"{key} changed"], inline=True)
                  for key in sorted((a.keys() | b.keys()) - known) if a.get(key) != b.get(key)]
@@ -522,7 +752,9 @@ def review(old: Extraction, new: Extraction) -> tuple[str, bool]:
 # (and the dot of "www.") stop GFM's autolink extension from taking a URL or address
 # with its escapes still in it; GitHub then links the unescaped text it renders.
 MARKDOWN_SPECIAL = frozenset("\\`*_[]!#|~$:@")
-WWW = re.compile(r"\b(www)\.", re.IGNORECASE)
+# GFM links a "www." at the start or after whitespace, "*", "_", "~" or "(". Escape its dot
+# after anything but a letter or digit: "_" is a word character, so "\b" would miss "_www.".
+WWW = re.compile(r"(?<![^\W_])(www)\.", re.IGNORECASE)
 # Raw HTML and entity references are written as entities.
 MARKDOWN_ENTITIES = {"<": "&lt;", ">": "&gt;", "&": "&amp;"}
 LINE_BREAK = re.compile(r"\r\n?|\n")

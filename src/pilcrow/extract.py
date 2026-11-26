@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+# Office Math (OMML) equations.
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 # Word 2010 paragraph IDs and the Word 2012 comments-extended part (reply threads, resolved state).
 W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
 W15 = "http://schemas.microsoft.com/office/word/2012/wordml"
@@ -36,8 +38,26 @@ NS = {"w": W}
 # Word stores in a blip's extension list, and legacy VML image data.
 BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 SVG_BLIP = "{http://schemas.microsoft.com/office/drawing/2016/SVG/main}svgBlip"
-IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+VML = "urn:schemas-microsoft-com:vml"
+IMAGEDATA = f"{{{VML}}}imagedata"
 O_RELID = "{urn:schemas-microsoft-com:office:office}relid"
+# Where an image's alt text lives: the drawing's wp:docPr, else the picture's own pic:cNvPr,
+# and a VML shape's alt attribute. A group's wp:docPr describes the group, not its members.
+WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+DRAWINGS = frozenset({f"{{{WP}}}inline", f"{{{WP}}}anchor"})
+PICTURE = f"{{{PIC}}}pic"
+GROUPS = frozenset({"{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}wgp",
+                    "{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}grpSp",
+                    f"{{{VML}}}group"})
+# Legacy VML WordArt: the text a v:shape draws along its path.
+TEXTPATH = f"{{{VML}}}textpath"
+# Objects whose content lives in a package part: a DrawingML chart, a SmartArt diagram's
+# data part (r:dm; its layout, quick-style and colour parts are formatting), and an OLE
+# object. w:altChunk is the fourth, an imported chunk.
+CHART = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
+DIAGRAM = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}relIds"
+OLE_OBJECT = "{urn:schemas-microsoft-com:office:office}OLEObject"
 # Shape content that a rendered text box still leaves out of the prose.
 UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
 TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
@@ -47,14 +67,20 @@ LIST_NOTE = ("List boundaries and indentation are retained; bullet and number fo
 UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
                      "list or level, or style-linked numbering); they are recorded as unknown.")
 IMAGE_NOTE = "Images are compared by content hash only; size, position, cropping, and alt text are not compared."
+# Replaces IMAGE_NOTE only when an image has alt text, so other documents keep their companions.
+IMAGE_ALT_NOTE = "Images are compared by content hash and alt text; size, position, and cropping are not compared."
 MISSING_IMAGE_NOTE = ("Some image relationships are missing or point to missing parts; "
                       "those images are recorded without a hash.")
+MISSING_OBJECT_NOTE = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
+                       "or point to missing parts; those objects are recorded without a hash.")
 COMMENT_NOTE = ("Comment text, authors, anchored text, replies, and resolved state are recorded; "
                 "dates and rich formatting are not compared.")
 UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part; "
                            "their anchor is recorded as null.")
 UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
                          "from the start or to the end of the story part.")
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
+                   "text form field settings are not compared.")
 MIB = 1024 * 1024
 # Package safety limits. Parsed parts (XML and .rels) are read whole into memory, so they
 # have tight caps; media is hashed in fixed-size chunks, so only the package-wide total
@@ -78,6 +104,161 @@ def w(name: str) -> str:
 
 
 COMMENT_MARKERS = frozenset({w("commentRangeStart"), w("commentRangeEnd"), w("commentReference")})
+# Legacy form field data (w:ffData) by element: the children whose meaning is recorded, or that
+# only set behaviour (macros, help text, enabled state). Anything else, such as w:textInput and
+# its children, keeps the unsupported construct warning.
+FORM_DATA = {
+    w("ffData"): frozenset(map(w, ("name", "enabled", "calcOnExit", "entryMacro", "exitMacro", "helpText",
+                                   "statusText", "checkBox", "ddList"))),
+    w("checkBox"): frozenset(map(w, ("size", "sizeAuto", "default", "checked"))),
+    w("ddList"): frozenset(map(w, ("result", "default", "listEntry"))),
+}
+EQUATIONS = frozenset({f"{{{M}}}oMathPara", f"{{{M}}}oMath"})
+# Markup an equation's fingerprint leaves out: deleted content, formatting, and markers whose
+# IDs Word renumbers on save. Proofing, bookmark, permission and move range markers carry no
+# content; comment markers are anchors, not equation content.
+EQUATION_DROPPED = frozenset({
+    w("del"), w("moveFrom"), w("rPr"), f"{{{M}}}ctrlPr", w("proofErr"), w("bookmarkStart"), w("bookmarkEnd"),
+    w("permStart"), w("permEnd"), w("moveFromRangeStart"), w("moveFromRangeEnd"), w("moveToRangeStart"),
+    w("moveToRangeEnd"), *COMMENT_MARKERS,
+})
+EQUATION_UNWRAPPED = frozenset({w("ins"), w("moveTo")})
+# Attributes that change on every save without changing the equation.
+EQUATION_IGNORED_ATTRIBUTES = frozenset({f"{{{W14}}}paraId", f"{{{W14}}}textId"})
+
+
+def om(name: str) -> str:
+    return f"{{{M}}}{name}"
+
+
+MATH_NOTE = ("Equations are shown as linear [Math: …] text; layout, fonts and alignment are not compared, "
+             "and equation fingerprints are in objects.")
+SYMBOL_WARNING = "Unsupported sym: content is not rendered in prose; inspect the DOCX in Word."
+# An equation's text is held between these marks inside a paragraph until its sentences are split.
+# XML 1.0 text cannot contain either character, so document text never holds them.
+MATH_START, MATH_END = "\x01", "\x02"
+MATH_SPAN = re.compile("\x01([^\x02]*)\x02")
+MATH_HELD = re.compile("\x01([0-9]+)\x02")
+# Math elements whose linear text is their content's text, one after another.
+MATH_CONTAINERS = frozenset(map(om, "oMathPara oMath e num den sub sup deg lim fName mr r".split()))
+# Math structures with a linear form of their own (m:m, a matrix, is read row by row).
+MATH_STRUCTURES = frozenset(map(om, "f sSup sSub sSubSup sPre rad d nary func limLow limUpp acc bar groupChr "
+                                    "box borderBox phant eqArr".split()))
+# A single atom needs no parentheses as an argument: only letters, a number, or one character.
+MATH_ATOM = re.compile(r"[^\W\d_]+|[0-9]+(?:\.[0-9]+)?|.", re.DOTALL)
+
+
+def plain(text: str) -> str:
+    """``text`` without the marks around equation text."""
+    return text.replace(MATH_START, "").replace(MATH_END, "")
+
+
+def math_sentences(text: str) -> list[str]:
+    """Sentence lines of ``text`` that never split inside an equation's [Math: …] text.
+
+    Each marked equation is swapped for a short token while sentences are split, then put
+    back without its marks, so splitting stays linear in the paragraph's length.
+    """
+    held: list[str] = []
+
+    def hold(match: re.Match[str]) -> str:
+        held.append(match[1])
+        return f"{MATH_START}{len(held) - 1}{MATH_END}"
+
+    lines = sentences(MATH_SPAN.sub(hold, text))
+    if not held:
+        return lines
+    return [MATH_HELD.sub(lambda match: held[int(match[1])], line) for line in lines]
+
+
+def math_children(node: Element) -> Iterator[Element]:
+    """A math element's children in the accepted view, as ``equation_form`` reads them, without
+    property elements (``m:*Pr``): those are read only by the structure they belong to."""
+    for child in node:
+        if child.tag in EQUATION_UNWRAPPED:
+            yield from math_children(child)
+        elif child.tag not in EQUATION_DROPPED and not (child.tag.startswith(f"{{{M}}}") and child.tag.endswith("Pr")):
+            yield child
+
+
+# A structure's arguments by local name (e, num, sub, …): each element and its normalised text.
+MathArgs: TypeAlias = dict[str, list[tuple["Element", str]]]
+
+
+def math_arg(args: MathArgs, name: str) -> str:
+    """The first ``name`` argument's text, "" when there is none."""
+    return args[name][0][1] if name in args else ""
+
+
+def math_group(args: MathArgs, name: str) -> str:
+    """An argument as an operand: parenthesised unless it is empty, a single atom, or one visible
+    delimiter (``(a+b)`` is not wrapped again)."""
+    if name not in args:
+        return ""
+    child, text = args[name][0]
+    if not text or MATH_ATOM.fullmatch(text):
+        return text
+    content = list(math_children(child))
+    if len(content) == 1 and content[0].tag == om("d") and all(delimiters(content[0])[::2]):
+        return text
+    return f"({text})"
+
+
+def math_scripts(node: Element, args: MathArgs, hide: bool = False) -> str:
+    """``_sub`` and ``^sup`` of a structure, each left out when empty (or hidden, for m:nary)."""
+    sub = "" if hide and math_flag(node, "subHide") else math_group(args, "sub")
+    sup = "" if hide and math_flag(node, "supHide") else math_group(args, "sup")
+    return ("_" + sub if sub else "") + ("^" + sup if sup else "")
+
+
+def delimiters(node: Element) -> tuple[str, str, str]:
+    """An m:d's beginning, separator and ending characters."""
+    return math_char(node, "begChr", "("), math_char(node, "sepChr", "|"), math_char(node, "endChr", ")")
+
+
+def math_property(node: Element, name: str) -> Element | None:
+    """The ``name`` property of a math structure, from its own m:<structure>Pr element."""
+    props = node.find(node.tag + "Pr")
+    return None if props is None else props.find(om(name))
+
+
+def math_char(node: Element, name: str, default: str) -> str:
+    """A character property (m:chr, m:begChr, …); an empty m:val means no character."""
+    prop = math_property(node, name)
+    value = None if prop is None else prop.get(om("val"))
+    return default if value is None else value
+
+
+def math_flag(node: Element, name: str) -> bool:
+    """An on/off property (m:degHide, m:subHide, …); present without m:val means on."""
+    prop = math_property(node, name)
+    return prop is not None and on_off(prop.get(om("val"), "1"))
+
+
+def equation_form(node: Element) -> list[Any]:
+    """The accepted view of an equation as nested lists: tag, sorted attributes, text, children.
+
+    Tracked deletions are dropped and insertions unwrapped; run formatting, control
+    character formatting, revision IDs and markers are left out, so a formatting-only
+    re-save keeps the same form. m:t text is kept exactly; other text is XML layout.
+    """
+    def children(parent: Element) -> Iterator[Element]:
+        for child in parent:
+            if child.tag in EQUATION_UNWRAPPED:
+                yield from children(child)
+            elif child.tag not in EQUATION_DROPPED:
+                yield child
+    attributes = sorted([key, value] for key, value in node.attrib.items()
+                        if key not in EQUATION_IGNORED_ATTRIBUTES
+                        and not key.rsplit("}", 1)[-1].startswith("rsid"))
+    value = node.text or ""
+    text = value if node.tag.rsplit("}", 1)[-1] == "t" else value.strip()
+    return [node.tag, attributes, text, [equation_form(child) for child in children(node)]]
+
+
+def equation_hash(node: Element) -> str:
+    form = json.dumps(equation_form(node), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(form.encode("utf-8")).hexdigest()
 
 
 def size_label(size: int) -> str:
@@ -116,6 +297,31 @@ def number_id(value: str) -> str:
     return value if number is None else str(number)
 
 
+# An image's (alt text, alt title), each whitespace-normalised and "" when absent.
+AltText: TypeAlias = tuple[str, str]
+
+
+def alt_text(node: Element, inherited: AltText) -> AltText:
+    """The alt text images inside ``node`` have, given what its ancestors set.
+
+    A drawing's wp:docPr comes first, then the picture's own pic:cNvPr; a VML shape's
+    alt attribute; group members only have their own.
+    """
+    if node.tag in DRAWINGS:
+        props = node.find(f"{{{WP}}}docPr")
+        return ("", "") if props is None else (normalize(props.get("descr", "")), normalize(props.get("title", "")))
+    if node.tag in GROUPS:
+        return "", ""
+    if node.tag == PICTURE:
+        props = node.find(f"{{{PIC}}}nvPicPr/{{{PIC}}}cNvPr")
+        if props is None:
+            return inherited
+        return (inherited[0] or normalize(props.get("descr", "")), inherited[1] or normalize(props.get("title", "")))
+    if node.tag.startswith(f"{{{VML}}}") and "alt" in node.attrib:
+        return normalize(node.get("alt", "")), ""
+    return inherited
+
+
 class DocumentError(ValueError):
     """An input is unavailable or cannot be safely interpreted."""
 
@@ -142,7 +348,7 @@ class Reader:
         }
         self.review: list[dict[str, str | int | bool | None]] = []
         self.links: list[dict[str, str]] = []
-        self.fields: list[dict[str, str]] = []
+        self.fields: list[dict[str, Any]] = []
         self.styles: dict[str, Element] = {}
         # w:num by numId and w:abstractNum by abstractNumId; the first definition wins.
         self.nums: dict[str, Element] = {}
@@ -151,12 +357,16 @@ class Reader:
         self.lists: dict[str, dict[str, Any]] = {}
         # Which list each list item belongs to, run-length encoded in traversal order.
         self.list_runs: list[dict[str, Any]] = []
-        # Image references in traversal order, and hashed media part -> (sha256, size).
+        # Image references in traversal order, and hashed part (media, or the part a chart,
+        # diagram, embedded object or imported chunk points to) -> (sha256, size).
         self.images: list[dict[str, Any]] = []
         self.media: dict[str, tuple[str, int]] = {}
+        # Equation, symbol and object part fingerprints in traversal order.
+        self.objects: list[dict[str, str | None]] = []
         # Inside an unselected mc:AlternateContent copy whose prose is still read.
         self.unselected = 0
-        self.field_stack: list[list[str]] = []
+        # Open fields: instruction text so far, and the form state of a legacy form field.
+        self.field_stack: list[tuple[list[str], dict[str, Any] | None]] = []
         self.part = "word/document.xml"
         self.rels: Relationships = {}
         self.features: Counter[str] = Counter()
@@ -253,17 +463,21 @@ class Reader:
             yield from self.walk(child)
 
     def branch(self, alternate: Element) -> Element | None:
-        """The one copy of an mc:AlternateContent text box to render, or None if it has none.
+        """The one copy of an mc:AlternateContent text box or equation to render, or None.
 
-        Word stores a modern text box twice: DrawingML in mc:Choice and VML in mc:Fallback.
+        Word stores a modern text box (DrawingML in mc:Choice, VML in mc:Fallback) and a
+        compatibility-wrapped equation twice; text boxes take precedence when present.
         """
-        def has_box(node: Element) -> bool:
-            return any(d.tag == w("txbxContent") for d in node.iter())
-        choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has_box(c)), None)
-        if choice is not None:
-            return choice
-        fallback = alternate.find(f"{{{MC}}}Fallback")
-        return fallback if fallback is not None and has_box(fallback) else None
+        def pick(tags: frozenset[str]) -> Element | None:
+            def has(node: Element) -> bool:
+                return any(d.tag in tags for d in node.iter())
+            choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has(c)), None)
+            if choice is not None:
+                return choice
+            fallback = alternate.find(f"{{{MC}}}Fallback")
+            return fallback if fallback is not None and has(fallback) else None
+        found = pick(frozenset({w("txbxContent")}))
+        return found if found is not None else pick(EQUATIONS)
 
     def text_boxes(self, node: Element) -> list[Element]:
         """Outermost rendered w:txbxContent elements in document order; nested ones render inside them."""
@@ -284,8 +498,8 @@ class Reader:
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
                 or any(self.unrendered_shape_parts(child) for child in node))
 
-    def image_refs(self, node: Element) -> Iterator[list[str | None]]:
-        """Relationship IDs of each image in ``node``, in document order.
+    def image_refs(self, node: Element, alt: AltText = ("", "")) -> Iterator[tuple[list[str | None], AltText]]:
+        """Relationship IDs and alt text of each image in ``node``, in document order.
 
         Text box content is skipped (it is read when the box renders), and only one
         copy of an mc:AlternateContent is read: the text box branch, else the first
@@ -296,14 +510,15 @@ class Reader:
         if node.tag == f"{{{MC}}}AlternateContent":
             branch = self.image_branch(node)
             if branch is not None:
-                yield from self.image_refs(branch)
+                yield from self.image_refs(branch, alt)
             return
+        alt = alt_text(node, alt)
         if node.tag in {BLIP, SVG_BLIP}:
-            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")]
+            yield [node.get(f"{{{R}}}embed"), node.get(f"{{{R}}}link")], alt
         elif node.tag == IMAGEDATA:
-            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)]
+            yield [node.get(f"{{{R}}}id") or node.get(O_RELID)], alt
         for child in node:
-            yield from self.image_refs(child)
+            yield from self.image_refs(child, alt)
 
     def image_branch(self, alternate: Element) -> Element | None:
         """The one copy of an mc:AlternateContent whose images are recorded."""
@@ -313,10 +528,10 @@ class Reader:
         return branch
 
     def record_images(self, node: Element) -> None:
-        """Record each image in ``node`` by content hash (internal) or target (external)."""
+        """Record each image in ``node`` by content hash (internal) or target (external), and its alt text."""
         if self.unselected:
             return
-        for ids in self.image_refs(node):
+        for ids, (description, title) in self.image_refs(node):
             entry: dict[str, Any] = {"part": self.part}
             for rid in filter(None, ids):
                 rel = self.rels.get(rid)
@@ -332,8 +547,154 @@ class Reader:
             if len(entry) == 1:  # no relationship ID at all
                 self.warn(MISSING_IMAGE_NOTE)
                 entry["sha256"] = None
+            # Only when present, so documents without alt text keep their companions.
+            if description:
+                entry["alt"] = description
+            if title:
+                entry["alt_title"] = title
             self.images.append(entry)
             self.warn(IMAGE_NOTE)
+
+    def object_nodes(self, node: Element) -> Iterator[Element]:
+        """Outermost equations, w:sym, charts, diagrams, OLE objects, alt chunks and VML WordArt in ``node``, in document order.
+
+        Like ``image_refs``: text box content is read when the box renders, only one
+        copy of an mc:AlternateContent is read, and tracked deletions are skipped.
+        """
+        if node.tag in EQUATIONS or node.tag in {w("sym"), w("altChunk"), CHART, DIAGRAM, OLE_OBJECT}:
+            yield node
+            return
+        if node.tag == TEXTPATH and normalize(node.get("string", "")):
+            yield node  # WordArt; a v:textpath without text (e.g. in a v:shapetype) is only a style
+            return
+        if node.tag in {w("txbxContent"), w("del"), w("moveFrom")}:
+            return
+        if node.tag == f"{{{MC}}}AlternateContent":
+            branch = self.image_branch(node)
+            if branch is not None:
+                yield from self.object_nodes(branch)
+            return
+        for child in node:
+            yield from self.object_nodes(child)
+
+    def record_objects(self, node: Element) -> None:
+        """Fingerprint each object in ``node``: an equation by its accepted-view hash, a symbol by
+        font and character, a chart, diagram, embedded object or imported chunk by its part, and
+        VML WordArt by its text."""
+        if self.unselected:
+            return
+        for found in self.object_nodes(node):
+            if found.tag == w("sym"):
+                self.objects.append({"kind": "symbol", "part": self.part, "font": attr(found, "font"),
+                                     "char": attr(found, "char").upper()})
+            elif found.tag == CHART:
+                self.objects.append(self.object_part("chart", found.get(f"{{{R}}}id")))
+            elif found.tag == DIAGRAM:
+                self.objects.append(self.object_part("diagram", found.get(f"{{{R}}}dm")))
+            elif found.tag == OLE_OBJECT:
+                entry = self.object_part("embedded object", found.get(f"{{{R}}}id"))
+                entry["prog_id"] = found.get("ProgID", "")
+                self.objects.append(entry)
+            elif found.tag == w("altChunk"):
+                self.objects.append(self.object_part("imported chunk", found.get(f"{{{R}}}id")))
+            elif found.tag == TEXTPATH:
+                self.objects.append({"kind": "WordArt", "part": self.part, "text": normalize(found.get("string", ""))})
+            else:
+                self.objects.append({"kind": "equation", "part": self.part, "sha256": equation_hash(found)})
+
+    def object_part(self, kind: str, rid: str | None) -> dict[str, str | None]:
+        """An object entry with the hash of the part ``rid`` points to, or its target if external.
+
+        Part names are not recorded, so renaming a part with the same content is no change.
+        """
+        entry: dict[str, str | None] = {"kind": kind, "part": self.part}
+        rel = self.rels.get(rid) if rid else None
+        if rel is not None and rel[2]:
+            entry["target"] = rel[1]  # never fetched, like linked images
+        elif rel is not None and rel[1] in self.names:
+            if rel[1] not in self.media:
+                self.media[rel[1]] = self.hash_part(rel[1])
+            entry["sha256"] = self.media[rel[1]][0]
+        else:
+            self.warn(MISSING_OBJECT_NOTE)
+            entry["sha256"] = None
+        return entry
+
+    def equation_text(self, node: Element) -> str:
+        """An equation as linear text: ``[Math: …]`` per m:oMath, separated by a space.
+
+        It reads the accepted view, like the fingerprint: tracked deletions are left out,
+        insertions kept, and formatting adds no text.
+        """
+        self.warn(MATH_NOTE)
+        if node.tag == om("oMathPara"):
+            maths = [normalize(self.math(child)) for child in math_children(node)] or [""]
+        else:
+            maths = [normalize(self.math(node))]
+        return " ".join(f"[Math: {text or '(empty)'}]" for text in maths)
+
+    def math(self, node: Element) -> str:
+        """The linear text of one math element; arguments of structures are whitespace-normalised.
+
+        Each level of nesting recurses straight into its children, so an equation can nest
+        about as deeply as its fingerprint allows before failing.
+        """
+        tag = node.tag
+        if tag in {om("t"), w("t")}:
+            return re.sub(r"\s", " ", node.text or "")
+        if tag in {w("tab"), w("br"), w("cr")}:
+            return " "
+        if tag == w("sym"):
+            self.warn(SYMBOL_WARNING)
+            return "[Unsupported sym]"
+        if tag == f"{{{MC}}}AlternateContent":
+            branch = self.image_branch(node)
+            return "" if branch is None else "".join([self.math(child) for child in math_children(branch)])
+        if tag == om("m"):
+            rows = [", ".join([normalize(self.math(cell)) for cell in math_children(row) if cell.tag == om("e")])
+                    for row in math_children(node) if row.tag == om("mr")]
+            return "[" + "; ".join(rows) + "]"
+        children = [(child, self.math(child)) for child in math_children(node)]
+        if tag not in MATH_STRUCTURES:
+            if tag.startswith(f"{{{M}}}") and tag not in MATH_CONTAINERS:
+                self.warn(f"Unsupported math construct {tag.rsplit('}', 1)[-1]}; rendered as its text, structure not shown.")
+            return "".join(text for _, text in children)
+        args: MathArgs = {}
+        for child, text in children:
+            args.setdefault(child.tag.rsplit("}", 1)[-1], []).append((child, normalize(text)))
+        if tag == om("f"):
+            bar = "¦" if math_char(node, "type", "bar") == "noBar" else "/"
+            return math_group(args, "num") + bar + math_group(args, "den")
+        if tag in {om("sSup"), om("sSub"), om("sSubSup")}:
+            return math_group(args, "e") + math_scripts(node, args)
+        if tag == om("sPre"):
+            return " ".join(part for part in (math_scripts(node, args), math_group(args, "e")) if part)
+        if tag == om("rad"):
+            degree = "" if math_flag(node, "degHide") else math_arg(args, "deg")
+            return f"√({degree}&{math_arg(args, 'e')})" if degree else f"√({math_arg(args, 'e')})"
+        if tag == om("d"):
+            begin, separator, end = delimiters(node)
+            return begin + separator.join(text for _, text in args.get("e", [])) + end
+        if tag == om("nary"):
+            scripts = math_scripts(node, args, hide=True)
+            operand = math_arg(args, "e")
+            return math_char(node, "chr", "∫") + scripts + (" " if scripts and operand else "") + operand
+        if tag == om("func"):
+            # The space already sets the operand apart: "sin x", "lim_(n→∞) a_n".
+            return " ".join(part for part in (math_arg(args, "fName"), math_arg(args, "e")) if part)
+        if tag in {om("limLow"), om("limUpp")}:
+            limit = math_group(args, "lim")
+            mark = "_" if tag == om("limLow") else "^"
+            return math_group(args, "e") + (mark + limit if limit else "")
+        if tag == om("acc"):
+            return math_group(args, "e") + math_char(node, "chr", "\u0302")
+        if tag == om("bar"):
+            return math_group(args, "e") + ("\u0305" if math_char(node, "pos", "bot") == "top" else "\u0332")
+        if tag == om("groupChr"):
+            return math_group(args, "e") + math_char(node, "chr", "\u23df")
+        if tag == om("eqArr"):
+            return "; ".join(text for _, text in args.get("e", []))
+        return math_arg(args, "e")  # m:box, m:borderBox, m:phant
 
     def emit(self, text: str, anchored: str | None = None) -> str:
         """Return prose ``text`` and add it (or ``anchored``) to the story text comment ranges cover."""
@@ -434,19 +795,20 @@ class Reader:
             if rid and not rel:
                 self.warn("Some hyperlink relationships are missing; destinations may be incomplete.")
             visible = "".join(self.inline(child) for child in node)
-            self.links.append({"text": normalize(visible), "target": target, "part": self.part})
+            self.links.append({"text": normalize(plain(visible)), "target": target, "part": self.part})
             return visible
         if tag == w("fldChar"):
             kind = attr(node, "fldCharType")
             if kind == "begin":
-                self.field_stack.append([])
+                data = node.find("w:ffData", NS)
+                self.field_stack.append(([], None if data is None else self.form_field(data)))
             elif kind == "end" and self.field_stack:
-                self.record_field("".join(self.field_stack.pop()))
+                self.close_field()
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
             return ""
         if tag == w("instrText"):
             if self.field_stack:
-                self.field_stack[-1].append(node.text or "")
+                self.field_stack[-1][0].append(node.text or "")
             else:
                 self.record_field(node.text or "")
             return ""
@@ -455,13 +817,20 @@ class Reader:
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
         if tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
             return "".join(self.inline(child) for child in branch)
+        if tag in EQUATIONS:
+            self.record_objects(node)
+            # Marked, so sentence splitting never breaks inside it; comment anchors get it unmarked.
+            text = self.equation_text(node)
+            return self.emit(MATH_START + text + MATH_END, text)
         if tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"}:
             self.record_images(node)
+        if tag in {w("drawing"), w("pict"), w("object"), w("altChunk"), f"{{{MC}}}AlternateContent", w("sym")}:
+            self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
             if not self.unrendered_shape_parts(node):
                 return ""
-        if local in {"drawing", "pict", "object", "txbxContent", "oMath", "oMathPara", "AlternateContent", "altChunk", "sym"}:
+        if local in {"drawing", "pict", "object", "txbxContent", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
             return self.emit(f"[Unsupported {local}]")
@@ -469,10 +838,47 @@ class Reader:
             return ""
         return "".join(self.inline(child) for child in node)
 
-    def record_field(self, instruction: str) -> None:
+    def close_field(self) -> None:
+        instruction, form = self.field_stack.pop()
+        self.record_field("".join(instruction), form)
+
+    def record_field(self, instruction: str, form: dict[str, Any] | None = None) -> None:
         value = normalize(instruction)
-        self.fields.append({"command": value.split(" ", 1)[0],
-                            "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part})
+        entry: dict[str, Any] = {"command": value.split(" ", 1)[0],
+                                 "sha256": hashlib.sha256(value.encode()).hexdigest(), "part": self.part}
+        if form is not None:
+            # Only for checkbox and dropdown form fields, so other fields keep their metadata.
+            entry["form"] = form
+            self.warn(FORM_FIELD_NOTE)
+        self.fields.append(entry)
+
+    def form_field(self, data: Element) -> dict[str, Any] | None:
+        """The state of a legacy checkbox or dropdown form field from its w:ffData, else None.
+
+        A text input's visible value is already prose, so it records nothing here.
+        """
+        name = data.find("w:name", NS)
+        label = attr(name, "val") if name is not None else ""
+        box = data.find("w:checkBox", NS)
+        if box is not None:
+            # The current state, else the default state; an absent w:val is on, as for any ST_OnOff.
+            state = box.find("w:checked", NS)
+            if state is None:
+                state = box.find("w:default", NS)
+            return {"type": "checkbox", "name": label,
+                    "checked": state is not None and on_off(attr(state, "val", "1"))}
+        dropdown = data.find("w:ddList", NS)
+        if dropdown is None:
+            return None
+        entries = [attr(entry, "val") for entry in dropdown.findall("w:listEntry", NS)]
+        # w:result is the zero-based selected entry; without one, w:default applies, which defaults to 0.
+        chosen = dropdown.find("w:result", NS)
+        if chosen is None:
+            chosen = dropdown.find("w:default", NS)
+        index = 0 if chosen is None else decimal(attr(chosen, "val"))
+        # An index that names no entry is recorded as null, never guessed.
+        selected = entries[index] if index is not None and 0 <= index < len(entries) else None
+        return {"type": "dropdown", "name": label, "entries": entries, "selected": selected}
 
     def properties(self, paragraph: Element) -> tuple[list[Element], str]:
         direct = paragraph.find("w:pPr", NS)
@@ -500,7 +906,7 @@ class Reader:
         return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
 
     def paragraph_text(self, node: Element, text: str) -> str:
-        lines = sentences(text)
+        lines = math_sentences(text)
         if not lines:
             return ""
         props, style_id = self.properties(node)
@@ -513,7 +919,7 @@ class Reader:
             level = min(6, int(heading[1])) if heading else 0
         num = next((p.find("w:numPr", NS) for p in props if p.find("w:numPr", NS) is not None), None)
         if level:
-            return "#" * level + " " + normalize(text)
+            return "#" * level + " " + normalize(plain(text))
         if num is not None:
             # Prose keeps the rule it had before list metadata: the nearest numPr alone decides
             # whether this is a list item and how far it is indented. The inherited numId and
@@ -644,6 +1050,11 @@ class Reader:
             elif child.tag in {w("del"), w("moveFrom")}:
                 self.inline(child)  # record review, omit deleted blocks
                 continue
+            elif child.tag in EQUATIONS:
+                # Body and cell content may hold math directly: it is a paragraph of its own.
+                self.record_objects(child)
+                value = self.emit(self.equation_text(child))
+                self.emit("", " ")  # a paragraph boundary, as after a w:p
             elif child.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(child)) is not None:
                 value = self.blocks(branch)  # one copy of block-level text box content
             elif child.tag == f"{{{MC}}}AlternateContent":
@@ -708,12 +1119,24 @@ class Reader:
     def audit(self, tree: Element) -> None:
         # This small allowlist is intentionally conservative: unknown constructs warn.
         known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
-        def visit(node: Element) -> None:
+        def visit_form(node: Element) -> None:
+            for child in node:
+                if child.tag not in FORM_DATA[node.tag]:
+                    visit(child)
+                elif child.tag in FORM_DATA:
+                    visit_form(child)
+
+        def visit(node: Element, math: bool = False) -> None:
             local = node.tag.rsplit("}", 1)[-1]
+            # Math is rendered as linear text, which warns for math elements it does not know.
+            math = math or node.tag in EQUATIONS
+            if node.tag == w("ffData"):
+                visit_form(node)  # form field data whose meaning is recorded, see FORM_DATA
+                return
             if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
                 # Only the copy holding the rendered text box is read.
                 for child in branch:
-                    visit(child)
+                    visit(child, math)
                 return
             if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
                 # A rendered text box: audit its Word content, not the shape markup around it.
@@ -734,10 +1157,10 @@ class Reader:
                     if name.endswith("Change") or name in {"ins", "del", "cellIns", "cellDel", "cellMerge"}:
                         self.warn("Tracked formatting or structure changes are not fully represented; inspect the DOCX.")
                 return
-            if not node.tag.startswith("{" + W + "}"):
+            if not node.tag.startswith("{" + W + "}") and not (math and node.tag.startswith("{" + M + "}")):
                 self.warn(f"Unsupported XML construct {local}; content may be omitted or approximate.")
             for child in node:
-                visit(child)
+                visit(child, math)
         visit(tree)
 
     def render_part(self, part: str, tree: Element) -> str:
@@ -749,7 +1172,7 @@ class Reader:
         if self.field_stack:
             self.warn("Unclosed field codes found; saved display text may be incomplete.")
             while self.field_stack:
-                self.record_field("".join(self.field_stack.pop()))
+                self.close_field()
         return value
 
     def extract(self) -> Extraction:
@@ -846,12 +1269,18 @@ class Reader:
             self.warn("Footnote references have no related footnotes part.")
         if self.features["endnote references"] and not any(k == "endnotes" for k, _ in stories):
             self.warn("Endnote references have no related endnotes part.")
+        if any("alt" in image or "alt_title" in image for image in self.images):
+            self.warnings.discard(IMAGE_NOTE)
+            self.warn(IMAGE_ALT_NOTE)
         metadata = {"schema": 1, "view": "accept-insertions-omit-deletions",
                     "coverage": "partial-prose", "warnings": sorted(self.warnings),
                     "review": self.review, "hyperlinks": self.links, "fields": self.fields,
                     "lists": [{**entry, "levels": [entry["levels"][k] for k in sorted(entry["levels"])]}
                               for entry in self.lists.values()],
                     "list_runs": self.list_runs, "images": self.images}
+        if self.objects:
+            # Only when present, so documents without any of these objects keep their companions.
+            metadata["objects"] = self.objects
         return Extraction("\n\n".join(p for p in prose if p).rstrip() + "\n", metadata)
 
 
