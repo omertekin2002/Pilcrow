@@ -369,13 +369,13 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
                 continue
             # Match a reply whose parent changed, or one aligned in place before its parent paired;
             # an entry equal on its own that moved stays removed and added.
-            j = next((c for c in candidates if old[i] != new[c] or (i, c) in pruned), None)
-            if j is None:
+            match = next((c for c in candidates if old[i] != new[c] or (i, c) in pruned), None)
+            if match is None:
                 continue
-            candidates.remove(j)
-            pairs[i] = j
-            edits[i] = (j, None)
-            new_paired.add(j)
+            candidates.remove(match)
+            pairs[i] = match
+            edits[i] = (match, None)
+            new_paired.add(match)
             found = True
         for fields, word in COMMENT_EDITS:
             def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
