@@ -118,6 +118,7 @@ EXPECTED = {
     "Read ch. 4. Then ch. 5.": ["Read ch. 4.", "Then ch. 5."],
     "In Art. “5” and Sec. (3).": ["In Art.", "“5” and Sec.", "(3)."],
     "Done in Dec. 2. And May. 3 more.": ["Done in Dec. 2.", "And May.", "3 more."],
+    "The unit is \u212a. Next.": ["The unit is \u212a.", "Next."],
     **{text: [text] for text in JOINED},
 }
 

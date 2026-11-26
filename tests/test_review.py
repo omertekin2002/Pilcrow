@@ -402,15 +402,48 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('+ added reply by Ada to Ada\'s comment "Changed." on "Same passage." (comment 1): "Reply." (open)',
                       lines)
 
+    def test_editing_a_parent_with_identical_replies_does_not_rewrite_them(self) -> None:
+        def write(path: Path, parent: str) -> None:
+            comments = {"1": parent, "2": "Agreed.", "3": "Agreed."}
+            ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+            body = f"<w:p>{start('1')}{start('2')}{start('3')}{run('The cat sat.')}{end('1')}{end('2')}{end('3')}</w:p>"
+            self.threaded(path, comments, ids, ("11111111", None, "0"), ("22222222", "11111111", "0"),
+                          ("33333333", "11111111", "0"), body=body)
+        write(self.old, "Please clarify.")
+        write(self.new, "Please clarify this.")
+        self.assertEqual(self.section(self.review(), "Comments"),
+                         ['~ edited text of comment by Ada on "The cat sat.": "Please clarify." → "Please clarify this."'])
+
+    def test_a_nested_reply_whose_parent_is_not_paired_is_removed_and_added(self) -> None:
+        # When the root comment is replaced (text and resolved both change, so not paired), its
+        # reply is removed and added, and a nested reply under that reply is removed and added too
+        # (neither silently kept when unchanged nor reported as edited through its parent's raw identity).
+        ids = {"1": "11111111", "2": "22222222", "3": "33333333"}
+        body = f"<w:p>{start('1')}{start('2')}{start('3')}{run('The cat sat.')}{end('1')}{end('2')}{end('3')}</w:p>"
+        for new_nested in ("Deep.", "Deep, edited."):
+            with self.subTest(new_nested=new_nested):
+                self.threaded(self.old, {"1": "Old root.", "2": "Middle.", "3": "Deep."}, ids,
+                              ("11111111", None, "0"), ("22222222", "11111111", "0"), ("33333333", "22222222", "0"),
+                              body=body)
+                self.threaded(self.new, {"1": "New root.", "2": "Middle.", "3": new_nested}, ids,
+                              ("11111111", None, "1"), ("22222222", "11111111", "0"), ("33333333", "22222222", "0"),
+                              body=body)
+                lines = self.section(self.review(), "Comments")
+                self.assertIn('- removed reply by Ada to Ada\'s comment "Middle." on "The cat sat.": "Deep." (open)', lines)
+                self.assertIn(f'+ added reply by Ada to Ada\'s comment "Middle." on "The cat sat.": "{new_nested}" (open)',
+                              lines)
+                self.assertFalse([line for line in lines if line.startswith("~")], lines)
+
     def test_a_reply_to_cycle_ends(self) -> None:
-        # Malformed: each comment names the other as its parent.
+        # Malformed: each comment names the other as its parent, so neither has a paired parent.
         comments, ids = {"1": "First.", "2": "Second."}, {"1": "11111111", "2": "22222222"}
         self.threaded(self.old, comments, ids, ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
         self.threaded(self.new, {"1": "First, edited.", "2": "Second."}, ids,
                       ("11111111", "22222222", "0"), ("22222222", "11111111", "0"))
-        self.assertEqual(self.section(self.review(), "Comments"),
-                         ['~ edited text of reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First."'
-                          ' → "First, edited."'])
+        lines = self.section(self.review(), "Comments")
+        self.assertIn('- removed reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First." (open)', lines)
+        self.assertIn('+ added reply by Ada to Ada\'s comment "Second." on "Passage 1.": "First, edited." (open)', lines)
+        self.assertFalse([line for line in lines if line.startswith("~")], lines)
 
     def test_long_comment_text_is_shortened(self) -> None:
         long = "word " * 40

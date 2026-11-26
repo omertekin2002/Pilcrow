@@ -50,10 +50,12 @@ def sentences(text: str) -> list[str]:
             # A sentence rarely starts lowercase: "Ph.D. in", "Acme Inc. was", "Max. load".
             if following.islower():
                 continue
-            token = abbreviation_candidate(line, match.start()).lower()
-            if token and (token in ABBREVIATIONS or INITIALISM.fullmatch(token)
-                          or (token in NUMBER_ABBREVIATIONS and following.isdecimal())):
-                continue
+            token = abbreviation_candidate(line, match.start())
+            if token:
+                lower = token.lower()
+                if (lower in ABBREVIATIONS or INITIALISM.fullmatch(token)
+                        or (lower in NUMBER_ABBREVIATIONS and following.isdecimal())):
+                    continue
             result.append(line[start: end].strip())
             start = end
         if line[start:]:

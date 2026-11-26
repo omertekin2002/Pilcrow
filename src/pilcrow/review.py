@@ -295,18 +295,29 @@ COMMENT_EDITS: list[tuple[tuple[str, ...], Callable[[Entry, Entry], str | None]]
 ]
 
 
-def through_pairs(view: Sequence[Entry], raw: Sequence[Entry], pairs: dict[int, int]) -> list[Entry]:
-    """``view`` with each reply's parent replaced by its parent's pairing, where it has one.
+def valid_parent(raw: Sequence[Entry], index: int) -> int | None:
+    """The parent comment position of ``raw[index]`` when it names an existing comment, else None."""
+    parent = raw[index].get("reply_to")
+    return parent if isinstance(parent, int) and 0 <= parent < len(raw) else None
+
+
+def through_pairs(view: Sequence[Entry], raw: Sequence[Entry], pairs: dict[int, int], side: str) -> list[Entry]:
+    """``view`` with each reply's parent replaced by its parent's pairing, or an unpaired marker.
 
     ``pairs`` maps a paired parent's position to the position of the new comment it is
     paired with, so two replies whose parents are paired with each other compare equal
-    however the parent itself changed.
+    however the parent itself changed, while a reply whose parent is not paired cannot
+    match through its parent's raw identity.
     """
     result = []
-    for entry, original in zip(view, raw, strict=True):
-        parent = original.get("reply_to")
-        paired = pairs.get(parent) if isinstance(parent, int) else None
-        result.append(entry if paired is None else {**entry, "parent": {"paired": paired}})
+    for index, entry in enumerate(view):
+        parent = valid_parent(raw, index)
+        if parent is None:
+            result.append(entry)
+        elif parent in pairs:
+            result.append({**entry, "parent": {"paired": pairs[parent]}})
+        else:
+            result.append({**entry, "parent": {"unpaired": side, "index": parent}})
     return result
 
 
@@ -318,6 +329,27 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
     # Entries outside the differing blocks are equal and pair up in order.
     pairs = dict(zip((i for i in range(len(old)) if i not in unmatched_old),
                      (j for j in range(len(new)) if j not in unmatched_new), strict=True))
+    # A matched reply only counts as unchanged when its parent is paired with its new parent;
+    # hold back any others until a later round pairs their parents, or leave them unmatched.
+    pruned: set[tuple[int, int]] = set()
+    while True:
+        drop = [(i, j) for i, j in pairs.items()
+                if (op := valid_parent(old_raw, i)) is not None
+                and pairs.get(op) != valid_parent(new_raw, j)]
+        if not drop:
+            break
+        for i, j in drop:
+            del pairs[i]
+            pruned.add((i, j))
+    if pruned:
+        anchors = [*sorted(pairs.items()), (len(old), len(new))]
+        blocks, prev_i, prev_j = [], 0, 0
+        for i, j in anchors:
+            if i > prev_i or j > prev_j:
+                blocks.append((list(range(prev_i, i)), list(range(prev_j, j))))
+            prev_i, prev_j = i + 1, j + 1
+        unmatched_old = {i for olds, _ in blocks for i in olds}
+        unmatched_new = {j for _, news in blocks for j in news}
     edits: dict[int, tuple[int, str | None]] = {}  # old position -> (new position, line or None for no change)
     # Pair parents before their replies: each round compares replies through the pairs of the
     # rounds before it, and the rounds stop once one pairs nothing, even on a reply_to cycle.
@@ -325,9 +357,27 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
     while found:
         found = False
         new_paired = set(pairs.values())
-        old_now = through_pairs(old, old_raw, pairs)
-        new_now = through_pairs(new, new_raw, {j: j for j in new_paired})
-        for fields, word in [((), None), *COMMENT_EDITS]:
+        old_now = through_pairs(old, old_raw, pairs, "old")
+        new_now = through_pairs(new, new_raw, {j: j for j in new_paired}, "new")
+        # Exact matches through a paired parent: pair in order even for identical replies.
+        by_key: dict[str, list[int]] = {}
+        for j in sorted(unmatched_new - new_paired):
+            by_key.setdefault(canonical(new_now[j]), []).append(j)
+        for i in sorted(unmatched_old - pairs.keys()):
+            candidates = by_key.get(canonical(old_now[i]))
+            if not candidates:
+                continue
+            # Match a reply whose parent changed, or one aligned in place before its parent paired;
+            # an entry equal on its own that moved stays removed and added.
+            j = next((c for c in candidates if old[i] != new[c] or (i, c) in pruned), None)
+            if j is None:
+                continue
+            candidates.remove(j)
+            pairs[i] = j
+            edits[i] = (j, None)
+            new_paired.add(j)
+            found = True
+        for fields, word in COMMENT_EDITS:
             def key(entry: Entry, fields: tuple[str, ...] = fields) -> str:
                 return canonical({k: v for k, v in entry.items() if k not in fields})
             old_keys, new_keys = Counter(map(key, old_now)), Counter(map(key, new_now))
@@ -338,19 +388,10 @@ def comments_section(old_raw: Sequence[Entry], new_raw: Sequence[Entry]) -> list
                 if old_keys[k] != 1 or new_keys[k] != 1:
                     continue
                 j = new_position[k]
-                if j not in unmatched_new or j in new_paired:
+                if j not in unmatched_new or j in new_paired or not only_differs(old_now[i], new_now[j], *fields):
                     continue
-                if word is None:
-                    # Equal only through its parent's pairing: a reply whose parent changed. An
-                    # entry equal on its own just moved, and stays removed and added.
-                    if old[i] == new[j]:
-                        continue
-                    line = None
-                elif only_differs(old_now[i], new_now[j], *fields):
-                    line = word(old[i], new[j])
-                    if line is None:
-                        continue
-                else:
+                line = word(old[i], new[j])
+                if line is None:
                     continue
                 pairs[i] = j
                 edits[i] = (j, line)

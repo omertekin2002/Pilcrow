@@ -67,7 +67,7 @@ whitespace-normalised; the keys are present only when non-empty, so images
 without alt text keep the metadata they had. Media file names are not recorded because Word renumbers them on save,
 so order plus hash is the comparison, and re-encoded images are a real change.
 The chosen `mc:AlternateContent` copy is read once: the text box branch, else
-the first `mc:Choice`. `objects` lists equations, symbols, charts, diagrams,
+the equation branch, else the first `mc:Choice` (or `mc:Fallback`). `objects` lists equations, symbols, charts, diagrams,
 embedded objects, imported chunks, and WordArt in one traversal order, each with its story
 `part`: `{"kind": "equation", "sha256": …}` (the canonical accepted-view hash
 above), `{"kind": "WordArt", "text": …}` (a VML `v:textpath` string), `{"kind": "symbol", "font": …, "char": …}` (`w:font` and `w:char`,

@@ -463,17 +463,21 @@ class Reader:
             yield from self.walk(child)
 
     def branch(self, alternate: Element) -> Element | None:
-        """The one copy of an mc:AlternateContent text box to render, or None if it has none.
+        """The one copy of an mc:AlternateContent text box or equation to render, or None.
 
-        Word stores a modern text box twice: DrawingML in mc:Choice and VML in mc:Fallback.
+        Word stores a modern text box (DrawingML in mc:Choice, VML in mc:Fallback) and a
+        compatibility-wrapped equation twice; text boxes take precedence when present.
         """
-        def has_box(node: Element) -> bool:
-            return any(d.tag == w("txbxContent") for d in node.iter())
-        choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has_box(c)), None)
-        if choice is not None:
-            return choice
-        fallback = alternate.find(f"{{{MC}}}Fallback")
-        return fallback if fallback is not None and has_box(fallback) else None
+        def pick(tags: frozenset[str]) -> Element | None:
+            def has(node: Element) -> bool:
+                return any(d.tag in tags for d in node.iter())
+            choice = next((c for c in alternate if c.tag == f"{{{MC}}}Choice" and has(c)), None)
+            if choice is not None:
+                return choice
+            fallback = alternate.find(f"{{{MC}}}Fallback")
+            return fallback if fallback is not None and has(fallback) else None
+        found = pick(frozenset({w("txbxContent")}))
+        return found if found is not None else pick(EQUATIONS)
 
     def text_boxes(self, node: Element) -> list[Element]:
         """Outermost rendered w:txbxContent elements in document order; nested ones render inside them."""

@@ -2048,10 +2048,9 @@ class CLITests(unittest.TestCase):
 
         prose, meta = self.export_objects(body)
         self.assertEqual(meta["objects"], [para_entry(t) for t in "bcim"])
-        # Block-level math is a paragraph of its own; without a text box, every compatibility
-        # copy's prose is read, as for paragraphs, while only the chosen copy is fingerprinted.
+        # Block-level math is a paragraph of its own; only the chosen compatibility copy renders.
         self.assertEqual(prose, "Before.\n\n[Math: b]\n\n[Table]\n\n[Row]\n\n[Cell]\n\n[Math: c]\n\n[/Row]\n\n"
-                                "[/Table]\n\n[Math: i]\n\n[Math: m]\n\n[Math: f]\n")
+                                "[/Table]\n\n[Math: i]\n\n[Math: m]\n")
         make_docx(self.root / "essay.docx", body.replace(equation("b", para=True), equation("B", para=True)))
         self.cli("check", "essay.docx", code=1)
 
@@ -2063,9 +2062,13 @@ class CLITests(unittest.TestCase):
                  f'<mc:Fallback>{anchored("", vml_picture("fallback"))}</mc:Fallback></mc:AlternateContent>')
         media = {"word/media/fallback.png": "fallback bytes"}
         para_form = [f"{{{M}}}oMathPara", [], "", [simple_form()]]
-        for body, form in ((inline, para_form), (block, simple_form())):
+        for body, form, expected_prose in (
+            (inline, para_form, "Formula: [Math: E=mc2]\n"),
+            (block, simple_form(), "[Math: E=mc2]\n"),
+        ):
             with self.subTest(body=body):
-                _, meta = self.export_objects(body, extra=media, relationships=image_rel("fallback", "media/fallback.png"))
+                prose, meta = self.export_objects(body, extra=media, relationships=image_rel("fallback", "media/fallback.png"))
+                self.assertEqual(prose, expected_prose)
                 self.assertEqual(meta["objects"], [equation_entry(form)])
                 self.assertEqual(meta["images"], [])
 
