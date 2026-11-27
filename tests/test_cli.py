@@ -337,8 +337,8 @@ def dropdown_form(entries: list[str], selected: str | None, name: str = "Drop1")
     return {"type": "dropdown", "name": name, "entries": entries, "selected": selected}
 
 
-FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
-                   "text form field settings are not compared.")
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is shown in prose and recorded in field "
+                   "metadata; text form field settings are not compared.")
 
 
 def make_docx(
@@ -1435,17 +1435,18 @@ class CLITests(unittest.TestCase):
         meta: dict[str, Any] = json.loads(self.exported()[1])
         return meta
 
-    def test_toggling_a_form_checkbox_is_stale_in_metadata_only(self) -> None:
+    def test_toggling_a_form_checkbox_changes_prose_and_metadata(self) -> None:
         source = self.root / "essay.docx"
         meta = self.export_form(f"<w:p>{run('The Tenant may sublet: ')}{checkbox('0')}</w:p>")
         self.assertEqual(meta["fields"], [checkbox_entry(False)])
         self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
         before = self.exported()
+        self.assertEqual(before[0], "The Tenant may sublet: \u2610\n".encode())
         make_docx(source, f"<w:p>{run('The Tenant may sublet: ')}{checkbox('1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
         self.cli("export", source, "--root", self.root)
         after = self.exported()
-        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[0], "The Tenant may sublet: \u2612\n".encode())
         self.assertEqual(json.loads(after[1])["fields"], [checkbox_entry(True)])
 
     def test_checkbox_state_follows_checked_then_default(self) -> None:
@@ -1465,17 +1466,18 @@ class CLITests(unittest.TestCase):
         make_docx(source, f"<w:p>{checkbox(None, '1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
 
-    def test_choosing_another_dropdown_entry_is_stale_in_metadata_only(self) -> None:
+    def test_choosing_another_dropdown_entry_changes_prose_and_metadata(self) -> None:
         source = self.root / "essay.docx"
         meta = self.export_form(f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='0')}</w:p>")
         self.assertEqual(meta["fields"][0]["form"], dropdown_form(["Yes", "No"], "Yes"))
         self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
         before = self.exported()
+        self.assertEqual(before[0], b"Sublet allowed: Yes\n")
         make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
         self.cli("export", source, "--root", self.root)
         after = self.exported()
-        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[0], b"Sublet allowed: No\n")
         self.assertEqual(json.loads(after[1])["fields"][0]["form"], dropdown_form(["Yes", "No"], "No"))
         # Changing the entries, even with the same selection, is stale too.
         make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', 'Maybe', result='1')}</w:p>")
@@ -2960,8 +2962,155 @@ class EquationTextTests(unittest.TestCase):
         make_docx(self.path, body, extra=extra, relationships=relationships)
         outputs = extract(self.path).outputs()
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
-            ".prose.md": "8a6483a884064a67cfe3ac935b295872d8ad1d864b2b945332068c8189c038b5",
-            ".meta.json": "8fd177d4171cfe566c5adda90807756c5fdd5596c408381f3b495d36f21208d2",
+            # Re-pinned when legacy checkboxes got prose: the fixture's checkbox now reads ☒,
+            # and the form field note says so; nothing else moved.
+            ".prose.md": "a93eb6a510a1e7dc5aca4d6a52cc69fddfabe0f734b468695dab5c3adad93219",
+            ".meta.json": "6e68886b40f2fafedbafd84e7490b025e95d49003461615a5d64012fe236df8b",
+        })
+
+
+class FormFieldTextTests(unittest.TestCase):
+    """Legacy checkbox and dropdown form fields' state as prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-forms-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, **options)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def test_repro_reads_the_answers_in_place(self) -> None:
+        def form(checked: str, result: str) -> str:
+            return (f"<w:p>{run('Agree: ')}{checkbox(checked)}{run(' Terms: ')}"
+                    f"{dropdown('Net 30', 'Net 60', result=result)}</w:p>")
+
+        self.assertEqual(self.extract(form("0", "0"))[0], "Agree: ☐ Terms: Net 30\n")
+        prose, meta = self.extract(form("1", "1"))
+        self.assertEqual(prose, "Agree: ☒ Terms: Net 60\n")
+        self.assertEqual(meta["fields"], [checkbox_entry(True), {
+            "command": "FORMDROPDOWN", "sha256": hashlib.sha256(b"FORMDROPDOWN").hexdigest(),
+            "part": "word/document.xml", "form": dropdown_form(["Net 30", "Net 60"], "Net 60")}])
+
+    def test_checkbox_glyph_follows_the_recorded_state(self) -> None:
+        cases = [
+            (checkbox("1", "0"), True), (checkbox("0", "1"), False), (checkbox("", "0"), True),
+            (checkbox("true", None), True), (checkbox("off", None), False),
+            (checkbox(None, "1"), True), (checkbox(None, "0"), False), (checkbox(None, ""), True),
+            (checkbox(None, None), False), (checkbox("0", name=None), False),
+        ]
+        for xml, checked in cases:
+            with self.subTest(xml=xml):
+                prose, meta = self.extract(f"<w:p>{run('Box: ')}{xml}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["checked"], checked)
+                self.assertEqual(prose, "Box: " + ("☒" if checked else "☐") + "\n")
+
+    def test_dropdown_shows_its_selected_entry_or_nothing(self) -> None:
+        cases = [
+            (dropdown("Yes", "No", result=None), "Yes"),
+            (dropdown("Yes", "No", result=None, default="1"), "No"),
+            (dropdown("Yes", "No", result="1", default="0"), "No"),
+            (dropdown("Yes", "No", result="+01"), "No"),
+            (dropdown("Yes", "No", result="2"), None),
+            (dropdown("Yes", "No", result="-1"), None),
+            (dropdown("Yes", "No", result="first"), None),
+            (dropdown("Yes", "No", result=None, default="5"), None),
+            (dropdown(result="0"), None),
+            # The entry's text as it is: Markdown characters stay, as other prose does.
+            (dropdown("*Yes*", "Net  30", result="1"), "Net 30"),
+        ]
+        for xml, selected in cases:
+            with self.subTest(xml=xml):
+                prose, meta = self.extract(f"<w:p>{run('Choice: ')}{xml}{run(' end')}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["selected"] is None, selected is None)
+                self.assertEqual(prose, f"Choice: {selected} end\n" if selected else "Choice: end\n")
+        prose, _ = self.extract(f"<w:p>{dropdown('*Yes*', result='0')}</w:p>")
+        self.assertEqual(prose, "*Yes*\n")
+
+    def test_text_form_fields_are_unchanged(self) -> None:
+        text_input = form_field("FORMTEXT", '<w:textInput><w:default w:val="0"/></w:textInput>', "1200", name="Rent")
+        prose, meta = self.extract(f"<w:p>{run('Rent: ')}{text_input}{run(' per month.')}</w:p>")
+        self.assertEqual(prose, "Rent: 1200 per month.\n")
+        self.assertNotIn("form", meta["fields"][0])
+        self.assertNotIn(FORM_FIELD_NOTE, meta["warnings"])
+
+    def test_tracked_changes_and_other_stories(self) -> None:
+        extra = {
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}"><w:p>{run("Header ")}{checkbox("1", name="InHeader")}</w:p></w:hdr>',
+            "word/footnotes.xml": (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{run("Note ")}'
+                                   f'{dropdown("A", "B", result="1", name="InNote")}</w:p></w:footnote></w:footnotes>'),
+        }
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        body = (anchored("Boxed:", modern_text_box(f"<w:p>{run('In box ')}{checkbox('1', name='InBox')}</w:p>"))
+                + f'<w:p>{run("Inserted ")}<w:ins w:id="1" w:author="Ben">{checkbox("1", name="Inserted")}</w:ins></w:p>'
+                + f'<w:p>{run("Kept.")}<w:del w:id="2" w:author="Ben">{checkbox("1", name="Deleted")}'
+                + f'{dropdown("Gone", name="DeletedDrop")}</w:del></w:p>'
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        prose, meta = self.extract(body, extra=extra, relationships=relationships)
+        # An insertion's field renders, as in the accepted view; a deletion's renders nothing.
+        self.assertIn("In box ☒", prose)
+        self.assertIn("Inserted ☒\n", prose)
+        self.assertIn("\nKept.\n", prose)
+        self.assertNotIn("Gone", prose)
+        self.assertIn("Note B", prose)
+        self.assertIn("Header ☒", prose)
+        self.assertEqual(len(meta["fields"]), 4)
+
+    def test_a_comment_anchor_over_a_form_field_holds_its_text(self) -> None:
+        body = (f'<w:p>{start("1")}{run("Agree: ")}{checkbox("1")}{run(" Terms: ")}'
+                f'{dropdown("Net 30", "Net 60", result="1")}{end("1")}</w:p>')
+        _, meta = self.extract(body, extra={"word/comments.xml": comments_part({"1": "Confirm."})},
+                               relationships=COMMENTS_REL)
+        (comment,) = meta["review"]
+        self.assertEqual(comment["anchor"], "Agree: ☒ Terms: Net 60")
+
+    def test_an_unselected_alternate_copy_shows_no_state(self) -> None:
+        def copy(text: str) -> str:
+            return f"<w:p>{run(text)}{checkbox('1')}{dropdown('Yes', result='0')}</w:p>"
+
+        body = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="w14">{copy("Chosen ")}</mc:Choice>'
+                f'<mc:Fallback>{copy("Fallback ")}</mc:Fallback></mc:AlternateContent>')
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "Chosen ☒Yes\n\nFallback\n")
+
+    def test_result_runs_of_a_checkbox_keep_their_text(self) -> None:
+        # Word writes none, but any that are present render as before, after the state.
+        data = '<w:checkBox><w:sizeAuto/><w:default w:val="1"/></w:checkBox>'
+        prose, _ = self.extract(f"<w:p>{run('Box: ')}{form_field('FORMCHECKBOX', data, 'X', name='Check1')}</w:p>")
+        self.assertEqual(prose, "Box: ☒X\n")
+
+    def test_sentences_split_around_the_state_as_in_any_prose(self) -> None:
+        body = (f"<w:p>{run('I agree ')}{checkbox('1')}{run('. Payment is ')}"
+                f"{dropdown('due. Net 30', result='0')}{run(' days.')}</w:p>")
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "I agree ☒.\nPayment is due.\nNet 30 days.\n")
+
+    def test_documents_without_a_legacy_checkbox_or_dropdown_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before legacy form fields had prose.
+        text_input = form_field("FORMTEXT", '<w:textInput><w:default w:val="0"/></w:textInput>', "1200", name="Rent")
+        body = (paragraph("Lease terms. The Tenant pays rent monthly.")
+                + f"<w:p>{run('Rent: ')}{text_input}{run(' per month.')}</w:p>"
+                + '<w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+                '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+                '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r>'
+                '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+                + f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>'
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>')
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra={"word/comments.xml": comments_part({"1": "Please check."})},
+                  relationships=COMMENTS_REL)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "57ed66ef6405337e2e77262ab0da133145cd90dbabfd4f18192a9b247b870b2b",
+            ".meta.json": "8d178635a167aecf5bd847062d4421072f5341c4a7aaf6edb693b5887dcfa412",
         })
 
 

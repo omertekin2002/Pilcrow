@@ -23,7 +23,9 @@ try:
         W,
         abstract_num,
         anchored,
+        checkbox,
         comments_part,
+        dropdown,
         end,
         level,
         list_item,
@@ -45,7 +47,9 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         W,
         abstract_num,
         anchored,
+        checkbox,
         comments_part,
+        dropdown,
         end,
         level,
         list_item,
@@ -101,6 +105,7 @@ def rich_documents() -> dict[str, tuple[str, dict[str, str], str]]:
         + anchored("Legacy anchor.", vml_text_box(paragraph("Legacy box.")))
     )
     commented = f'<w:p>{start("1")}{run("Commented text.")}{end("1")}</w:p>'
+    forms = f"<w:p>{run('Agree: ')}{checkbox('1')}{run(' Terms: ')}{dropdown('Net 30', 'Net 60', result='1')}</w:p>"
     return {
         "structure.docx": (structure, {"word/styles.xml": styles, "word/numbering.xml": lists},
                            f'<Relationship Id="styles" Type="{R}/styles" Target="styles.xml"/>' + NUMBERING_REL),
@@ -108,6 +113,7 @@ def rich_documents() -> dict[str, tuple[str, dict[str, str], str]]:
         "tracked.docx": (tracked, {}, ""),
         "boxes.docx": (boxes, {}, ""),
         "commented.docx": (commented, {"word/comments.xml": comments_part({"1": "A remark."})}, COMMENTS_REL),
+        "forms.docx": (forms, {}, ""),
     }
 
 
@@ -167,6 +173,7 @@ class TextconvTests(unittest.TestCase):
                 self.assertNotIn(b'"schema"', result.stdout)
                 self.assertIn(f"warning: {name}: ".encode(), result.stderr)
         self.assertIn("東京".encode(), self.prose_companion("structure.docx"))
+        self.assertEqual(self.prose_companion("forms.docx"), "Agree: \u2612 Terms: Net 60\n".encode())
 
     def test_reads_a_temporary_copy_without_extension_outside_any_root(self) -> None:
         make_docx(self.root / "essay.docx", paragraph("A sentence. Another sentence."))

@@ -98,8 +98,10 @@ UNANCHORED_COMMENT_NOTE = ("Some comments are not anchored in any rendered part;
                            "their anchor is recorded as null.")
 UNCLOSED_COMMENT_NOTE = ("Some comment ranges are missing a start or an end; their anchors run "
                          "from the start or to the end of the story part.")
-FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
-                   "text form field settings are not compared.")
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is shown in prose and recorded in field "
+                   "metadata; text form field settings are not compared.")
+# A legacy checkbox form field's state in prose: the glyphs Word's content-control checkboxes use.
+CHECKED, UNCHECKED = "\u2612", "\u2610"
 MIB = 1024 * 1024
 # Package safety limits. Parsed parts (XML and .rels) are read whole into memory, so they
 # have tight caps; media is hashed in fixed-size chunks, so only the package-wide total
@@ -1034,13 +1036,16 @@ class Reader:
             return visible
         if tag == w("fldChar"):
             kind = attr(node, "fldCharType")
+            state = ""
             if kind == "begin":
                 data = node.find("w:ffData", NS)
-                self.field_stack.append(([], None if data is None else self.form_field(data)))
+                form = None if data is None else self.form_field(data)
+                self.field_stack.append(([], form))
+                state = self.form_state(form)
             elif kind == "end" and self.field_stack:
                 self.close_field()
             self.warn("Fields use saved display text, which can be stale; codes are fingerprinted, not evaluated (including Zotero).")
-            return ""
+            return state
         if tag == w("instrText"):
             if self.field_stack:
                 self.field_stack[-1][0].append(node.text or "")
@@ -1106,6 +1111,20 @@ class Reader:
             entry["form"] = form
             self.warn(FORM_FIELD_NOTE)
         self.fields.append(entry)
+
+    def form_state(self, form: dict[str, Any] | None) -> str:
+        """The prose for a legacy checkbox or dropdown form field, where its field begins.
+
+        Word writes no display text for these fields, so their recorded state is the prose:
+        a checkbox reads as Word's content-control glyphs, a dropdown as its selected entry
+        (nothing when none is selected). None render from an unselected mc:AlternateContent
+        copy, whose prose is read alongside the chosen copy's.
+        """
+        if form is None or self.unselected:
+            return ""
+        if form["type"] == "checkbox":
+            return self.emit(CHECKED if form["checked"] else UNCHECKED)
+        return self.emit(form["selected"] or "")
 
     def form_field(self, data: Element) -> dict[str, Any] | None:
         """The state of a legacy checkbox or dropdown form field from its w:ffData, else None.
