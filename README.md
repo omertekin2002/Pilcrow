@@ -444,8 +444,8 @@ diff, and a changed symbol `~ symbol 1
 (word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
 diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
 changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`,
-and an edited diagram node also shows as its `-`/`+` lines in the `[Diagram]`
-block of the prose diff.
+and an edited diagram node or chart label also shows as its `-`/`+` lines in the
+`[Diagram]` or `[Chart]` block of the prose diff.
 Edited image alt text reads `~ image 1 (word/document.xml) alt text: "A red cat"
 → "A blue dog"`, and edited WordArt text `~ WordArt 1 (word/document.xml):
 "SALE" → "CLOSED"`.
@@ -557,8 +557,8 @@ companions stale; the counters themselves are not shown in prose, and numbered
 headings are not compared.
 Complex tracked structure/layout is limited and reported. Text box text is shown
 between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
-box's position, wrapping, and shape formatting are not compared. Images, charts,
-and embedded objects are not rendered; images are recorded in
+box's position, wrapping, and shape formatting are not compared. Images and
+embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
 companions stale (size, position, and cropping are not compared). An image's alt
 text (its description, and its title when it has one) is recorded with it, so
@@ -589,15 +589,42 @@ shown:
 [/Diagram]
 ```
 
+A chart's labels are shown after its anchoring paragraph the same way: its title,
+axis titles, series names, and text categories, from the values Word cached in the
+chart part, so retitling a chart or renaming a series or category shows in the
+prose diff. Data values, numeric and date categories, data labels, and formatting
+are not shown, and a chart without any of these labels keeps its
+`[Unsupported drawing]` placeholder:
+
+```text
+[Chart]
+
+Title: Quarterly revenue
+Axis title: Quarter
+Axis title: Revenue (USD)
+Series: 2025
+Series: 2026
+Category: Q1
+Category: Q2
+Category: Q3
+
+[/Chart]
+```
+
+Categories every series shares are listed once, after the series; otherwise each
+series's categories follow its name. A chart lists at most 200 categories, then
+one `Category: … (N more)` line.
+
 Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
 (`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
 chart part, the diagram's data part, the embedding, the chunk), so editing a
 chart's values, a diagram's text, an embedded workbook, or a chunk, or adding or
 removing one, makes companions stale; renaming the part does not. The fingerprint
 covers the stored part, not how Word draws it, so a diagram edit that leaves its
-outline text unchanged (formatting stored in the data part, for example) still
-makes companions stale; a chart's own workbook and a diagram's layout, style, and
-colour parts are not compared. Charts and embedded objects are not rendered.
+outline text unchanged (formatting stored in the data part, for example), or a
+chart edit that only changes its values, still makes companions stale; a chart's
+own workbook and a diagram's layout, style, and colour parts are not compared.
+Embedded objects are not rendered.
 Legacy form fields (`FORMCHECKBOX`, `FORMDROPDOWN`), common in contract, HR, and
 government templates, keep their state outside the prose: Word writes no display
 text for them. Each checkbox's checked state and each dropdown's entries and
@@ -685,6 +712,13 @@ their prose now shows the diagram's text in a `[Diagram]` block and their covera
 warnings changed. Run `pilcrow export` and commit the refreshed companions. The
 diagram's `objects` entry is unchanged, and documents without SmartArt are
 unaffected.
+
+Upgrading from a version that showed every chart as `[Unsupported drawing]`:
+documents containing a chart with a title, axis title, series name, or text
+category report stale companions once, because their prose now shows those
+labels in a `[Chart]` block and their coverage warnings changed. Run `pilcrow
+export` and commit the refreshed companions. The chart's `objects` entry is
+unchanged, and documents without such a chart are unaffected.
 
 Run the generated-fixture suite:
 
