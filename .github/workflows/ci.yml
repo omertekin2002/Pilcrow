@@ -192,6 +192,23 @@ jobs:
           grep -Fx '### Prose' "$SUMMARY_FILE"
           grep -F 'now says something else' "$SUMMARY_FILE"
 
+      - name: Action writes a full summary with word marks
+        id: marked-summary
+        uses: ./
+        with:
+          root: ../pilcrow-fixture
+          summary: full
+          word-diff: true
+          base: ${{ steps.edit.outputs.base }}
+
+      - name: Marked summary shows the edited sentence once, with word marks
+        env:
+          SUMMARY_FILE: ${{ steps.marked-summary.outputs.summary-file }}
+        run: |
+          cat "$SUMMARY_FILE"
+          grep -E '^~ .*\[-.*-\].*\{\+.*\+\}' "$SUMMARY_FILE"
+          grep -Fx '~ The fixture report {+now +}says [-one thing-]{+something else+}.' "$SUMMARY_FILE"
+
       - name: Action writes an outline summary
         id: outline-summary
         uses: ./

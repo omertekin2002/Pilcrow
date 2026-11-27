@@ -2,7 +2,7 @@
 
 Internal to the Action (``action.yml``), not a ``pilcrow`` subcommand::
 
-    python -m pilcrow.summary --base REV --root ROOT --mode outline|full --output FILE
+    python -m pilcrow.summary --base REV --root ROOT --mode outline|full [--word-diff] --output FILE
 
 It compares from the merge base of the base revision and ``HEAD``, as GitHub's Files
 changed view does, so edits made on the base branch after ``HEAD`` forked from it are
@@ -15,7 +15,10 @@ annotation, never a failed job: the Action's outcome stays ``pilcrow check``'s.
 
 ``outline`` publishes no document text: only paths, statuses, and the titles of the
 report sections that differ, with counts. ``full`` publishes each document's
-``pilcrow review --format markdown`` report.
+``pilcrow review --format markdown`` report. ``--word-diff`` (the Action's
+``word-diff`` input) marks the changed words of replaced prose lines that pair up,
+as ``pilcrow review --word-diff`` does; it changes only ``full`` reports, and
+``outline`` output is the same with or without it.
 """
 
 from __future__ import annotations
@@ -100,11 +103,13 @@ def changed(root: Path, base: str, head: str) -> list[tuple[str, str]]:
     return sorted(((status[:1], path) for status, path in pairs if eligible(Path(path))), key=lambda p: p[1])
 
 
-def compare(root: Path, path: str, base: str, head: str) -> Document:
-    """Read ``path`` at both revisions and compare them; a read error is reported, not raised."""
+def compare(root: Path, path: str, base: str, head: str, marks: bool = False) -> Document:
+    """Read ``path`` at both revisions and compare them; a read error is reported, not raised.
+
+    ``marks`` marks the changed words of replaced prose lines that pair up (``--word-diff``)."""
     try:
         old, new = (extract(revision_blob(root / path, rev, MAX_PACKAGE_BYTES)) for rev in (base, head))
-        report = build(old, new)
+        report = build(old, new, marks)
     except Exception as exc:  # any failure, not only DocumentError: one document must never stop the others
         return Document(path, "could not be read", error=shown(str(exc)) or type(exc).__name__)
     return Document(path, "changed" if report.changed else "no supported changes", report)
@@ -151,8 +156,10 @@ def problem(reason: str, plain: str | None = None) -> str:
     return f"{TITLE}\n\nNo review: {reason}\n"
 
 
-def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
-    """The summary Markdown for ``root``, shown as ``label``. Never raises for a base or document problem."""
+def summarize(root: Path, base: str, mode: str, label: str = ".", marks: bool = False) -> str:
+    """The summary Markdown for ``root``, shown as ``label``. Never raises for a base or document problem.
+
+    ``marks`` (``--word-diff``) marks changed words in ``full`` reports; ``outline`` ignores it."""
     base = base.strip()
     if not base or re.fullmatch(r"0+", base):
         return problem("there is no base revision to compare with, as on the first push of a new branch.")
@@ -196,7 +203,7 @@ def summarize(root: Path, base: str, mode: str, label: str = ".") -> str:
             elif status == "D":
                 document = Document(path, "removed")
             else:
-                document = compare(root, path, fork, head)
+                document = compare(root, path, fork, head, marks and mode == "full")
                 if document.error is not None:
                     annotate(f"Pilcrow could not read {shown(path)}: {document.error}")
             text = block(document, mode, short_base, short_head)
@@ -225,6 +232,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base", required=True, help="the revision to compare from; the new side is HEAD")
     parser.add_argument("--root", default=".", help="document repository root (default: current directory)")
     parser.add_argument("--mode", choices=MODES, required=True)
+    parser.add_argument("--word-diff", action="store_true",
+                        help="in full mode, mark the changed words of replaced prose lines that pair up")
     parser.add_argument("--output", type=Path, required=True, help="the Markdown file to write")
     # A piped stdout on Windows uses the ANSI code page; escape what it cannot encode, as the CLI does.
     if hasattr(sys.stdout, "reconfigure"):
@@ -235,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         content = problem(f"--root is not an existing directory: {code(args.root)}",
                           f"--root is not an existing directory: {args.root}")
     else:
-        content = summarize(root, args.base, args.mode, args.root)
+        content = summarize(root, args.base, args.mode, args.root, args.word_diff)
     try:
         args.output.write_text(content, encoding="utf-8", errors="backslashreplace", newline="\n")
     except OSError as exc:

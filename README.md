@@ -301,6 +301,19 @@ inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8
   repeats this warning at the top. Choose `outline` when the text must not leave
   the repository.
 
+With `summary: full`, the optional `word-diff` input (default `false`) marks the
+changed words inside a replaced sentence, as
+[`pilcrow review --word-diff`](#review-a-change-in-words) does, so a one-word edit
+shows as one `~ ` line instead of a whole `-` line and a whole `+` line. It
+publishes no more text than `full` already does, and `outline` ignores it. The
+`word-diff` input first ships in the release after v0.1.9.
+
+```yaml
+        with:
+          summary: full
+          word-diff: true      # optional, default false; only for summary: full
+```
+
 The new side is always `HEAD`, and the old side is the merge base of `base` and
 `HEAD`, the commit `HEAD` forked from, as in GitHub's Files changed view. So the
 summary shows what the pull request changes whether the workflow checks out the
@@ -314,7 +327,8 @@ rules as `pilcrow check --all`. A renamed document is listed as removed and
 added, and an added or removed one has no report.
 
 The summary step is read-only and never fails the job (only a `summary` value
-other than `none`, `outline` or `full` does): it runs even when the
+other than `none`, `outline` or `full`, or a `word-diff` value other than `true`
+or `false`, does): it runs even when the
 check fails, and the action's outcome stays the check's. When the base is missing
 (the first push of a new branch), not in the checkout (the default shallow
 `fetch-depth: 1` clone), or shares no history with `HEAD` (unrelated histories,
@@ -530,7 +544,9 @@ the whole old and new lines are shown as `-` and `+`, exactly as without the
 flag. Dropping the added words and the brackets gives the old sentence back
 exactly; dropping the removed words and the braces gives the new one. Without
 `--word-diff` the report is unchanged, and the flag changes no exit code,
-companion, `textconv` output, or Action job summary.
+companion, `textconv` output, or Action job summary. The Action has its own
+opt-in input for the same marks in its `full` job summary: see
+[`word-diff`](#review-report-in-the-job-summary-optional).
 
 The report shows only what Pilcrow's extraction supports: formatting, layout,
 and anything else outside the prose and `.meta.json` are not compared, so "No
