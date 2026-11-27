@@ -10,8 +10,9 @@ import io
 import json
 import posixpath
 import re
+from bisect import bisect_right
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias
@@ -55,7 +56,8 @@ TEXTPATH = f"{{{VML}}}textpath"
 # Objects whose content lives in a package part: a DrawingML chart, a SmartArt diagram's
 # data part (r:dm; its layout, quick-style and colour parts are formatting), and an OLE
 # object. w:altChunk is the fourth, an imported chunk.
-CHART = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
+CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+CHART = f"{{{CHART_NS}}}chart"
 DIAGRAM = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}relIds"
 OLE_OBJECT = "{urn:schemas-microsoft-com:office:office}OLEObject"
 # Shape content that a rendered text box still leaves out of the prose.
@@ -72,6 +74,14 @@ DIAGRAM_UNREACHED_NOTE = ("Some SmartArt diagram text is not connected to the di
                           "it is shown at the top level after the outline.")
 # Outline levels deeper than this are indented as this level, as list items are.
 MAX_DIAGRAM_INDENT = 20
+# A chart part's labels (c:chartSpace/c:chart): its title, axis titles, series names and string
+# categories, from rich text or the cached values Word displays. Data values are not prose.
+CHART_NOTE = ("Chart titles, axis titles, series names and text categories are shown in [Chart] blocks after "
+              "their anchoring paragraph, from the chart's cached values; data values, numeric categories, "
+              "data labels and formatting are not shown, and the chart part is fingerprinted in objects.")
+CHART_AXES = frozenset(f"{{{CHART_NS}}}{name}" for name in ("catAx", "valAx", "dateAx", "serAx"))
+# Category lines shown per chart; the rest are counted in one "(N more)" line.
+MAX_CHART_CATEGORIES = 200
 LIST_NOTE = ("List boundaries and indentation are retained; bullet and number formats are recorded in "
              "metadata, but counter values and bullet glyphs are not reconstructed.")
 UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
@@ -271,6 +281,85 @@ def equation_hash(node: Element) -> str:
     return hashlib.sha256(form.encode("utf-8")).hexdigest()
 
 
+def ch(name: str) -> str:
+    return f"{{{CHART_NS}}}{name}"
+
+
+def drawing_text(paragraphs: Iterable[Element]) -> str:
+    """DrawingML text: each a:p's runs, fields and breaks (as a space), normalised, joined by a space."""
+    found = []
+    for para in paragraphs:
+        parts: list[str] = []
+        for child in para:
+            if child.tag in {f"{{{A}}}r", f"{{{A}}}fld"}:
+                parts.extend(t.text or "" for t in child.findall(f"{{{A}}}t"))
+            elif child.tag == f"{{{A}}}br":
+                parts.append(" ")
+        found.append(normalize("".join(parts)))
+    return " ".join(p for p in found if p)
+
+
+def chart_points(cache: Element) -> dict[int, str]:
+    """A string cache's (or literal's) point texts by index, normalised; the first point per index wins."""
+    points: dict[int, str] = {}
+    for point in cache.findall(ch("pt")):
+        index = decimal(point.get("idx", ""))
+        value = point.find(ch("v"))
+        if index is not None:
+            points.setdefault(index, normalize("" if value is None else value.text or ""))
+    return points
+
+
+def chart_text(tx: Element | None) -> str:
+    """A chart label's text (c:tx): rich text, else a cached string reference, else a literal value."""
+    if tx is None:
+        return ""
+    rich = tx.find(ch("rich"))
+    if rich is not None:
+        return drawing_text(rich.findall(f"{{{A}}}p"))
+    cache = tx.find(f"{ch('strRef')}/{ch('strCache')}")
+    if cache is not None:
+        points = chart_points(cache)
+        return normalize(" ".join(points[i] for i in sorted(points)))
+    value = tx.find(ch("v"))
+    return "" if value is None else normalize(value.text or "")
+
+
+def chart_categories(cat: Element | None) -> list[str]:
+    """A series's string category labels (c:cat) in index order; numeric and date categories have none.
+
+    A multi-level category joins its levels from the outermost to the innermost with " / ";
+    an outer label covers every index from its own up to the next outer label.
+    """
+    if cat is None:
+        return []
+    for path in (f"{ch('strRef')}/{ch('strCache')}", ch("strLit")):
+        cache = cat.find(path)
+        if cache is not None:
+            points = chart_points(cache)
+            return [points[i] for i in sorted(points) if points[i]]
+    cache = cat.find(f"{ch('multiLvlStrRef')}/{ch('multiLvlStrCache')}")
+    if cache is None:
+        return []
+    # c:lvl elements run from the innermost level outwards.
+    levels = [chart_points(level) for level in cache.findall(ch("lvl"))]
+    starts = [sorted(level) for level in levels]
+    labels = []
+    for index in sorted({i for level in levels for i in level}):
+        parts = []
+        for depth in reversed(range(len(levels))):
+            if depth == 0:
+                text = levels[0].get(index, "")
+            else:
+                at = bisect_right(starts[depth], index)
+                text = levels[depth][starts[depth][at - 1]] if at else ""
+            if text:
+                parts.append(text)
+        if parts:
+            labels.append(" / ".join(parts))
+    return labels
+
+
 def size_label(size: int) -> str:
     """A byte limit in the unit it is written in: "16 MiB", "1 GiB"."""
     return f"{size // 1024 // MIB} GiB" if size % (1024 * MIB) == 0 else f"{size // MIB} MiB"
@@ -381,10 +470,12 @@ class Reader:
         self.rels: Relationships = {}
         self.features: Counter[str] = Counter()
         # Text boxes found while reading a paragraph, rendered as blocks after it, and the
-        # [Diagram] blocks of SmartArt diagrams, already rendered.
+        # [Chart] and [Diagram] blocks of charts and SmartArt diagrams, already rendered.
         self.anchored: list[list[Element | str]] = []
         # Diagram data part -> its outline lines, or None when it has no text-bearing points.
         self.diagram_outlines: dict[str, list[str] | None] = {}
+        # Chart part -> its label lines; empty when it has none.
+        self.chart_labels: dict[str, list[str]] = {}
         # The current story part's rendered text in fragments, in the accepted view, so a
         # comment range is the fragments between the offsets of its start and end markers.
         self.story: list[str] = []
@@ -502,8 +593,8 @@ class Reader:
         return [box for child in node for box in self.text_boxes(child)]
 
     def unrendered_shape_parts(self, node: Element, rendered: frozenset[Element] = frozenset()) -> bool:
-        """Whether a shape holding text boxes or ``rendered`` diagrams also holds pictures, charts
-        or diagrams outside them."""
+        """Whether a shape holding text boxes or ``rendered`` charts and diagrams also holds
+        pictures, charts or diagrams outside them."""
         if node.tag == w("txbxContent") or node in rendered:
             return False
         if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
@@ -749,13 +840,13 @@ class Reader:
                 self.comment_marker(descendant)
 
     def anchor(self, node: Element) -> tuple[str, list[str]]:
-        """Read ``node`` inline and render the text boxes and diagrams it anchors as separate blocks."""
+        """Read ``node`` inline and render the text boxes, charts and diagrams it anchors as separate blocks."""
         text, boxes = self.anchor_boxes(node)
         return text, [self.anchored_block(box) for box in boxes]
 
     def anchor_boxes(self, node: Element) -> tuple[str, list[Element | str]]:
         """Read ``node`` inline and return the text boxes it anchors, not yet rendered, and its
-        rendered [Diagram] blocks."""
+        rendered [Chart] and [Diagram] blocks."""
         self.anchored.append([])
         text = self.inline(node)
         return text, self.anchored.pop()
@@ -831,16 +922,72 @@ class Reader:
 
     def diagram_text(self, point: Element) -> str:
         """A point's text: each dgm:t paragraph's runs, fields and breaks, normalised, joined by a space."""
-        paragraphs = []
-        for para in point.findall(f"{{{DGM}}}t/{{{A}}}p"):
-            parts: list[str] = []
-            for child in para:
-                if child.tag in {f"{{{A}}}r", f"{{{A}}}fld"}:
-                    parts.extend(t.text or "" for t in child.findall(f"{{{A}}}t"))
-                elif child.tag == f"{{{A}}}br":
-                    parts.append(" ")
-            paragraphs.append(normalize("".join(parts)))
-        return " ".join(p for p in paragraphs if p)
+        return drawing_text(point.findall(f"{{{DGM}}}t/{{{A}}}p"))
+
+    def chart(self, node: Element) -> str | None:
+        """A chart's [Chart] block, or None when its part is missing, external, or holds no
+        labels, so the drawing keeps its placeholder."""
+        rid = node.get(f"{{{R}}}id")
+        rel = self.rels.get(rid) if rid else None
+        if rel is None or rel[2] or rel[1] not in self.names:
+            return None
+        if rel[1] not in self.chart_labels:
+            self.chart_labels[rel[1]] = self.chart_lines(self.xml(rel[1]))
+        lines = self.chart_labels[rel[1]]
+        if not lines:
+            return None
+        self.features["charts"] += 1
+        self.warn(CHART_NOTE)
+        return "\n\n".join(("[Chart]", "\n".join(lines), "[/Chart]"))
+
+    def chart_lines(self, space: Element) -> list[str]:
+        """A chart part's label lines: the title, axis titles in document order, then series
+        names in document order with their string categories, at most MAX_CHART_CATEGORIES.
+
+        Categories every series shares are listed once after the series; otherwise each
+        series's categories follow its name.
+        """
+        chart = space.find(ch("chart")) if space.tag == ch("chartSpace") else None
+        if chart is None:
+            return []
+        lines = []
+        title, deleted = chart.find(ch("title")), chart.find(ch("autoTitleDeleted"))
+        # CT_Boolean: a missing val means true. Word's automatic title is never inferred.
+        removed = deleted is not None and on_off(deleted.get("val", "1"))
+        if title is not None and not removed and (text := chart_text(title.find(ch("tx")))):
+            lines.append(f"Title: {text}")
+        plot = chart.find(ch("plotArea"))
+        if plot is None:
+            return lines
+        for axis in plot:
+            heading = axis.find(ch("title")) if axis.tag in CHART_AXES else None
+            if heading is not None and (text := chart_text(heading.find(ch("tx")))):
+                lines.append(f"Axis title: {text}")
+        # Every chart-type group (c:barChart, c:lineChart, c:pieChart, ...) holds its series.
+        series = [(chart_text(ser.find(ch("tx"))), chart_categories(ser.find(ch("cat"))))
+                  for group in plot if group.tag.startswith(f"{{{CHART_NS}}}") and group.tag.endswith("Chart")
+                  for ser in group.findall(ch("ser"))]
+        lists = [categories for _, categories in series if categories]
+        shared = all(categories == lists[0] for categories in lists)
+        labels: list[tuple[str, str]] = []  # (kind, text)
+        for name, categories in series:
+            if name:
+                labels.append(("Series", name))
+            if not shared:
+                labels.extend(("Category", category) for category in categories)
+        if shared and lists:
+            labels.extend(("Category", category) for category in lists[0])
+        counted = 0
+        hidden = sum(kind == "Category" for kind, _ in labels) - MAX_CHART_CATEGORIES
+        for kind, text in labels:
+            if kind == "Category":
+                counted += 1
+                if counted == MAX_CHART_CATEGORIES + 1:
+                    lines.append(f"Category: … ({hidden} more)")
+                if counted > MAX_CHART_CATEGORIES:
+                    continue
+            lines.append(f"{kind}: {text}")
+        return lines
 
     def text_box(self, box: Element) -> str:
         self.features["text boxes"] += 1
@@ -925,10 +1072,10 @@ class Reader:
             self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
-            if not self.unrendered_shape_parts(node, self.anchor_diagrams(node)):
+            if not self.unrendered_shape_parts(node, self.anchor_objects(node)):
                 return ""
         elif (tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"} and self.anchored
-              and (rendered := self.anchor_diagrams(node)) and not self.unrendered_shape_parts(node, rendered)):
+              and (rendered := self.anchor_objects(node)) and not self.unrendered_shape_parts(node, rendered)):
             return ""
         if local in {"drawing", "pict", "object", "txbxContent", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
@@ -938,17 +1085,19 @@ class Reader:
             return ""
         return "".join(self.inline(child) for child in node)
 
-    def anchor_diagrams(self, node: Element) -> frozenset[Element]:
-        """Render the SmartArt diagrams in a drawing as anchored blocks; return those that rendered.
+    def anchor_objects(self, node: Element) -> frozenset[Element]:
+        """Render the charts and SmartArt diagrams in a drawing as anchored blocks, in document
+        order; return those that rendered.
 
-        They are found as objects are, so diagrams in text boxes render with the box, and none
+        They are found as objects are, so those in text boxes render with the box, and none
         render from an unselected mc:AlternateContent copy.
         """
         if self.unselected:
             return frozenset()
         rendered = []
         for found in self.object_nodes(node):
-            if found.tag == DIAGRAM and (block := self.diagram(found)) is not None:
+            block = self.chart(found) if found.tag == CHART else self.diagram(found) if found.tag == DIAGRAM else None
+            if block is not None:
                 self.anchored[-1].append(block)
                 rendered.append(found)
         return frozenset(rendered)
