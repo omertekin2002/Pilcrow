@@ -29,9 +29,11 @@ try:
         alt_chunk,
         anchored,
         chart,
+        chart_parts,
         checkbox,
         comments_extended,
         comments_part,
+        crossed_chart,
         described_picture,
         dropdown,
         end,
@@ -45,10 +47,13 @@ try:
         numbering,
         object_parts,
         ole_object,
+        outline,
         paragraph,
         picture,
+        quarterly,
         rel,
         run,
+        smartart,
         start,
         symbol,
         vml_wordart,
@@ -67,9 +72,11 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         alt_chunk,
         anchored,
         chart,
+        chart_parts,
         checkbox,
         comments_extended,
         comments_part,
+        crossed_chart,
         described_picture,
         dropdown,
         end,
@@ -83,10 +90,13 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         numbering,
         object_parts,
         ole_object,
+        outline,
         paragraph,
         picture,
+        quarterly,
         rel,
         run,
+        smartart,
         start,
         symbol,
         vml_wordart,
@@ -482,7 +492,10 @@ class ReviewTests(unittest.TestCase):
     def test_ticking_a_form_checkbox(self) -> None:
         self.write_forms(checkbox("0"), checkbox("1"))
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        # The box's state is prose, so the answer changes the line it sits on, too.
+        self.assertIn("\n-Sublet: \u2610\n+Sublet: \u2612\n", report)
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Sublet: [-\u2610-]{+\u2612+}\n", marked)
         self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked → checked'])
         self.write_forms(checkbox(None, "1"), checkbox(None, "0"))
@@ -492,11 +505,16 @@ class ReviewTests(unittest.TestCase):
     def test_choosing_another_dropdown_entry(self) -> None:
         self.write_forms(dropdown("Yes", "No", result="0"), dropdown("Yes", "No", result="1"))
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        self.assertIn("\n-Sublet: Yes\n+Sublet: No\n", report)
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Sublet: [-Yes-]{+No+}\n", marked)
         self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"'])
         self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", "Maybe", result="1"))
-        self.assertEqual(self.section(self.review(), "Fields"),
+        report = self.review()
+        # The entry list is not prose: with the same selection, only the Fields line moves.
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed'])
         self.write_forms(dropdown("Yes", "No", result="0"), dropdown("No", "Yes", result="0"))
         self.assertEqual(self.section(self.review(), "Fields"),
@@ -682,13 +700,62 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(edit=edit):
                 self.write_objects(self.new, **edit)
                 report = self.review()
-                self.assertIn("Prose: no changes", report)
+                if "node" in edit:  # a diagram's text is prose
+                    self.assertIn("\n-- Plan\n+- Build\n", report)
+                else:
+                    self.assertIn("Prose: no changes", report)
                 self.assertEqual(self.section(report, title), [line])
                 self.assertNotIn("Equations and symbols", report)
                 markdown = self.markdown()
                 self.assertIn(f"### {title}\n\n- `~` {line[2:]}\n", markdown)
         self.write_objects(self.new)
         self.assertNotIn(title, self.review(code=0))
+
+    def test_a_diagram_node_edit_shows_in_the_prose_diff(self) -> None:
+        def write(path: Path, step: str) -> None:
+            data = outline(("1", "0", "Plan"), ("2", "1", step), ("3", "0", "Review"))
+            make_docx(path, f'<w:p>{run("Steps:")}<w:r>{smartart("dgm")}</w:r></w:p>',
+                      extra={"word/diagrams/data1.xml": data}, relationships=rel("dgm", "diagramData", "diagrams/data1.xml"))
+
+        write(self.old, "Gather the requirements")
+        write(self.new, "Gather the needs")
+        report = self.review()
+        self.assertIn("\n [Diagram]\n \n - Plan\n-  - Gather the requirements\n+  - Gather the needs\n - Review\n", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ diagram 1 (word/document.xml) changed"])
+        self.assertIn("\n-  - Gather the requirements\n+  - Gather the needs\n", self.markdown())
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~   - Gather the [-requirements-]{+needs+}\n", marked)
+
+    def test_a_chart_series_rename_shows_in_the_prose_diff(self) -> None:
+        def write(path: Path, series: str) -> None:
+            make_docx(path, anchored("Figure:", chart("chart")), extra=chart_parts(quarterly(series)),
+                      relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(self.old, "2026")
+        write(self.new, "2026 forecast")
+        report = self.review()
+        self.assertIn("\n Series: 2025\n-Series: 2026\n+Series: 2026 forecast\n Category: Q1\n", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
+        self.assertIn("\n-Series: 2026\n+Series: 2026 forecast\n", self.markdown())
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Series: 2026{+ forecast+}\n", marked)
+
+    def test_a_save_that_renumbers_chart_axes_is_no_change(self) -> None:
+        # LibreOffice gives every c:axId and c:crossAx a new random value on each save (#77).
+        def write(path: Path, ids: tuple[str, str], value: str = "10") -> None:
+            make_docx(path, anchored("Figure:", chart("chart")), extra=chart_parts(crossed_chart(ids, value=value)),
+                      relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(self.old, ("77217256", "2760290"))
+        write(self.new, ("90904435", "24668023"))
+        report = self.review(code=0)
+        self.assertIn("Prose: no changes", report)
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        write(self.new, ("90904435", "24668023"), value="99")
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
 
     def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
         self.write_objects(self.old)

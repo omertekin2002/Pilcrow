@@ -301,6 +301,19 @@ inputs first ship in the release after v0.1.7; the snippet below assumes `v0.1.8
   repeats this warning at the top. Choose `outline` when the text must not leave
   the repository.
 
+With `summary: full`, the optional `word-diff` input (default `false`) marks the
+changed words inside a replaced sentence, as
+[`pilcrow review --word-diff`](#review-a-change-in-words) does, so a one-word edit
+shows as one `~ ` line instead of a whole `-` line and a whole `+` line. It
+publishes no more text than `full` already does, and `outline` ignores it. The
+`word-diff` input first ships in the release after v0.1.9.
+
+```yaml
+        with:
+          summary: full
+          word-diff: true      # optional, default false; only for summary: full
+```
+
 The new side is always `HEAD`, and the old side is the merge base of `base` and
 `HEAD`, the commit `HEAD` forked from, as in GitHub's Files changed view. So the
 summary shows what the pull request changes whether the workflow checks out the
@@ -314,7 +327,8 @@ rules as `pilcrow check --all`. A renamed document is listed as removed and
 added, and an added or removed one has no report.
 
 The summary step is read-only and never fails the job (only a `summary` value
-other than `none`, `outline` or `full` does): it runs even when the
+other than `none`, `outline` or `full`, or a `word-diff` value other than `true`
+or `false`, does): it runs even when the
 check fails, and the action's outcome stays the check's. When the base is missing
 (the first push of a new branch), not in the checkout (the default shallow
 `fetch-depth: 1` clone), or shares no history with `HEAD` (unrelated histories,
@@ -390,8 +404,8 @@ would contain and writes nothing. Coverage warnings go to stderr, so they can
 appear in the terminal alongside the diff. Because Git converts each revision on
 demand, this also works for history committed before you used Pilcrow, with no
 companions. It shows prose only: changes recorded in `.meta.json`, such as
-comments, list formats, images and their alt text, WordArt text, form
-checkbox and dropdown state, and tracked-change authors, do not appear, so it does not replace companions,
+comments, list formats, images and their alt text, WordArt text, dropdown
+entry lists, and tracked-change authors, do not appear, so it does not replace companions,
 `pilcrow check`, or review in Word. Whether
 GitHub Desktop uses the driver is **untested**.
 
@@ -443,13 +457,16 @@ clarify."`, `~ link "Report": https://old.example → https://new.example`, or
 diff, and a changed symbol `~ symbol 1
 (word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
 diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
-changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`.
+changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`,
+and an edited diagram node or chart label also shows as its `-`/`+` lines in the
+`[Diagram]` or `[Chart]` block of the prose diff.
 Edited image alt text reads `~ image 1 (word/document.xml) alt text: "A red cat"
 → "A blue dog"`, and edited WordArt text `~ WordArt 1 (word/document.xml):
 "SALE" → "CLOSED"`.
 Ticking a legacy form checkbox reads `~ field 1 (FORMCHECKBOX "Check1")
 in word/document.xml: unchecked → checked`, and choosing another dropdown entry
-`~ field 2 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"`. A comment is called resolved, reopened,
+`~ field 2 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"`; the
+new state also shows as the changed prose line the field sits on. A comment is called resolved, reopened,
 re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
@@ -527,7 +544,9 @@ the whole old and new lines are shown as `-` and `+`, exactly as without the
 flag. Dropping the added words and the brackets gives the old sentence back
 exactly; dropping the removed words and the braces gives the new one. Without
 `--word-diff` the report is unchanged, and the flag changes no exit code,
-companion, `textconv` output, or Action job summary.
+companion, `textconv` output, or Action job summary. The Action has its own
+opt-in input for the same marks in its `full` job summary: see
+[`word-diff`](#review-report-in-the-job-summary-optional).
 
 The report shows only what Pilcrow's extraction supports: formatting, layout,
 and anything else outside the prose and `.meta.json` are not compared, so "No
@@ -542,6 +561,41 @@ with `-`. A file added or deleted in the commit has no other side to compare, so
 it reports an error. `git difftool` ignores the exit code unless you pass
 `--trust-exit-code`.
 
+### Review a whole branch
+
+To review every DOCX a branch or a range of commits changed before you push,
+give `--all` instead of a path (`--all` first ships in the release after v0.1.9):
+
+```sh
+pilcrow review --rev main --all                          # main → working copy
+pilcrow review --rev main --all --merge-base             # only what this branch changed since it left main
+pilcrow review --rev main --rev feature --all --format markdown
+```
+
+It lists the changed documents with Git and prints one report per document, in
+path order, each headed by its path in the repository, such as
+`Review: main:docs/a.docx → docs/a.docx`. A document that was added or removed
+gets a single line, `Added: docs/c.docx` or `Removed: main:docs/d.docx` (a
+heading in Markdown). Renames are not detected, so a renamed document shows as
+removed and added. `--format markdown` and `--word-diff` work as above.
+
+- **One `--rev`** compares that revision with the working copy, including
+  uncommitted edits. Untracked documents count as added unless Git ignores them.
+- **Two `--rev`s** compare the two revisions; the working copy is not read.
+- **`--merge-base`** compares from where the branch left the first revision
+  (`git merge-base REV REV2`, or `REV` and `HEAD` with one `--rev`), as
+  `git diff --merge-base` does, so edits made on `main` since then are left
+  out. The header names the merge-base commit.
+- **`--root`** limits the review to a folder, as in `export` and `check`; the
+  default is the current directory. As there, Word lock files (`~$*.docx`) and
+  anything under `.pilcrow/` are skipped.
+
+It is read-only, like the single-document form. A document that cannot be read
+is an error on stderr naming its path, and the other documents are still
+reported. It exits 2 if any revision or document could not be read, 1 if any
+document changed, was added or was removed, and 0 otherwise. When no document
+changed, it prints `No DOCX documents changed.` and exits 0.
+
 In CI, the GitHub Action can publish these reports for every changed document in
 the job summary; see [Review report in the job summary](#review-report-in-the-job-summary-optional).
 
@@ -555,8 +609,8 @@ companions stale; the counters themselves are not shown in prose, and numbered
 headings are not compared.
 Complex tracked structure/layout is limited and reported. Text box text is shown
 between `[Text box]` and `[/Text box]` markers after its anchoring paragraph; the
-box's position, wrapping, and shape formatting are not compared. Images, charts,
-and embedded objects are not rendered; images are recorded in
+box's position, wrapping, and shape formatting are not compared. Images and
+embedded objects are not rendered; images are recorded in
 metadata by content hash, so swapping, adding, removing, or reordering one makes
 companions stale (size, position, and cropping are not compared). An image's alt
 text (its description, and its title when it has one) is recorded with it, so
@@ -572,19 +626,69 @@ fingerprint of their OMML structure and text (formatting and revision IDs left o
 and by font and character code, so editing, adding, or removing one makes
 companions stale even where the linear text does not show the change. Symbols stay
 `[Unsupported sym]` in prose.
+SmartArt diagram text is shown as an outline after its anchoring paragraph, so an
+edit to a node shows in the prose diff; layout, shapes, and formatting are not
+shown:
+
+```text
+[Diagram]
+
+- Plan
+  - Gather requirements
+  - Draft the outline
+- Review
+
+[/Diagram]
+```
+
+A chart's labels are shown after its anchoring paragraph the same way: its title,
+axis titles, series names, and text categories, from the values Word cached in the
+chart part, so retitling a chart or renaming a series or category shows in the
+prose diff. Data values, numeric and date categories, data labels, and formatting
+are not shown, and a chart without any of these labels keeps its
+`[Unsupported drawing]` placeholder:
+
+```text
+[Chart]
+
+Title: Quarterly revenue
+Axis title: Quarter
+Axis title: Revenue (USD)
+Series: 2025
+Series: 2026
+Category: Q1
+Category: Q2
+Category: Q3
+
+[/Chart]
+```
+
+Categories every series shares are listed once, after the series; otherwise each
+series's categories follow its name. A chart lists at most 200 categories, then
+one `Category: … (N more)` line.
+
 Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
 (`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
 chart part, the diagram's data part, the embedding, the chunk), so editing a
 chart's values, a diagram's text, an embedded workbook, or a chunk, or adding or
-removing one, makes companions stale; renaming the part does not. The fingerprint
-covers the stored part, not how Word draws it; a chart's own workbook and a
-diagram's layout, style, and colour parts are not compared.
+removing one, makes companions stale; renaming the part does not. A chart part is
+hashed with its axis IDs (`c:axId`, `c:crossAx`) numbered in order of appearance,
+because LibreOffice writes new random ones on every save; which axis crosses which
+still counts. The fingerprint covers the stored part, not how Word draws it, so a diagram edit that leaves its
+outline text unchanged (formatting stored in the data part, for example), or a
+chart edit that only changes its values, still makes companions stale; a chart's
+own workbook and a diagram's layout, style, and colour parts are not compared.
+Embedded objects are not rendered.
 Legacy form fields (`FORMCHECKBOX`, `FORMDROPDOWN`), common in contract, HR, and
-government templates, keep their state outside the prose: Word writes no display
+government templates, keep their state outside the text: Word writes no display
 text for them. Each checkbox's checked state and each dropdown's entries and
-selected entry are recorded with the field in metadata, so ticking a box or
-choosing another entry makes companions stale; the state is not shown in the
-prose. A text form field's value is its display text, already in the prose.
+selected entry are recorded with the field in metadata, and the state is shown in
+the prose where the field sits: a checkbox as `☒` (checked) or `☐` (unchecked),
+the glyphs Word's content-control checkboxes use, and a dropdown as its selected
+entry's text (nothing when no entry is selected). So `Agree: ☐ Terms: Net 30`
+becomes `Agree: ☒ Terms: Net 60` in the prose diff when the box is ticked and
+another entry chosen. A changed list of dropdown entries is in metadata only.
+A text form field's value is its display text, already in the prose.
 Content-control checkboxes need nothing extra, because their glyph is prose text.
 Comments stay out of the prose; their text, author, and anchored text (the
 accepted text their range covers, and the part it is in) are recorded in metadata,
@@ -648,6 +752,14 @@ with any legacy form field no longer warn about its `w:ffData`). Run `pilcrow
 export` and commit the refreshed companions. Documents without legacy form
 fields are unaffected.
 
+Upgrading from a version that did not show legacy form field state in prose:
+documents containing a checkbox or dropdown form field report stale companions
+once, because their prose now shows each checkbox as `☒` or `☐` and each
+dropdown's selected entry where the field sits, and their coverage warnings
+changed. Run `pilcrow export` and commit the refreshed companions. Field
+metadata is unchanged, and documents without a legacy checkbox or dropdown
+(including those with only text form fields) are unaffected.
+
 Upgrading from a version that did not record image alt text and WordArt text:
 documents containing an image with alt text, or legacy VML WordArt, report stale
 companions once, because their image entries in `.meta.json` now have an `alt`
@@ -659,6 +771,30 @@ documents containing an equation report stale companions once, because their
 prose now shows each equation as `[Math: …]` text and their coverage warnings
 changed. Run `pilcrow export` and commit the refreshed companions. Documents
 without equations are unaffected.
+
+Upgrading from a version that showed SmartArt diagrams as `[Unsupported drawing]`:
+documents containing a SmartArt diagram report stale companions once, because
+their prose now shows the diagram's text in a `[Diagram]` block and their coverage
+warnings changed. Run `pilcrow export` and commit the refreshed companions. The
+diagram's `objects` entry is unchanged, and documents without SmartArt are
+unaffected.
+
+Upgrading from a version that showed every chart as `[Unsupported drawing]`:
+documents containing a chart with a title, axis title, series name, or text
+category report stale companions once, because their prose now shows those
+labels in a `[Chart]` block and their coverage warnings changed. Run `pilcrow
+export` and commit the refreshed companions. The chart's `objects` entry is
+unchanged, and documents without such a chart are unaffected.
+
+Upgrading from a version that hashed chart parts byte for byte, or that warned
+about the drawing markup around pictures, charts and SmartArt diagrams and about
+the `annotationRef` mark in comments: documents containing a chart, a picture, a
+SmartArt diagram or a comment report stale companions once, because a chart's
+`objects` hash now ignores axis ID renumbering and those generic
+`Unsupported Word construct …` / `Unsupported XML construct …` warnings are gone
+(the specific chart, diagram, image and placeholder notes stay). Their prose is
+unchanged. Run `pilcrow export` and commit the refreshed companions. Documents
+without any of these are unaffected.
 
 Run the generated-fixture suite:
 

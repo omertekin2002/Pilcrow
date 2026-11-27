@@ -113,12 +113,13 @@ class SummaryTests(unittest.TestCase):
         self.git("commit", "-q", "--allow-empty", "-m", message)
         return self.git("rev-parse", "HEAD").strip()
 
-    def summarize(self, base: str, mode: str = "outline", root: Path | None = None) -> tuple[str, str]:
+    def summarize(self, base: str, mode: str = "outline", root: Path | None = None,
+                  word_diff: bool = False) -> tuple[str, str]:
         """Run the module in-process; return the summary and what it printed (its annotations)."""
         printed = io.StringIO()
         with redirect_stdout(printed):
             code = summary.main([f"--base={base}", f"--root={root or self.repo}", f"--mode={mode}",
-                                 f"--output={self.output}"])
+                                 *(["--word-diff"] if word_diff else []), f"--output={self.output}"])
         self.assertEqual(code, 0, printed.getvalue())
         return self.output.read_text(encoding="utf-8"), printed.getvalue()
 
@@ -379,6 +380,16 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("good.docx", text)
             self.assertIn("Prose changed" if mode == "outline" else "+After.", text)
 
+    def test_a_nested_repository_does_not_hide_a_listed_document(self) -> None:
+        make_docx(self.repo / "sub" / "a.docx", paragraph("Before."))
+        base = self.commit("first")
+        make_docx(self.repo / "sub" / "a.docx", paragraph("After."))
+        self.commit("second")
+        self.git("init", "-q", cwd=self.repo / "sub")  # a repository appears on the listed path later
+        text, printed = self.summarize(base)
+        self.assertIn("- `sub/a.docx` — changed: Prose changed\n", text)
+        self.assertEqual(printed, "")
+
     def test_an_unexpected_error_is_reported_like_a_read_error(self) -> None:
         make_docx(self.repo / "a.docx", paragraph("One."))
         make_docx(self.repo / "b.docx", paragraph("One."))
@@ -388,11 +399,11 @@ class SummaryTests(unittest.TestCase):
         self.commit("second")
         real = summary.build
 
-        def flaky(old: object, new: object) -> object:
+        def flaky(old: object, new: object, marks: bool = False) -> object:
             if flaky.calls == 0:  # type: ignore[attr-defined]
                 flaky.calls = 1  # type: ignore[attr-defined]
                 raise KeyError("boom")
-            return real(old, new)  # type: ignore[arg-type]
+            return real(old, new, marks)  # type: ignore[arg-type]
         flaky.calls = 0  # type: ignore[attr-defined]
         with patch.object(summary, "build", flaky):
             text, printed = self.summarize(base, "outline")
@@ -449,6 +460,104 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("more changed documents not listed: summary size limit", text)
         self.assertNotIn("d.docx", text)
 
+    def edited(self) -> str:
+        """Commit two documents, then edit them: one sentence edit that pairs up, and replacements that do not.
+
+        Returns the first commit's ID."""
+        make_docx(self.repo / "a.docx", paragraph("The supplier shall deliver the goods within 30 days.")
+                  + paragraph("Payment is due on receipt."))
+        make_docx(self.repo / "b.docx", paragraph("Alpha bravo charlie.") + paragraph("Kept line.")
+                  + paragraph("One sentence here."))
+        base = self.commit("first")
+        make_docx(self.repo / "a.docx", paragraph("The supplier may deliver the goods within 60 days.")
+                  + paragraph("Payment is due on receipt."))
+        # Under half the words match in the first; one line becomes two in the second.
+        make_docx(self.repo / "b.docx", paragraph("Zulu yankee xray.") + paragraph("Kept line.")
+                  + paragraph("One sentence there.") + paragraph("And another one."))
+        self.commit("second")
+        return base
+
+    def test_word_diff_marks_full_reports_as_review_word_diff_does(self) -> None:
+        base = self.edited()
+        before = self.state()
+        text, printed = self.summarize(base, "full", word_diff=True)
+        self.assertEqual(self.state(), before)
+        self.assertEqual(printed, "")
+        self.assertIn("**This summary includes document text.**", text)  # marks publish no new text
+        reports = re.split(r"^(?=## Review: )", text, flags=re.MULTILINE)[1:]
+        self.assertEqual(len(reports), 2)
+        for report, path in zip(reports, ("a.docx", "b.docx"), strict=True):
+            cli = subprocess.run([sys.executable, "-m", "pilcrow", "review", "--format", "markdown", "--word-diff",
+                                  "--rev", base, "--rev", "HEAD", path], cwd=self.repo, env=self.env,
+                                 capture_output=True, timeout=60)
+            self.assertEqual(cli.returncode, 1, cli.stderr)
+            # The same report apart from the labels in the heading.
+            self.assertEqual(report.split("\n", 1)[1].rstrip("\n"),
+                             cli.stdout.decode("utf-8").split("\n", 1)[1].rstrip("\n"))
+        prose = reports[0].split("```diff\n", 1)[1].split("\n```", 1)[0]
+        self.assertIn("\n~ The supplier [-shall-]{+may+} deliver the goods within [-30-]{+60+} days.\n", prose)
+        self.assertNotIn("-The supplier", prose)
+        self.assertNotIn("+The supplier", prose)
+        # Replacements that do not pair up keep whole lines.
+        for line in ("-Alpha bravo charlie.", "+Zulu yankee xray.", "-One sentence here.", "+One sentence there.",
+                     "+And another one."):
+            self.assertIn(f"\n{line}\n", reports[1])
+        self.assertNotIn("\n~ ", reports[1])
+
+    def test_without_word_diff_the_summary_is_unchanged(self) -> None:
+        base = self.edited()
+        plain, _ = self.summarize(base, "full")
+        marked, _ = self.summarize(base, "full", word_diff=True)
+        self.assertNotEqual(plain, marked)
+        self.assertNotIn("\n~ ", plain)
+        self.assertIn("\n-The supplier shall deliver the goods within 30 days.\n"
+                      "+The supplier may deliver the goods within 60 days.\n", plain)
+        # Only the prose diff block differs.
+        def outside(text: str) -> str:
+            return re.sub(r"```diff\n.*?\n```", "", text, flags=re.DOTALL)
+        self.assertEqual(outside(plain), outside(marked))
+        for path in ("a.docx", "b.docx"):  # unmarked reports match `pilcrow review` without the flag
+            cli = subprocess.run([sys.executable, "-m", "pilcrow", "review", "--format", "markdown",
+                                  "--rev", base, "--rev", "HEAD", path], cwd=self.repo, env=self.env,
+                                 capture_output=True, timeout=60)
+            self.assertIn(cli.stdout.decode("utf-8").split("\n", 1)[1].rstrip("\n"), plain)
+        # outline ignores the flag and still publishes no document text.
+        outline, _ = self.summarize(base, "outline")
+        self.assertEqual(self.summarize(base, "outline", word_diff=True)[0], outline)
+        self.assertTrue(outline.endswith("\n\n- `a.docx` — changed: Prose changed\n"
+                                         "- `b.docx` — changed: Prose changed\n"), outline)
+        for word in ("supplier", "Alpha", "Zulu", "sentence", "[-", "{+"):
+            self.assertNotIn(word, outline)
+
+    def test_a_size_limit_applies_to_marked_reports(self) -> None:
+        for name in "abcd":
+            make_docx(self.repo / f"{name}.docx", paragraph(f"Old {name} " + "long text " * 50 + "end."))
+        base = self.commit("first")
+        for name in "abcd":
+            make_docx(self.repo / f"{name}.docx", paragraph(f"New {name} " + "long text " * 50 + "end."))
+        self.commit("second")
+        full, _ = self.summarize(base, "full", word_diff=True)
+        self.assertEqual(full.count("\n~ [-Old-]{+New+} "), 4)
+        one = len(re.split(r"^(?=## Review: )", full, flags=re.MULTILINE)[1].encode("utf-8"))
+        header = len(full.encode("utf-8").split(b"## Review: ", 1)[0])
+        budget = header + 2 * one + 10
+        with patch.object(summary, "BUDGET", budget):
+            text, printed = self.summarize(base, "full", word_diff=True)
+        self.assertLessEqual(len(text.encode("utf-8")), budget + 200)
+        self.assertLess(len(text.encode("utf-8")), 1 << 20)
+        self.assertEqual(text.count("## Review: "), 2)
+        self.assertEqual(text.count("[-Old-]{+New+}"), 2)
+        self.assertIn("- `c.docx` — report omitted: summary size limit", text)
+        self.assertIn("- `d.docx` — report omitted: summary size limit", text)
+        self.assertIn("::warning::Pilcrow summary: some reports were omitted", printed)
+        # Marks count at their real size: one ~ line is shorter than whole - and + lines, so the same
+        # budget holds fewer unmarked reports.
+        plain, _ = self.summarize(base, "full")
+        unmarked = len(re.split(r"^(?=## Review: )", plain, flags=re.MULTILINE)[1].encode("utf-8"))
+        self.assertGreater(unmarked, one + 10)
+        with patch.object(summary, "BUDGET", budget):
+            self.assertEqual(self.summarize(base, "full")[0].count("## Review: "), 1)
+
     def test_paths_are_code_spans(self) -> None:
         make_docx(self.repo / "a`b _c_.docx", paragraph("One."))
         base = self.commit("first")
@@ -487,6 +596,54 @@ class ActionManifestTests(unittest.TestCase):
                       " && inputs.summary != ''", step)
         self.assertLess(text.index("name: Check companions"), text.index("pilcrow.summary"))
         self.assertIn("value: ${{ steps.summary.outputs.file }}", text)
+
+    def test_word_diff_is_opt_in(self) -> None:
+        text = (PROJECT / "action.yml").read_text(encoding="utf-8")
+        self.assertRegex(text, r"\n  word-diff:\n(    .*\n)*?    default: \"false\"\n")
+        self.assertIn("PILCROW_WORD_DIFF: ${{ inputs.word-diff }}", text)
+
+    @unittest.skipIf(sys.platform == "win32" or shutil.which("bash") is None, "needs a POSIX bash")
+    def test_the_summary_step_validates_word_diff(self) -> None:
+        """Run the summary step's script with a stand-in Python that records its arguments."""
+        text = (PROJECT / "action.yml").read_text(encoding="utf-8")
+        (step,) = [s for s in text.split("\n    - ") if "pilcrow.summary" in s]
+        script = "\n".join(line[8:] for line in step.split("      run: |\n", 1)[1].splitlines()) + "\n"
+        with tempfile.TemporaryDirectory(prefix="pilcrow-step-") as name:
+            temp = Path(name)
+            stub = temp / "python"
+            stub.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ARGS_FILE"\n'
+                            'for a; do case "$a" in --output=*) echo report > "${a#--output=}" ;; esac; done\n',
+                            encoding="utf-8")
+            stub.chmod(0o755)
+
+            def step_run(mode: str, word_diff: str) -> tuple[int, str, list[str]]:
+                args = temp / "args"
+                args.unlink(missing_ok=True)
+                env = {**os.environ, "PILCROW_PYTHON": str(stub), "PILCROW_ROOT": ".", "PILCROW_BASE": "abc",
+                       "PILCROW_MODE": mode, "PILCROW_WORD_DIFF": word_diff, "ARGS_FILE": str(args),
+                       "RUNNER_TEMP": name, "GITHUB_STEP_SUMMARY": str(temp / "summary"),
+                       "GITHUB_OUTPUT": str(temp / "output")}
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env,
+                                        capture_output=True, timeout=60)
+                called = args.read_text(encoding="utf-8").splitlines() if args.exists() else []
+                return result.returncode, result.stdout.decode("utf-8"), called
+
+            for value, expected in (("false", False), ("", False), ("False", False), ("true", True),
+                                    ("TRUE", True)):
+                with self.subTest(word_diff=value):
+                    code, out, called = step_run("full", value)
+                    self.assertEqual((code, out), (0, ""))
+                    self.assertEqual(called[:3], ["-m", "pilcrow.summary", "--base=abc"])
+                    self.assertEqual("--word-diff" in called, expected)
+            for value in ("maybe", "yes", "1"):
+                with self.subTest(word_diff=value):
+                    code, out, called = step_run("full", value)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, f"::error::word-diff must be true or false, not '{value}'\n")
+                    self.assertEqual(called, [])
+            code, out, called = step_run("sometimes", "true")  # an invalid summary value, for comparison
+            self.assertEqual((code, called), (2, []))
+            self.assertTrue(out.startswith("::error::summary must be"), out)
 
 
 if __name__ == "__main__":

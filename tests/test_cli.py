@@ -18,6 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -230,6 +231,26 @@ def part_entry(kind: str, data: str | None, part: str = "word/document.xml", **e
     return {"kind": kind, "part": part, "sha256": sha, **extra}
 
 
+def chart_form(data: str) -> list[Any]:
+    """The canonical form of a chart part: tag, sorted attributes, text and children, with each
+    c:axId and c:crossAx value replaced by the order in which it first appears."""
+    axes: dict[str, str] = {}
+
+    def form(node: ElementTree.Element) -> list[Any]:
+        attributes = sorted([key, value] for key, value in node.attrib.items())
+        if node.tag in {f"{{{C}}}axId", f"{{{C}}}crossAx"}:
+            attributes = [[key, axes.setdefault(value, str(len(axes))) if key == "val" else value]
+                          for key, value in attributes]
+        return [node.tag, attributes, node.text or "", [form(child) for child in node]]
+    return form(ElementTree.fromstring(data))
+
+
+def chart_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
+    """The objects entry for a chart whose part holds ``data``: the hash of its canonical form."""
+    form = json.dumps(chart_form(data), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {"kind": "chart", "part": part, "sha256": hashlib.sha256(form).hexdigest()}
+
+
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 
@@ -337,8 +358,8 @@ def dropdown_form(entries: list[str], selected: str | None, name: str = "Drop1")
     return {"type": "dropdown", "name": name, "entries": entries, "selected": selected}
 
 
-FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is recorded in field metadata; "
-                   "text form field settings are not compared.")
+FORM_FIELD_NOTE = ("Legacy form field checkbox and dropdown state is shown in prose and recorded in field "
+                   "metadata; text form field settings are not compared.")
 
 
 def make_docx(
@@ -445,6 +466,40 @@ def comments_extended(*entries: tuple[str, str | None, str | None]) -> str:
             + "".join(entry(*e) for e in entries) + "</w15:commentsEx>")
 
 
+def dgm_point(model_id: str, *paragraphs: str, kind: str | None = None) -> str:
+    """A SmartArt data model point with one a:p of one run per paragraph; none: no dgm:t."""
+    kind_xml = f' type="{kind}"' if kind else ""
+    text = "".join(f'<a:p><a:r><a:rPr lang="en-US"/><a:t>{escape(p)}</a:t></a:r></a:p>' for p in paragraphs)
+    body = f"<dgm:t><a:bodyPr/><a:lstStyle/>{text}</dgm:t>" if paragraphs else ""
+    return f'<dgm:pt modelId="{model_id}"{kind_xml}><dgm:prSet/><dgm:spPr/>{body}</dgm:pt>'
+
+
+def dgm_cxn(src: str, dest: str, order: int = 0, kind: str | None = None) -> str:
+    """A data model connection; without ``kind`` it is a parOf (parent/child) connection."""
+    kind_xml = f' type="{kind}"' if kind else ""
+    return (f'<dgm:cxn modelId="c{src}-{dest}"{kind_xml} srcId="{src}" destId="{dest}" '
+            f'srcOrd="{order}" destOrd="0"/>')
+
+
+def diagram_data(points: str, connections: str = "") -> str:
+    """A SmartArt data part (dgm:dataModel) with the given points and connections."""
+    return (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst>{points}</dgm:ptLst>'
+            f"<dgm:cxnLst>{connections}</dgm:cxnLst><dgm:bg/><dgm:whole/></dgm:dataModel>")
+
+
+def outline(*nodes: tuple[str, str, str]) -> str:
+    """A data part for an outline of (id, parent id, text) nodes, the doc point being "0",
+    siblings in the given order, with the transition and presentation points Word writes."""
+    points, connections = [dgm_point("0", kind="doc")], []
+    siblings: dict[str, int] = {}
+    for node, parent, text in nodes:
+        order = siblings[parent] = siblings.get(parent, -1) + 1
+        points += [dgm_point(node, *([text] if text else [])), dgm_point(f"p{node}", "TRANS", kind="parTrans"),
+                   dgm_point(f"s{node}", kind="sibTrans"), dgm_point(f"v{node}", "PRES", kind="pres")]
+        connections += [dgm_cxn(parent, node, order), dgm_cxn(node, f"v{node}", 0, "presOf")]
+    return diagram_data("".join(points), "".join(connections))
+
+
 def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str = "Plan",
                  chunk: str = "Chunk text") -> dict[str, str]:
     """The parts a chart, a SmartArt diagram, an embedded workbook and an imported chunk point to."""
@@ -457,9 +512,7 @@ def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str 
                                               + rel("rId1", "package", "../embeddings/chart_workbook.xlsx")
                                               + "</Relationships>"),
         "word/embeddings/chart_workbook.xlsx": "chart workbook bytes",
-        "word/diagrams/data1.xml": (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst><dgm:pt modelId="1">'
-                                    f"<dgm:t><a:p><a:r><a:t>{node}</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst>"
-                                    "</dgm:dataModel>"),
+        "word/diagrams/data1.xml": outline(("1", "0", node)),
         "word/diagrams/layout1.xml": "<layout/>",
         "word/diagrams/quickStyle1.xml": "<quickStyle/>",
         "word/diagrams/colors1.xml": "<colors/>",
@@ -477,6 +530,86 @@ OBJECT_RELS = (rel("chart", "chart", "charts/chart1.xml") + rel("dgmData", "diag
                + rel("chunk", "aFChunk", "afchunk.htm"))
 OBJECT_BODY = (f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{smartart("dgmData")}</w:r>'
                f'<w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}')
+
+
+
+def chart_rich(*paragraphs: str) -> str:
+    """A chart label (c:tx) as rich text, one a:p of one run per paragraph."""
+    text = "".join(f'<a:p><a:pPr><a:defRPr/></a:pPr><a:r><a:rPr lang="en-US"/><a:t>{escape(p)}</a:t></a:r></a:p>'
+                   for p in paragraphs)
+    return f"<c:tx><c:rich><a:bodyPr/><a:lstStyle/>{text}</c:rich></c:tx>"
+
+
+def str_points(*values: str) -> str:
+    return f'<c:ptCount val="{len(values)}"/>' + "".join(
+        f'<c:pt idx="{i}"><c:v>{escape(v)}</c:v></c:pt>' for i, v in enumerate(values))
+
+
+def chart_cached(*values: str) -> str:
+    """A chart label (c:tx) as a cell reference with its cached string, as Word writes series names."""
+    return f"<c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache>{str_points(*values)}</c:strCache></c:strRef></c:tx>"
+
+
+def chart_categories(*values: str) -> str:
+    """A series's string categories (c:cat) from a cell range's cached strings."""
+    return f"<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$9</c:f><c:strCache>{str_points(*values)}</c:strCache></c:strRef></c:cat>"
+
+
+def chart_series(name: str = "", categories: str = "", value: str = "10") -> str:
+    """A c:ser with a name (a c:tx), categories (a c:cat) and one cached data value."""
+    return (f'<c:ser><c:idx val="0"/><c:order val="0"/>{name}{categories}<c:val><c:numRef><c:f>Sheet1!$B$2</c:f>'
+            f'<c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>{value}</c:v>'
+            "</c:pt></c:numCache></c:numRef></c:val></c:ser>")
+
+
+def chart_axis(kind: str, title: str = "", ax_id: str = "1") -> str:
+    """An axis (c:catAx, c:valAx, ...), titled with a c:tx when ``title`` is given."""
+    heading = f'<c:title>{title}<c:overlay val="0"/></c:title>' if title else ""
+    return f'<c:{kind}><c:axId val="{ax_id}"/><c:scaling/><c:delete val="0"/>{heading}</c:{kind}>'
+
+
+def chart_space(plot: str, title: str | None = None, *, deleted: str | None = None) -> str:
+    """A chart part: a c:title holding ``title`` (a c:tx, or "" for none) and a plot area holding ``plot``."""
+    heading = "" if title is None else f'<c:title>{title}<c:overlay val="0"/></c:title>'
+    removed = "" if deleted is None else f"<c:autoTitleDeleted{deleted}/>"
+    return (f'<c:chartSpace xmlns:c="{C}" xmlns:a="{A}" xmlns:r="{R}"><c:date1904 val="0"/><c:chart>{heading}{removed}'
+            f'<c:plotArea><c:layout/>{plot}</c:plotArea><c:plotVisOnly val="1"/></c:chart>'
+            '<c:externalData r:id="rId1"/></c:chartSpace>')
+
+
+def quarterly(series_2026: str = "2026", category: str = "Q2", title: str = "Quarterly revenue") -> str:
+    """A bar chart with a rich-text title and axis titles, two named series and shared categories."""
+    quarters = chart_categories("Q1", category, "Q3")
+    bars = chart_series(chart_cached("2025"), quarters) + chart_series(chart_cached(series_2026), quarters, "12")
+    return chart_space(f'<c:barChart><c:barDir val="col"/>{bars}</c:barChart>'
+                       + chart_axis("catAx", chart_rich("Quarter")) + chart_axis("valAx", chart_rich("Revenue (USD)"), "2"),
+                       chart_rich(title))
+
+
+def crossed_chart(ids: tuple[str, str] = ("111", "222"), *, crosses: tuple[str, str] | None = None,
+                  value: str = "10", series: str = "2025", extra_axis: str = "") -> str:
+    """A bar chart whose group lists its two axes by c:axId and whose axes cross each other by
+    c:crossAx, as Word and LibreOffice write it; ``crosses`` overrides which axis each crosses."""
+    cat, val = ids
+    cat_crosses, val_crosses = crosses or (val, cat)
+    group = (f'<c:barChart><c:barDir val="col"/>{chart_series(chart_cached(series), chart_categories("Q1", "Q2"), value)}'
+             f'<c:axId val="{cat}"/><c:axId val="{val}"/></c:barChart>')
+    axes = (f'<c:catAx><c:axId val="{cat}"/><c:scaling/><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="{cat_crosses}"/>'
+            f'</c:catAx><c:valAx><c:axId val="{val}"/><c:scaling/><c:delete val="0"/><c:axPos val="l"/>'
+            f'<c:crossAx val="{val_crosses}"/></c:valAx>')
+    return chart_space(group + axes + extra_axis, chart_rich("Revenue"))
+
+
+QUARTERLY_BLOCK = ("[Chart]\n\nTitle: Quarterly revenue\nAxis title: Quarter\nAxis title: Revenue (USD)\n"
+                   "Series: 2025\nSeries: 2026\nCategory: Q1\nCategory: Q2\nCategory: Q3\n\n[/Chart]")
+
+
+def chart_parts(data: str, name: str = "word/charts/chart1.xml") -> dict[str, str]:
+    """A chart part holding ``data``, with the embedded workbook it reads its values from."""
+    rels = name.replace("charts/", "charts/_rels/") + ".rels"
+    return {name: data, rels: f'<Relationships xmlns="{PKG_R}">{rel("rId1", "package", "../embeddings/chart_workbook.xlsx")}'
+                              "</Relationships>",
+            "word/embeddings/chart_workbook.xlsx": "chart workbook bytes"}
 
 
 class CLITests(unittest.TestCase):
@@ -1337,17 +1470,18 @@ class CLITests(unittest.TestCase):
         meta: dict[str, Any] = json.loads(self.exported()[1])
         return meta
 
-    def test_toggling_a_form_checkbox_is_stale_in_metadata_only(self) -> None:
+    def test_toggling_a_form_checkbox_changes_prose_and_metadata(self) -> None:
         source = self.root / "essay.docx"
         meta = self.export_form(f"<w:p>{run('The Tenant may sublet: ')}{checkbox('0')}</w:p>")
         self.assertEqual(meta["fields"], [checkbox_entry(False)])
         self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
         before = self.exported()
+        self.assertEqual(before[0], "The Tenant may sublet: \u2610\n".encode())
         make_docx(source, f"<w:p>{run('The Tenant may sublet: ')}{checkbox('1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
         self.cli("export", source, "--root", self.root)
         after = self.exported()
-        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[0], "The Tenant may sublet: \u2612\n".encode())
         self.assertEqual(json.loads(after[1])["fields"], [checkbox_entry(True)])
 
     def test_checkbox_state_follows_checked_then_default(self) -> None:
@@ -1367,17 +1501,18 @@ class CLITests(unittest.TestCase):
         make_docx(source, f"<w:p>{checkbox(None, '1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
 
-    def test_choosing_another_dropdown_entry_is_stale_in_metadata_only(self) -> None:
+    def test_choosing_another_dropdown_entry_changes_prose_and_metadata(self) -> None:
         source = self.root / "essay.docx"
         meta = self.export_form(f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='0')}</w:p>")
         self.assertEqual(meta["fields"][0]["form"], dropdown_form(["Yes", "No"], "Yes"))
         self.assertIn(FORM_FIELD_NOTE, meta["warnings"])
         before = self.exported()
+        self.assertEqual(before[0], b"Sublet allowed: Yes\n")
         make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', result='1')}</w:p>")
         self.cli("check", source, "--root", self.root, code=1)
         self.cli("export", source, "--root", self.root)
         after = self.exported()
-        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[0], b"Sublet allowed: No\n")
         self.assertEqual(json.loads(after[1])["fields"][0]["form"], dropdown_form(["Yes", "No"], "No"))
         # Changing the entries, even with the same selection, is stale too.
         make_docx(source, f"<w:p>{run('Sublet allowed: ')}{dropdown('Yes', 'No', 'Maybe', result='1')}</w:p>")
@@ -1872,8 +2007,10 @@ class CLITests(unittest.TestCase):
         prose, meta = self.exported()
         self.assertEqual(hashlib.sha256(prose).hexdigest(),
                          "37997d7537bbac3bd80770076952b402b2538528a7fd7efef5d99ea6f9ff8959", prose)
+        # Re-pinned when recognised drawings stopped warning about their wrapper markup (#77):
+        # only the generic drawing, inline, graphic and picture warnings left the metadata.
         self.assertEqual(hashlib.sha256(meta).hexdigest(),
-                         "bf59117831f52348f3221f581f11cef4d2ebcd040d2dc6c0f19a750b89a928e8", meta)
+                         "ee21cdec9947fbdfc967e3aaab2841ee715d878de82c5342e84efa2905bc684e", meta)
         self.assertNotIn("objects", json.loads(meta))
 
     def test_wordart_text_edits_make_check_stale_and_review_names_them(self) -> None:
@@ -2082,13 +2219,14 @@ class CLITests(unittest.TestCase):
         data = json.loads(meta)
         parts = object_parts()
         self.assertEqual(data["objects"], [
-            part_entry("chart", parts["word/charts/chart1.xml"]),
+            chart_entry(parts["word/charts/chart1.xml"]),
             part_entry("diagram", parts["word/diagrams/data1.xml"]),
             part_entry("embedded object", parts["word/embeddings/Microsoft_Excel_Worksheet.xlsx"], prog_id="Excel.Sheet.12"),
             part_entry("imported chunk", parts["word/afchunk.htm"]),
         ])
-        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported drawing][Unsupported object]"
-                                                "\n\n[Unsupported altChunk]\n")
+        # The diagram's text is shown after its paragraph; the other objects keep their placeholders.
+        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported object]"
+                                                "\n\n[Diagram]\n\n- Plan\n\n[/Diagram]\n\n[Unsupported altChunk]\n")
         # Hashed parts are compared now; formatting parts and the chart's workbook still are not.
         unrendered = sorted(wn.split(";")[0].removeprefix("Unrendered package part: ")
                             for wn in data["warnings"] if wn.startswith("Unrendered package part"))
@@ -2122,7 +2260,7 @@ class CLITests(unittest.TestCase):
         self.cli("export", "essay.docx")
         self.cli("check", "essay.docx")
         after = self.exported()
-        self.assertEqual(after[0], prose, "object edits must not alter the prose")
+        self.assertEqual(after[0], prose, "chart edits must not alter the prose")
         self.assertNotEqual(after[1], meta)
 
     def test_objects_in_headers_notes_and_text_boxes_are_recorded_by_part(self) -> None:
@@ -2141,13 +2279,13 @@ class CLITests(unittest.TestCase):
                          + rel("footnotes", "footnotes", "footnotes.xml"))
         extra = {"word/header1.xml": header, "word/_rels/header1.xml.rels": chart_rels,
                  "word/footnotes.xml": footnotes, "word/_rels/footnotes.xml.rels": footnote_rels,
-                 "word/charts/chart1.xml": "<body chart/>", "word/charts/chart2.xml": "<header chart/>",
-                 "word/charts/chart3.xml": "<footnote chart/>"}
+                 "word/charts/chart1.xml": "<bodyChart/>", "word/charts/chart2.xml": "<headerChart/>",
+                 "word/charts/chart3.xml": "<footnoteChart/>"}
         _, meta = self.export_objects(body, extra=extra, relationships=relationships)
         self.assertEqual(meta["objects"], [
-            part_entry("chart", "<body chart/>"),
-            part_entry("chart", "<footnote chart/>", "word/footnotes.xml"),
-            part_entry("chart", "<header chart/>", "word/header1.xml"),
+            chart_entry("<bodyChart/>"),
+            chart_entry("<footnoteChart/>", "word/footnotes.xml"),
+            chart_entry("<headerChart/>", "word/header1.xml"),
         ])
         self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
 
@@ -2159,6 +2297,19 @@ class CLITests(unittest.TestCase):
         make_docx(self.root / "essay.docx", body, extra={"word/charts/chart2.xml": "<chart/>"},
                   relationships=rel("chart", "chart", "charts/chart2.xml"))
         self.cli("check", "essay.docx")
+
+    def test_a_save_that_renumbers_chart_axes_keeps_check_fresh(self) -> None:
+        # LibreOffice gives every c:axId and c:crossAx a new random value on each save (#77).
+        def write(ids: tuple[str, str], **options: Any) -> None:
+            make_docx(self.root / "essay.docx", anchored("Figure:", chart("chart")),
+                      extra=chart_parts(crossed_chart(ids, **options)), relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(("77217256", "2760290"))
+        self.cli("export", "essay.docx")
+        write(("90904435", "24668023"))
+        self.cli("check", "essay.docx")
+        write(("90904435", "24668023"), value="99")
+        self.assertIn("STALE", self.cli("check", "essay.docx", code=1).stdout)
 
     def test_linked_and_missing_object_parts(self) -> None:
         missing_note = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
@@ -2191,7 +2342,7 @@ class CLITests(unittest.TestCase):
         for body in (inline, block):
             with self.subTest(body=body):
                 _, meta = self.export_objects(body, extra=extra, relationships=relationships)
-                self.assertEqual(meta["objects"], [part_entry("chart", "<chart/>")])
+                self.assertEqual(meta["objects"], [chart_entry("<chart/>")])
                 self.assertEqual(meta["images"], [])
                 unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
                 self.assertEqual(unrendered, [
@@ -2861,8 +3012,822 @@ class EquationTextTests(unittest.TestCase):
         make_docx(self.path, body, extra=extra, relationships=relationships)
         outputs = extract(self.path).outputs()
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
-            ".prose.md": "8a6483a884064a67cfe3ac935b295872d8ad1d864b2b945332068c8189c038b5",
-            ".meta.json": "8fd177d4171cfe566c5adda90807756c5fdd5596c408381f3b495d36f21208d2",
+            # Re-pinned when legacy checkboxes got prose: the fixture's checkbox now reads ☒,
+            # and the form field note says so; nothing else moved. Re-pinned again when the
+            # picture's drawing markup stopped warning (#77); the prose did not move.
+            ".prose.md": "a93eb6a510a1e7dc5aca4d6a52cc69fddfabe0f734b468695dab5c3adad93219",
+            ".meta.json": "f661f269615caebab3ccf6f98dc1a1f5ace0f4be50ca631879b33b26f8dd1b00",
+        })
+
+
+class FormFieldTextTests(unittest.TestCase):
+    """Legacy checkbox and dropdown form fields' state as prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-forms-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, **options: Any) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, **options)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def test_repro_reads_the_answers_in_place(self) -> None:
+        def form(checked: str, result: str) -> str:
+            return (f"<w:p>{run('Agree: ')}{checkbox(checked)}{run(' Terms: ')}"
+                    f"{dropdown('Net 30', 'Net 60', result=result)}</w:p>")
+
+        self.assertEqual(self.extract(form("0", "0"))[0], "Agree: ☐ Terms: Net 30\n")
+        prose, meta = self.extract(form("1", "1"))
+        self.assertEqual(prose, "Agree: ☒ Terms: Net 60\n")
+        self.assertEqual(meta["fields"], [checkbox_entry(True), {
+            "command": "FORMDROPDOWN", "sha256": hashlib.sha256(b"FORMDROPDOWN").hexdigest(),
+            "part": "word/document.xml", "form": dropdown_form(["Net 30", "Net 60"], "Net 60")}])
+
+    def test_checkbox_glyph_follows_the_recorded_state(self) -> None:
+        cases = [
+            (checkbox("1", "0"), True), (checkbox("0", "1"), False), (checkbox("", "0"), True),
+            (checkbox("true", None), True), (checkbox("off", None), False),
+            (checkbox(None, "1"), True), (checkbox(None, "0"), False), (checkbox(None, ""), True),
+            (checkbox(None, None), False), (checkbox("0", name=None), False),
+        ]
+        for xml, checked in cases:
+            with self.subTest(xml=xml):
+                prose, meta = self.extract(f"<w:p>{run('Box: ')}{xml}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["checked"], checked)
+                self.assertEqual(prose, "Box: " + ("☒" if checked else "☐") + "\n")
+
+    def test_dropdown_shows_its_selected_entry_or_nothing(self) -> None:
+        cases = [
+            (dropdown("Yes", "No", result=None), "Yes"),
+            (dropdown("Yes", "No", result=None, default="1"), "No"),
+            (dropdown("Yes", "No", result="1", default="0"), "No"),
+            (dropdown("Yes", "No", result="+01"), "No"),
+            (dropdown("Yes", "No", result="2"), None),
+            (dropdown("Yes", "No", result="-1"), None),
+            (dropdown("Yes", "No", result="first"), None),
+            (dropdown("Yes", "No", result=None, default="5"), None),
+            (dropdown(result="0"), None),
+            # The entry's text as it is: Markdown characters stay, as other prose does.
+            (dropdown("*Yes*", "Net  30", result="1"), "Net 30"),
+        ]
+        for xml, selected in cases:
+            with self.subTest(xml=xml):
+                prose, meta = self.extract(f"<w:p>{run('Choice: ')}{xml}{run(' end')}</w:p>")
+                self.assertEqual(meta["fields"][0]["form"]["selected"] is None, selected is None)
+                self.assertEqual(prose, f"Choice: {selected} end\n" if selected else "Choice: end\n")
+        prose, _ = self.extract(f"<w:p>{dropdown('*Yes*', result='0')}</w:p>")
+        self.assertEqual(prose, "*Yes*\n")
+
+    def test_text_form_fields_are_unchanged(self) -> None:
+        text_input = form_field("FORMTEXT", '<w:textInput><w:default w:val="0"/></w:textInput>', "1200", name="Rent")
+        prose, meta = self.extract(f"<w:p>{run('Rent: ')}{text_input}{run(' per month.')}</w:p>")
+        self.assertEqual(prose, "Rent: 1200 per month.\n")
+        self.assertNotIn("form", meta["fields"][0])
+        self.assertNotIn(FORM_FIELD_NOTE, meta["warnings"])
+
+    def test_tracked_changes_and_other_stories(self) -> None:
+        extra = {
+            "word/header1.xml": f'<w:hdr xmlns:w="{W}"><w:p>{run("Header ")}{checkbox("1", name="InHeader")}</w:p></w:hdr>',
+            "word/footnotes.xml": (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>{run("Note ")}'
+                                   f'{dropdown("A", "B", result="1", name="InNote")}</w:p></w:footnote></w:footnotes>'),
+        }
+        relationships = (f'<Relationship Id="headerRef" Type="{R}/header" Target="header1.xml"/>'
+                         f'<Relationship Id="footnotes" Type="{R}/footnotes" Target="footnotes.xml"/>')
+        body = (anchored("Boxed:", modern_text_box(f"<w:p>{run('In box ')}{checkbox('1', name='InBox')}</w:p>"))
+                + f'<w:p>{run("Inserted ")}<w:ins w:id="1" w:author="Ben">{checkbox("1", name="Inserted")}</w:ins></w:p>'
+                + f'<w:p>{run("Kept.")}<w:del w:id="2" w:author="Ben">{checkbox("1", name="Deleted")}'
+                + f'{dropdown("Gone", name="DeletedDrop")}</w:del></w:p>'
+                + '<w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        prose, meta = self.extract(body, extra=extra, relationships=relationships)
+        # An insertion's field renders, as in the accepted view; a deletion's renders nothing.
+        self.assertIn("In box ☒", prose)
+        self.assertIn("Inserted ☒\n", prose)
+        self.assertIn("\nKept.\n", prose)
+        self.assertNotIn("Gone", prose)
+        self.assertIn("Note B", prose)
+        self.assertIn("Header ☒", prose)
+        self.assertEqual(len(meta["fields"]), 4)
+
+    def test_a_comment_anchor_over_a_form_field_holds_its_text(self) -> None:
+        body = (f'<w:p>{start("1")}{run("Agree: ")}{checkbox("1")}{run(" Terms: ")}'
+                f'{dropdown("Net 30", "Net 60", result="1")}{end("1")}</w:p>')
+        _, meta = self.extract(body, extra={"word/comments.xml": comments_part({"1": "Confirm."})},
+                               relationships=COMMENTS_REL)
+        (comment,) = meta["review"]
+        self.assertEqual(comment["anchor"], "Agree: ☒ Terms: Net 60")
+
+    def test_an_unselected_alternate_copy_shows_no_state(self) -> None:
+        def copy(text: str) -> str:
+            return f"<w:p>{run(text)}{checkbox('1')}{dropdown('Yes', result='0')}</w:p>"
+
+        body = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="w14">{copy("Chosen ")}</mc:Choice>'
+                f'<mc:Fallback>{copy("Fallback ")}</mc:Fallback></mc:AlternateContent>')
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "Chosen ☒Yes\n\nFallback\n")
+
+    def test_result_runs_of_a_checkbox_keep_their_text(self) -> None:
+        # Word writes none, but any that are present render as before, after the state.
+        data = '<w:checkBox><w:sizeAuto/><w:default w:val="1"/></w:checkBox>'
+        prose, _ = self.extract(f"<w:p>{run('Box: ')}{form_field('FORMCHECKBOX', data, 'X', name='Check1')}</w:p>")
+        self.assertEqual(prose, "Box: ☒X\n")
+
+    def test_sentences_split_around_the_state_as_in_any_prose(self) -> None:
+        body = (f"<w:p>{run('I agree ')}{checkbox('1')}{run('. Payment is ')}"
+                f"{dropdown('due. Net 30', result='0')}{run(' days.')}</w:p>")
+        prose, _ = self.extract(body)
+        self.assertEqual(prose, "I agree ☒.\nPayment is due.\nNet 30 days.\n")
+
+    def test_documents_without_a_legacy_checkbox_or_dropdown_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before legacy form fields had prose.
+        text_input = form_field("FORMTEXT", '<w:textInput><w:default w:val="0"/></w:textInput>', "1200", name="Rent")
+        body = (paragraph("Lease terms. The Tenant pays rent monthly.")
+                + f"<w:p>{run('Rent: ')}{text_input}{run(' per month.')}</w:p>"
+                + '<w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+                '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+                '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r>'
+                '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+                + f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>'
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>')
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra={"word/comments.xml": comments_part({"1": "Please check."})},
+                  relationships=COMMENTS_REL)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "57ed66ef6405337e2e77262ab0da133145cd90dbabfd4f18192a9b247b870b2b",
+            ".meta.json": "8d178635a167aecf5bd847062d4421072f5341c4a7aaf6edb693b5887dcfa412",
+        })
+
+
+DIAGRAM_NOTE = ("SmartArt diagram text is shown as an outline in [Diagram] blocks after its anchoring paragraph; "
+                "layout, shapes and formatting are not shown, and the diagram's data part is fingerprinted in objects.")
+DIAGRAM_UNREACHED_NOTE = ("Some SmartArt diagram text is not connected to the diagram's outline; "
+                          "it is shown at the top level after the outline.")
+UNSUPPORTED_DRAWING = "Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word."
+DIAGRAM_RELS = (rel("dgmData", "diagramData", "diagrams/data1.xml") + rel("dgmLayout", "diagramLayout", "diagrams/layout1.xml")
+                + rel("dgmStyle", "diagramQuickStyle", "diagrams/quickStyle1.xml")
+                + rel("dgmColors", "diagramColors", "diagrams/colors1.xml"))
+PLAN = outline(("1", "0", "Plan"), ("2", "1", "Gather requirements"), ("3", "1", "Draft the outline"), ("4", "0", "Review"))
+PLAN_BLOCK = "[Diagram]\n\n- Plan\n  - Gather requirements\n  - Draft the outline\n- Review\n\n[/Diagram]"
+
+
+def diagram_parts(data: str, name: str = "word/diagrams/data1.xml") -> dict[str, str]:
+    """A SmartArt diagram's data part holding ``data``, with its formatting parts."""
+    return {name: data, "word/diagrams/layout1.xml": "<layout/>", "word/diagrams/quickStyle1.xml": "<quickStyle/>",
+            "word/diagrams/colors1.xml": "<colors/>"}
+
+
+class DiagramTextTests(unittest.TestCase):
+    """SmartArt diagram text as [Diagram] outline blocks in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-diagram-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, data: str | None = PLAN, *, extra: dict[str, str] | None = None,
+                relationships: str = DIAGRAM_RELS) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        parts = {} if data is None else diagram_parts(data)
+        parts.update(extra or {})
+        make_docx(self.path, body, extra=parts, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def outline(self, data: str) -> str:
+        """The prose of one paragraph anchoring one diagram with ``data``."""
+        prose, _ = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        return prose
+
+    def test_a_diagram_renders_its_outline_after_its_anchoring_paragraph(self) -> None:
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")) + paragraph("After."))
+        self.assertEqual(prose, f"Steps:\n\n{PLAN_BLOCK}\n\nAfter.\n")
+        self.assertIn(DIAGRAM_NOTE, meta["warnings"])
+        self.assertNotIn(UNSUPPORTED_DRAWING, meta["warnings"])
+        self.assertNotIn(DIAGRAM_UNREACHED_NOTE, meta["warnings"])
+        # The fingerprint is still the data part's hash, as before diagrams had prose.
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)])
+        # The data part is supported; its formatting parts are still not read.
+        unrendered = [wn for wn in meta["warnings"] if wn.startswith("Unrendered package part")]
+        self.assertEqual(unrendered, [f"Unrendered package part: word/diagrams/{name}.xml; changes to its content are not compared."
+                                      for name in ("colors1", "layout1", "quickStyle1")])
+        # A drawing directly in the body, and one between runs, render the same block.
+        self.assertEqual(self.extract(smartart("dgmData"))[0], PLAN_BLOCK + "\n")
+        prose, _ = self.extract(f'<w:p>{run("Before ")}<w:r>{smartart("dgmData")}</w:r>{run(" after.")}</w:p>')
+        self.assertEqual(prose, f"Before after.\n\n{PLAN_BLOCK}\n")
+
+    def test_node_text_joins_paragraphs_runs_fields_and_breaks_and_splits_sentences(self) -> None:
+        point = ('<dgm:pt modelId="1"><dgm:t><a:bodyPr/><a:p><a:r><a:t>Gather </a:t></a:r><a:r><a:t> data</a:t></a:r>'
+                 '<a:br/><a:r><a:t>now</a:t></a:r></a:p><a:p><a:endParaRPr/></a:p><a:p><a:fld id="{1}" type="slidenum">'
+                 '<a:t>7</a:t></a:fld><a:r><a:t>\n  times</a:t></a:r></a:p></dgm:t></dgm:pt>')
+        data = diagram_data(dgm_point("0", kind="doc") + point + dgm_point("2", "Check the data. Then publish it."),
+                            dgm_cxn("0", "1") + dgm_cxn("1", "2"))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- Gather data now 7 times\n"
+                                             "  - Check the data.\n    Then publish it.\n\n[/Diagram]\n")
+
+    def test_siblings_follow_src_ord_then_connection_order(self) -> None:
+        points = dgm_point("0", kind="doc") + "".join(dgm_point(n, n) for n in "ABC")
+        data = diagram_data(points, dgm_cxn("0", "A", 1) + dgm_cxn("0", "B", 0) + dgm_cxn("0", "C", 0))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- B\n- C\n- A\n\n[/Diagram]\n")
+        reordered = outline(("1", "0", "Plan"), ("3", "1", "Draft the outline"), ("2", "1", "Gather requirements"),
+                            ("4", "0", "Review"))
+        self.assertEqual(self.outline(reordered), "Steps:\n\n[Diagram]\n\n- Plan\n  - Draft the outline\n"
+                                                  "  - Gather requirements\n- Review\n\n[/Diagram]\n")
+
+    def test_cycles_and_self_loops_terminate_without_duplicates(self) -> None:
+        points = dgm_point("0", kind="doc") + dgm_point("1", "One") + dgm_point("2", "Two")
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("1", "1") + dgm_cxn("1", "2") + dgm_cxn("2", "1", 0)
+                            + dgm_cxn("2", "0", 1) + dgm_cxn("2", "2", 2) + dgm_cxn("0", "2", 1))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- One\n  - Two\n\n[/Diagram]\n")
+
+    def test_unreached_points_follow_the_outline_with_one_warning(self) -> None:
+        points = (dgm_point("0", kind="doc") + dgm_point("5", "Loose") + dgm_point("1", "Plan")
+                  + dgm_point("3", "Cycle A") + dgm_point("4", "Cycle B") + dgm_point("6"))
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("3", "4") + dgm_cxn("4", "3") + dgm_cxn("0", "9"))
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        self.assertEqual(prose, "Steps:\n\n[Diagram]\n\n- Plan\n- Loose\n- Cycle A\n- Cycle B\n\n[/Diagram]\n")
+        self.assertEqual([wn for wn in meta["warnings"] if "SmartArt" in wn], [DIAGRAM_NOTE, DIAGRAM_UNREACHED_NOTE])
+        # Without a doc point nothing is reached: every point is shown, in point-list order.
+        data = diagram_data(dgm_point("2", "Second") + dgm_point("1", "First"), dgm_cxn("1", "2"))
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        self.assertEqual(prose, "Steps:\n\n[Diagram]\n\n- Second\n- First\n\n[/Diagram]\n")
+        self.assertIn(DIAGRAM_UNREACHED_NOTE, meta["warnings"])
+        # A fully connected diagram has no such warning.
+        self.assertNotIn(DIAGRAM_UNREACHED_NOTE, self.extract(anchored("Steps:", smartart("dgmData")))[1]["warnings"])
+
+    def test_only_node_and_assistant_points_hold_prose(self) -> None:
+        # PLAN's transition and presentation points have text ("TRANS", "PRES") that is never shown.
+        self.assertNotIn("TRANS", self.outline(PLAN))
+        self.assertNotIn("PRES", self.outline(PLAN))
+        points = (dgm_point("0", "Doc text", kind="doc") + dgm_point("1", "Lead", kind="node")
+                  + dgm_point("2", "Helper", kind="asst") + dgm_point("3", kind="asst") + dgm_point("4", "Loose pres", kind="pres"))
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("1", "2") + dgm_cxn("1", "3", 1))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- Lead\n  - Helper\n\n[/Diagram]\n")
+
+    def test_deep_nesting_renders_without_recursion(self) -> None:
+        count = 10_000
+        points = dgm_point("0", kind="doc") + "".join(dgm_point(str(n), f"Node {n}") for n in range(1, count + 1))
+        connections = "".join(dgm_cxn(str(n), str(n + 1)) for n in range(count))
+        prose = self.outline(diagram_data(points, connections))
+        lines = prose.split("\n\n")[2].split("\n")
+        self.assertEqual(len(lines), count)
+        self.assertEqual(lines[:2], ["- Node 1", "  - Node 2"])
+        # Indentation stops growing at 20 levels, as for list items.
+        self.assertEqual(lines[20:22], ["  " * 20 + "- Node 21", "  " * 20 + "- Node 22"])
+        self.assertEqual(lines[-1], "  " * 20 + f"- Node {count}")
+
+    def test_without_readable_text_a_diagram_keeps_its_placeholder(self) -> None:
+        placeholder = "Steps:[Unsupported drawing]\n"
+        body = anchored("Steps:", smartart("dgmData"))
+        for name, data, relationships in (
+            ("no relationship", PLAN, ""),
+            ("no part", None, DIAGRAM_RELS),
+            ("external", PLAN, rel("dgmData", "diagramData", "https://example.invalid/data.xml", external=True)),
+            ("no text-bearing points", diagram_data(dgm_point("0", kind="doc") + dgm_point("1", "Trans", kind="parTrans")), DIAGRAM_RELS),
+            ("not a data model", "<dataModel/>", DIAGRAM_RELS),
+            ("no point list", diagram_data("").replace("<dgm:ptLst></dgm:ptLst>", ""), DIAGRAM_RELS),
+        ):
+            with self.subTest(name=name):
+                prose, meta = self.extract(body, data, relationships=relationships)
+                self.assertEqual(prose, placeholder)
+                self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+                self.assertNotIn(DIAGRAM_NOTE, meta["warnings"])
+        # Text-bearing points whose text is empty: an empty diagram, like an empty text box.
+        self.assertEqual(self.outline(outline(("1", "0", ""), ("2", "1", ""))),
+                         "Steps:\n\n[Diagram]\n\n(empty)\n\n[/Diagram]\n")
+
+    def test_a_drawing_that_also_holds_a_picture_keeps_its_placeholder(self) -> None:
+        shared = graphic(DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="dgmData"/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                              '<a:blip r:embed="img"/></pic:blipFill></pic:pic>')
+        prose, meta = self.extract(anchored("Steps:", shared), extra={"word/media/image1.png": "png"},
+                                   relationships=DIAGRAM_RELS + image_rel("img", "media/image1.png"))
+        self.assertEqual(prose, f"Steps:[Unsupported drawing]\n\n{PLAN_BLOCK}\n")
+        self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+
+    def test_diagrams_render_where_anchored_and_not_from_deletions_or_unselected_copies(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", smartart("hd"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hd", "diagramData", "diagrams/data2.xml")}</Relationships>'
+        body = (anchored("Box:", modern_text_box(anchored("Inside:", smartart("dgmData"))))
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        head = outline(("1", "0", "Header node"))
+        prose, meta = self.extract(body, extra={"word/header1.xml": header, "word/_rels/header1.xml.rels": header_rels,
+                                                "word/diagrams/data2.xml": head},
+                                   relationships=DIAGRAM_RELS + rel("headerRef", "header", "header1.xml"))
+        self.assertEqual(prose, f"Box:\n\n[Text box]\n\nInside:\n\n{PLAN_BLOCK}\n\n[/Text box]\n\n"
+                                "## Header (word/header1.xml)\n\nHead:\n\n[Diagram]\n\n- Header node\n\n[/Diagram]\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN), part_entry("diagram", head, "word/header1.xml")])
+        # A diagram in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{smartart("dgmData")}</w:r></w:del></w:p>'
+        prose, meta = self.extract(deleted)
+        self.assertEqual(prose, "Kept.\n")
+        self.assertNotIn("objects", meta)
+        # Every compatibility copy's prose is read, but a diagram renders only from the chosen one.
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{anchored("Chosen:", smartart("dgmData"))}'
+                 f'</mc:Choice><mc:Fallback>{anchored("Other:", smartart("dgmData"))}</mc:Fallback></mc:AlternateContent>')
+        prose, meta = self.extract(block)
+        self.assertEqual(prose, f"Chosen:\n\n{PLAN_BLOCK}\n\nOther:[Unsupported drawing]\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)])
+        # A diagram in a comment is neither rendered nor recorded.
+        comments = (f'<w:comments xmlns:w="{W}" xmlns:r="{R}"><w:comment w:id="1" w:author="Ada">'
+                    f'{anchored("Note:", smartart("dgmData"))}</w:comment></w:comments>')
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Text.")}{end("1")}</w:p>', extra={"word/comments.xml": comments},
+                                   relationships=DIAGRAM_RELS + COMMENTS_REL)
+        self.assertEqual(prose, "Text.\n")
+        self.assertNotIn("objects", meta)
+
+    def test_a_diagram_part_referenced_twice_renders_twice(self) -> None:
+        prose, meta = self.extract(anchored("One:", smartart("dgmData")) + anchored("Two:", smartart("dgmData")))
+        self.assertEqual(prose, f"One:\n\n{PLAN_BLOCK}\n\nTwo:\n\n{PLAN_BLOCK}\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)] * 2)
+
+    def test_editing_a_node_changes_only_its_line(self) -> None:
+        before = self.outline(PLAN)
+        after = self.outline(outline(("1", "0", "Plan"), ("2", "1", "Gather needs"), ("3", "1", "Draft the outline"),
+                                     ("4", "0", "Review")))
+        changed = [(old, new) for old, new in zip(before.split("\n"), after.split("\n"), strict=True) if old != new]
+        self.assertEqual(changed, [("  - Gather requirements", "  - Gather needs")])
+
+    def test_documents_without_smartart_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before diagrams had prose: charts, embedded
+        # objects, imported chunks, text boxes (one grouped with a picture), images, equations
+        # and WordArt, in the body and a header.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", chart("hc"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart1.xml")}</Relationships>'
+        body = (paragraph("Intro. Second sentence.")
+                + f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box."), picture=True))
+                + anchored("Shape:", drawing_text_box(paragraph("Drawn.") + anchored("Chart:", chart("chart"))))
+                + f'<w:p>{equation(energy())}</w:p><w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>'
+                + anchored("Figure:", picture("img")) + smartart("nowhere")
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        parts = {name: data for name, data in object_parts().items() if not name.startswith("word/diagrams/")}
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+                         + rel("chunk", "aFChunk", "afchunk.htm") + image_rel("img", "media/image1.png")
+                         + image_rel("image1", "media/image1.png") + rel("headerRef", "header", "header1.xml"))
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra={**parts, "word/media/image1.png": "png bytes", "word/header1.xml": header,
+                                          "word/_rels/header1.xml.rels": header_rels}, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            # Metadata re-pinned when charts got a canonical hash and recognised drawings stopped
+            # warning about their wrapper markup (#77); the prose did not move.
+            ".prose.md": "9dd8a49a3e1c9cd1144c4f59d06efe69f57863f75c10c91243551b2e9b38a85c",
+            ".meta.json": "c8579c093e2c769931af6894ebb3c6a06ff29d990d6f1125aa63f7f35af121f6",
+        })
+
+
+
+CHART_NOTE = ("Chart titles, axis titles, series names and text categories are shown in [Chart] blocks after "
+              "their anchoring paragraph, from the chart's cached values; data values, numeric categories, "
+              "data labels and formatting are not shown, and the chart part is fingerprinted in objects.")
+CHART_REL = rel("chart", "chart", "charts/chart1.xml")
+
+
+class ChartTextTests(unittest.TestCase):
+    """Chart labels as [Chart] blocks in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-chart-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, data: str | None = None, *, extra: dict[str, str] | None = None,
+                relationships: str = CHART_REL) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        parts = chart_parts(quarterly() if data is None else data)
+        parts.update(extra or {})
+        make_docx(self.path, body, extra=parts, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def block(self, data: str) -> str:
+        """The prose of one paragraph anchoring one chart with part ``data``."""
+        prose, _ = self.extract(anchored("Figure:", chart("chart")), data)
+        return prose
+
+    def labels(self, plot: str, title: str | None = None, **options: str) -> list[str]:
+        """The label lines of a chart with ``plot`` and ``title``; [] when it keeps its placeholder."""
+        prose = self.block(chart_space(plot, title, **options))
+        if "[Chart]" not in prose:
+            self.assertEqual(prose, "Figure:[Unsupported drawing]\n")
+            return []
+        return prose.split("\n\n")[2].split("\n")
+
+    def test_a_chart_renders_its_labels_after_its_anchoring_paragraph(self) -> None:
+        prose, meta = self.extract(anchored("Figure:", chart("chart")) + paragraph("After."))
+        self.assertEqual(prose, f"Figure:\n\n{QUARTERLY_BLOCK}\n\nAfter.\n")
+        self.assertIn(CHART_NOTE, meta["warnings"])
+        self.assertNotIn(UNSUPPORTED_DRAWING, meta["warnings"])
+        # The fingerprint is still the chart part's hash, as before charts had prose.
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
+        # The chart part is supported; its embedded workbook is still not read.
+        unrendered = [wn for wn in meta["warnings"] if wn.startswith("Unrendered package part")]
+        self.assertEqual(unrendered, ["Unrendered package part: word/embeddings/chart_workbook.xlsx; "
+                                      "changes to its content are not compared."])
+        # A drawing directly in the body, and one between runs, render the same block.
+        self.assertEqual(self.extract(chart("chart"))[0], QUARTERLY_BLOCK + "\n")
+        prose, _ = self.extract(f'<w:p>{run("Before ")}<w:r>{chart("chart")}</w:r>{run(" after.")}</w:p>')
+        self.assertEqual(prose, f"Before after.\n\n{QUARTERLY_BLOCK}\n")
+
+    def test_labels_read_rich_text_cached_strings_and_literals(self) -> None:
+        rich = ('<c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>Sales </a:t></a:r><a:r><a:t> by</a:t></a:r><a:br/>'
+                '<a:r><a:t>region</a:t></a:r></a:p><a:p><a:endParaRPr/></a:p><a:p><a:fld id="{1}" type="datetime">'
+                '<a:t>2026</a:t></a:fld><a:r><a:t>\n  final</a:t></a:r></a:p></c:rich></c:tx>')
+        literal = "<c:tx><c:v>  Plan\tA </c:v></c:tx>"
+        plot = (f"<c:lineChart>{chart_series(chart_cached('North', 'East'))}{chart_series(literal)}"
+                f"{chart_series(chart_rich('Rich', 'name'))}</c:lineChart>"
+                + chart_axis("valAx", chart_cached("Units sold")))
+        self.assertEqual(self.labels(plot, rich), ["Title: Sales by region 2026 final", "Axis title: Units sold",
+                                                   "Series: North East", "Series: Plan A", "Series: Rich name"])
+        # A title linked to a cell reads its cached string.
+        self.assertEqual(self.labels("<c:pieChart/>", chart_cached("Linked title")), ["Title: Linked title"])
+
+    def test_no_title_line_when_the_title_is_deleted_absent_or_automatic(self) -> None:
+        plot = f"<c:pieChart>{chart_series(chart_cached('Share'))}</c:pieChart>"
+        self.assertEqual(self.labels(plot, chart_rich("Shown"), deleted=' val="0"'), ["Title: Shown", "Series: Share"])
+        for name, options in (("deleted", {"deleted": ' val="1"'}), ("deleted, no val", {"deleted": ""}),
+                              ("deleted, true", {"deleted": ' val="true"'})):
+            with self.subTest(name=name):
+                self.assertEqual(self.labels(plot, chart_rich("Hidden"), **options), ["Series: Share"])
+        # No c:title, and a c:title without text (Word draws the series name): no title line.
+        self.assertEqual(self.labels(plot), ["Series: Share"])
+        self.assertEqual(self.labels(plot, ""), ["Series: Share"])
+
+    def test_axis_titles_follow_document_order(self) -> None:
+        plot = ("<c:surfaceChart/>" + chart_axis("dateAx", chart_rich("Month")) + chart_axis("valAx", "", "2")
+                + chart_axis("serAx", chart_rich("Depth"), "3") + chart_axis("catAx", chart_rich("Site"), "4")
+                + '<c:spPr><c:title/></c:spPr>')
+        self.assertEqual(self.labels(plot), ["Axis title: Month", "Axis title: Depth", "Axis title: Site"])
+
+    def test_series_follow_document_order_across_chart_groups(self) -> None:
+        plot = (f"<c:barChart>{chart_series(chart_cached('Bars'))}{chart_series()}</c:barChart>"
+                f"<c:lineChart>{chart_series(chart_cached('Trend'))}</c:lineChart>"
+                f"<c:scatterChart>{chart_series(chart_rich('Points'))}</c:scatterChart>")
+        self.assertEqual(self.labels(plot), ["Series: Bars", "Series: Trend", "Series: Points"])
+
+    def test_shared_categories_are_listed_once_and_others_per_series(self) -> None:
+        months = chart_categories("Jan", "Feb")
+        numeric = "<c:cat><c:numRef><c:f>Sheet1!$A$2</c:f><c:numCache><c:pt idx='0'><c:v>2025</c:v></c:pt></c:numCache></c:numRef></c:cat>"
+        shared = (f"<c:barChart>{chart_series(chart_cached('A'), months)}{chart_series(chart_cached('B'), numeric)}"
+                  f"{chart_series(chart_cached('C'), months)}</c:barChart>")
+        self.assertEqual(self.labels(shared), ["Series: A", "Series: B", "Series: C", "Category: Jan", "Category: Feb"])
+        differing = (f"<c:barChart>{chart_series(chart_cached('A'), months)}{chart_series('', chart_categories('Mar'))}"
+                     f"{chart_series(chart_cached('C'), numeric)}{chart_series(chart_cached('D'), chart_categories('Feb', 'Jan'))}"
+                     "</c:barChart>")
+        self.assertEqual(self.labels(differing), ["Series: A", "Category: Jan", "Category: Feb", "Category: Mar",
+                                                  "Series: C", "Series: D", "Category: Feb", "Category: Jan"])
+        # Categories without any series name still give the chart a block.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', months)}</c:barChart>"), ["Category: Jan", "Category: Feb"])
+
+    def test_category_points_follow_idx_and_literals_count(self) -> None:
+        unordered = ('<c:cat><c:strRef><c:f>x</c:f><c:strCache><c:ptCount val="5"/><c:pt idx="2"><c:v>Third</c:v></c:pt>'
+                     '<c:pt idx="0"><c:v> First </c:v></c:pt><c:pt idx="1"><c:v/></c:pt><c:pt idx="2"><c:v>Again</c:v></c:pt>'
+                     '<c:pt idx="x"><c:v>Bad</c:v></c:pt><c:pt idx="10"><c:v>Last</c:v></c:pt></c:strCache></c:strRef></c:cat>')
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', unordered)}</c:barChart>"),
+                         ["Category: First", "Category: Third", "Category: Last"])
+        literal = f"<c:cat><c:strLit>{str_points('North', 'South')}</c:strLit></c:cat>"
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', literal)}</c:barChart>"),
+                         ["Category: North", "Category: South"])
+
+    def test_multi_level_categories_join_outermost_to_innermost(self) -> None:
+        def level(*points: tuple[int, str]) -> str:
+            return "<c:lvl>" + "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in points) + "</c:lvl>"
+
+        multi = ('<c:cat><c:multiLvlStrRef><c:f>Sheet1!$A$2:$B$5</c:f><c:multiLvlStrCache><c:ptCount val="4"/>'
+                 + level((0, "Q1"), (1, "Q2"), (2, "Q1"), (3, "Q2")) + level((0, "2025"), (2, "2026"))
+                 + level((0, "Plan")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        # Each outer label is shown once, on the first category of its group, as Word stores it.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series(chart_cached('Units'), multi)}</c:barChart>"), [
+            "Series: Units", "Category: Plan / 2025 / Q1", "Category: Q2", "Category: 2026 / Q1", "Category: Q2"])
+        # Empty points add nothing, and an index only an outer level holds is a category of its own.
+        sparse = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level((0, "Q1"), (1, ""))
+                  + level((1, "2026"), (3, "2027")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', sparse)}</c:barChart>"),
+                         ["Category: Q1", "Category: 2026", "Category: 2027"])
+        # A long outer label is never copied into the categories of its group.
+        long = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level(*((i, f"D{i}") for i in range(300)))
+                + level((0, "Y" * 100_000)) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        lines = self.labels(f"<c:barChart>{chart_series('', long)}</c:barChart>")
+        self.assertEqual(lines[:2], ["Category: " + "Y" * 100_000 + " / D0", "Category: D1"])
+        self.assertEqual((len(lines), lines[-1]), (201, "Category: … (100 more)"))
+
+    def test_numeric_categories_and_data_values_produce_no_lines(self) -> None:
+        numeric = ("<c:cat><c:numRef><c:f>Sheet1!$A$2</c:f><c:numCache><c:formatCode>General</c:formatCode>"
+                   '<c:pt idx="0"><c:v>2025</c:v></c:pt></c:numCache></c:numRef></c:cat>')
+        literal = '<c:cat><c:numLit><c:pt idx="0"><c:v>7</c:v></c:pt></c:numLit></c:cat>'
+        plot = f"<c:barChart>{chart_series(chart_cached('Units'), numeric, '4242')}{chart_series('', literal)}</c:barChart>"
+        self.assertEqual(self.labels(plot), ["Series: Units"])
+        # Without any label at all, the chart keeps its placeholder.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', numeric)}</c:barChart>"), [])
+
+    def test_categories_are_capped_at_200_lines_per_chart(self) -> None:
+        days = chart_categories(*(f"Day {n}" for n in range(1, 251)))
+        lines = self.labels(f"<c:lineChart>{chart_series(chart_cached('Visits'), days)}</c:lineChart>")
+        self.assertEqual(len(lines), 202)
+        self.assertEqual(lines[:2], ["Series: Visits", "Category: Day 1"])
+        self.assertEqual(lines[-2:], ["Category: Day 200", "Category: … (50 more)"])
+        # Per-series categories share the cap; later series names still show.
+        plot = (f"<c:barChart>{chart_series(chart_cached('A'), chart_categories(*(f'A{n}' for n in range(150))))}"
+                f"{chart_series(chart_cached('B'), chart_categories(*(f'B{n}' for n in range(100))))}"
+                f"{chart_series(chart_cached('C'), chart_categories('C0'))}</c:barChart>")
+        lines = self.labels(plot)
+        self.assertEqual(sum(line.startswith("Category: ") for line in lines), 201)
+        self.assertEqual(lines[150:153], ["Category: A149", "Series: B", "Category: B0"])
+        self.assertEqual(lines[-3:], ["Category: B49", "Category: … (51 more)", "Series: C"])
+        # Exactly 200 categories need no such line.
+        lines = self.labels(f"<c:lineChart>{chart_series('', chart_categories(*map(str, range(200))))}</c:lineChart>")
+        self.assertEqual((len(lines), lines[-1]), (200, "Category: 199"))
+
+    def test_without_labels_a_chart_keeps_its_placeholder(self) -> None:
+        placeholder = "Figure:[Unsupported drawing]\n"
+        body = anchored("Figure:", chart("chart"))
+        unlabelled = object_parts()["word/charts/chart1.xml"]
+        for name, data, relationships in (
+            ("no labels", unlabelled, CHART_REL),
+            ("no relationship", quarterly(), ""),
+            ("no part", None, rel("chart", "chart", "charts/chart9.xml")),
+            ("external", quarterly(), rel("chart", "chart", "https://example.invalid/chart.xml", external=True)),
+            ("not a chart space", "<chart/>", CHART_REL),
+            ("no chart", f'<c:chartSpace xmlns:c="{C}"/>', CHART_REL),
+            ("no plot area", f'<c:chartSpace xmlns:c="{C}"><c:chart/></c:chartSpace>', CHART_REL),
+        ):
+            with self.subTest(name=name):
+                prose, meta = self.extract(body, data, relationships=relationships)
+                self.assertEqual(prose, placeholder)
+                self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+                self.assertNotIn(CHART_NOTE, meta["warnings"])
+        # An Office 2016 chart (cx:chart) is not a c:chart and keeps today's output.
+        cx = graphic("http://schemas.microsoft.com/office/drawing/2014/chartex",
+                     '<cx:chart xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex" r:id="chart"/>')
+        self.assertEqual(self.extract(anchored("Figure:", cx))[0], placeholder)
+
+    def test_a_drawing_that_also_holds_a_picture_keeps_its_placeholder(self) -> None:
+        shared = graphic(C, f'<c:chart xmlns:c="{C}" r:id="chart"/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                            '<a:blip r:embed="img"/></pic:blipFill></pic:pic>')
+        prose, meta = self.extract(anchored("Figure:", shared), extra={"word/media/image1.png": "png"},
+                                   relationships=CHART_REL + image_rel("img", "media/image1.png"))
+        self.assertEqual(prose, f"Figure:[Unsupported drawing]\n\n{QUARTERLY_BLOCK}\n")
+        self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+
+    def test_charts_render_where_anchored_and_not_from_deletions_or_unselected_copies(self) -> None:
+        sales = chart_space(f"<c:pieChart>{chart_series(chart_cached('Header sales'))}</c:pieChart>")
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", chart("hc"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart2.xml")}</Relationships>'
+        # A chart in a text box, then a chart beside a SmartArt diagram in one paragraph.
+        body = (anchored("Box:", modern_text_box(anchored("Inside:", chart("chart"))))
+                + f'<w:p>{run("Both:")}<w:r>{smartart("dgmData")}</w:r><w:r>{chart("chart")}</w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        prose, meta = self.extract(body, extra={"word/header1.xml": header, "word/_rels/header1.xml.rels": header_rels,
+                                                "word/charts/chart2.xml": sales, **diagram_parts(PLAN)},
+                                   relationships=CHART_REL + DIAGRAM_RELS + rel("headerRef", "header", "header1.xml"))
+        self.assertEqual(prose, f"Box:\n\n[Text box]\n\nInside:\n\n{QUARTERLY_BLOCK}\n\n[/Text box]\n\n"
+                                f"Both:\n\n{PLAN_BLOCK}\n\n{QUARTERLY_BLOCK}\n\n"
+                                "## Header (word/header1.xml)\n\nHead:\n\n[Chart]\n\nSeries: Header sales\n\n[/Chart]\n")
+        self.assertEqual(meta["objects"], [chart_entry(quarterly()), part_entry("diagram", PLAN),
+                                           chart_entry(quarterly()), chart_entry(sales, "word/header1.xml")])
+        self.assertEqual([wn for wn in meta["warnings"] if "[Chart]" in wn or "[Diagram]" in wn], [CHART_NOTE, DIAGRAM_NOTE])
+        # A chart in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{chart("chart")}</w:r></w:del></w:p>'
+        prose, meta = self.extract(deleted)
+        self.assertEqual(prose, "Kept.\n")
+        self.assertNotIn("objects", meta)
+        # Every compatibility copy's prose is read, but a chart renders only from the chosen one.
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{anchored("Chosen:", chart("chart"))}'
+                 f'</mc:Choice><mc:Fallback>{anchored("Other:", chart("chart"))}</mc:Fallback></mc:AlternateContent>')
+        prose, meta = self.extract(block)
+        self.assertEqual(prose, f"Chosen:\n\n{QUARTERLY_BLOCK}\n\nOther:[Unsupported drawing]\n")
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
+        # A chart in a comment is neither rendered nor recorded.
+        comments = (f'<w:comments xmlns:w="{W}" xmlns:r="{R}"><w:comment w:id="1" w:author="Ada">'
+                    f'{anchored("Note:", chart("chart"))}</w:comment></w:comments>')
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Text.")}{end("1")}</w:p>', extra={"word/comments.xml": comments},
+                                   relationships=CHART_REL + COMMENTS_REL)
+        self.assertEqual(prose, "Text.\n")
+        self.assertNotIn("objects", meta)
+
+    def test_a_chart_part_referenced_twice_renders_twice(self) -> None:
+        prose, meta = self.extract(anchored("One:", chart("chart")) + anchored("Two:", chart("chart")))
+        self.assertEqual(prose, f"One:\n\n{QUARTERLY_BLOCK}\n\nTwo:\n\n{QUARTERLY_BLOCK}\n")
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())] * 2)
+
+    def test_editing_a_label_changes_only_its_line(self) -> None:
+        before = self.block(quarterly())
+        for edit, line in (({"series_2026": "2026 (forecast)"}, ("Series: 2026", "Series: 2026 (forecast)")),
+                           ({"category": "Q2 (est.)"}, ("Category: Q2", "Category: Q2 (est.)")),
+                           ({"title": "Revenue by quarter"}, ("Title: Quarterly revenue", "Title: Revenue by quarter"))):
+            with self.subTest(edit=edit):
+                after = self.block(quarterly(**edit))
+                changed = [(old, new) for old, new in zip(before.split("\n"), after.split("\n"), strict=True) if old != new]
+                self.assertEqual(changed, [line])
+
+    def fingerprint(self, data: str) -> str:
+        """The objects sha256 of one anchored chart whose part holds ``data``."""
+        _, meta = self.extract(anchored("Figure:", chart("chart")), data)
+        (entry,) = meta["objects"]
+        self.assertEqual(entry, chart_entry(data))
+        return str(entry["sha256"])
+
+    def test_renumbered_axis_ids_keep_the_chart_fingerprint(self) -> None:
+        # LibreOffice writes new random axis IDs on every save, and changes nothing else.
+        saved = self.fingerprint(crossed_chart(("77217256", "2760290")))
+        self.assertEqual(self.fingerprint(crossed_chart(("90904435", "24668023"))), saved)
+        self.assertEqual(self.fingerprint(crossed_chart(("1", "2"))), saved)
+        # The IDs are numbered by first appearance, so swapping two values is a renumbering too.
+        self.assertEqual(self.fingerprint(crossed_chart(("2760290", "77217256"))), saved)
+
+    def test_other_chart_edits_still_change_the_fingerprint(self) -> None:
+        saved = self.fingerprint(crossed_chart())
+        serial = '<c:serAx><c:axId val="333"/><c:scaling/><c:delete val="0"/><c:crossAx val="111"/></c:serAx>'
+        edits = {
+            "a cached value": crossed_chart(value="99"),
+            "a series name": crossed_chart(series="2026"),
+            # Each axis crosses itself instead of the other one.
+            "which axis crosses which": crossed_chart(crosses=("111", "222")),
+            "an added axis": crossed_chart(extra_axis=serial),
+            "an axis ID that is not a renumbering": crossed_chart(("111", "111")),
+        }
+        for name, data in edits.items():
+            with self.subTest(edit=name):
+                self.assertNotEqual(self.fingerprint(data), saved)
+
+    def test_a_chart_part_too_large_to_parse_keeps_its_raw_hash(self) -> None:
+        # Over the parsed-part cap the chart part cannot be parsed, so its fingerprint is the
+        # streamed hash of its bytes, as before charts had a canonical form; no error is raised.
+        from zipfile import ZipFile as Package
+
+        from pilcrow import extract as module
+
+        data = crossed_chart()
+        make_docx(self.path, f'<w:p><w:r>{chart("chart")}</w:r></w:p>', extra=chart_parts(data),
+                  relationships=CHART_REL)
+        with Package(self.path) as package, patch.object(module, "MAX_PARSED_PART_BYTES", len(data) - 1):
+            extractor = module.Reader(package)
+            extractor.rels = extractor.relationships("word/document.xml")
+            self.assertEqual(extractor.object_part("chart", "chart"), part_entry("chart", data))
+        with Package(self.path) as package:
+            extractor = module.Reader(package)
+            extractor.rels = extractor.relationships("word/document.xml")
+            self.assertEqual(extractor.object_part("chart", "chart"), chart_entry(data))
+
+    def test_documents_without_labelled_charts_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before charts had prose: OBJECT_BODY (an
+        # unlabelled chart, a SmartArt diagram, an embedded object and an imported chunk).
+        from pilcrow.extract import extract
+
+        make_docx(self.path, OBJECT_BODY, extra=object_parts(), relationships=OBJECT_RELS)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            # Metadata re-pinned when charts got a canonical hash and recognised drawings stopped
+            # warning about their wrapper markup (#77); the prose did not move.
+            ".prose.md": "fec4a0a3752a5c8b11f07f875c2d26c283d7c5c06bd6f88d4277092e8d1f8ba9",
+            ".meta.json": "743cec43e929caab6328a1f370ed3ce65b89d7072eb63188ca3bfa6538b4a27d",
+        })
+
+
+def anchored_graphic(uri: str, content: str) -> str:
+    """A floating (wp:anchor) DrawingML graphic frame holding ``content``, with the position,
+    extent, wrapping and properties Word writes around it."""
+    return (f'<w:drawing><wp:anchor xmlns:wp="{WP}" distT="0" distB="0" distL="114300" distR="114300" simplePos="0" '
+            'relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>'
+            '<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>'
+            '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>'
+            '<wp:extent cx="914400" cy="914400"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="bothSides"/>'
+            f'<wp:docPr id="1" name="Graphic 1"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="{A}"><a:graphicData uri="{uri}">'
+            f'{content}</a:graphicData></a:graphic></wp:anchor></w:drawing>')
+
+
+def generic_warnings(meta: dict[str, Any]) -> list[str]:
+    """The allowlist's generic construct warnings, without the specific notes."""
+    return [wn for wn in meta["warnings"] if wn.startswith(("Unsupported Word construct", "Unsupported XML construct"))]
+
+
+class RecognisedConstructTests(unittest.TestCase):
+    """Constructs Pilcrow records and notes on its own do not also warn as unknown markup (#77)."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-recognised-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, *, extra: dict[str, str] | None = None, relationships: str = "") -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def test_a_comment_annotation_mark_does_not_warn(self) -> None:
+        # Word and LibreOffice start every comment with a w:annotationRef run.
+        comments = comments_part({"1": "Please check."}).replace("<w:r>", "<w:r><w:annotationRef/></w:r><w:r>", 1)
+        self.assertIn("annotationRef", comments)
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>',
+                                   extra={"word/comments.xml": comments}, relationships=COMMENTS_REL)
+        self.assertEqual(prose, "Commented passage.\n")
+        self.assertEqual(generic_warnings(meta), [])
+        self.assertIn(COMMENT_NOTE, meta["warnings"])
+        self.assertEqual([entry["text"] for entry in meta["review"] if entry["kind"] == "comment"], ["Please check."])
+
+    def test_drawings_holding_pictures_charts_or_diagrams_give_only_their_own_notes(self) -> None:
+        unlabelled = f'<c:chartSpace xmlns:c="{C}"><c:chart/></c:chartSpace>'
+        graphics = {
+            "picture": (PIC, f'<pic:pic xmlns:pic="{PIC}"><pic:nvPicPr><pic:cNvPr id="0" name="cat.png"/><pic:cNvPicPr/>'
+                             '</pic:nvPicPr><pic:blipFill><a:blip r:embed="img"/><a:stretch><a:fillRect/></a:stretch>'
+                             '</pic:blipFill><pic:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>',
+                        [IMAGE_NOTE, UNSUPPORTED_DRAWING]),
+            "chart": (C, f'<c:chart xmlns:c="{C}" r:id="chart"/>', [CHART_NOTE]),
+            "unlabelled chart": (C, f'<c:chart xmlns:c="{C}" r:id="bare"/>', [UNSUPPORTED_DRAWING]),
+            "diagram": (DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="dgmData" r:lo="lo" r:qs="qs" r:cs="cs"/>', [DIAGRAM_NOTE]),
+        }
+        extra = {**chart_parts(quarterly()), **diagram_parts(PLAN), "word/media/image1.png": "png bytes",
+                 "word/charts/chart2.xml": unlabelled}
+        relationships = (CHART_REL + DIAGRAM_RELS + image_rel("img", "media/image1.png")
+                         + rel("bare", "chart", "charts/chart2.xml"))
+        for name, (uri, content, notes) in graphics.items():
+            for wrap in (graphic, anchored_graphic):
+                with self.subTest(graphic=name, wrapper=wrap.__name__):
+                    _, meta = self.extract(anchored("Figure:", wrap(uri, content)), extra=extra, relationships=relationships)
+                    self.assertEqual(generic_warnings(meta), [])
+                    for note in notes:
+                        self.assertIn(note, meta["warnings"])
+                    self.assertEqual(len(meta["images"]) + len(meta.get("objects", [])), 1)
+
+    def test_a_compatibility_copy_holding_only_a_recognised_drawing_does_not_warn(self) -> None:
+        # The recorded copy (the first mc:Choice) holds only a chart; the picture of it in
+        # mc:Fallback is not read, as with text boxes.
+        copies = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{chart("chart")}</mc:Choice>'
+                  f'<mc:Fallback>{picture("img")}</mc:Fallback></mc:AlternateContent>')
+        extra = {**chart_parts(quarterly()), "word/media/image1.png": "png bytes"}
+        _, meta = self.extract(anchored("Figure:", copies), extra=extra,
+                               relationships=CHART_REL + image_rel("img", "media/image1.png"))
+        self.assertEqual(generic_warnings(meta), [])
+        self.assertIn(CHART_NOTE, meta["warnings"])
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
+
+    def test_drawings_holding_anything_else_still_warn(self) -> None:
+        shape = (f'<wps:wsp xmlns:wps="{WPS}"><wps:cNvSpPr/><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                 '</wps:spPr><wps:bodyPr/></wps:wsp>')
+        group = (f'<wpg:wgp xmlns:wpg="{WPG}"><wpg:cNvGrpSpPr/><wpg:grpSpPr/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                 '<a:blip r:embed="img"/></pic:blipFill></pic:pic></wpg:wgp>')
+        chartex = "http://schemas.microsoft.com/office/drawing/2014/chartex"
+        others = {
+            "a shape without a text box": (WPS, shape, "wsp"),
+            "a grouped picture": (WPG, group, "wgp"),
+            "a chartex chart": (chartex, f'<cx:chart xmlns:cx="{chartex}" r:id="chart"/>', "chart"),
+            "a chart next to a shape": (C, f'<c:chart xmlns:c="{C}" r:id="chart"/>{shape}', "wsp"),
+            "an empty frame": (PIC, "", "graphicData"),
+        }
+        extra = {**chart_parts(quarterly()), "word/media/image1.png": "png bytes"}
+        relationships = CHART_REL + image_rel("img", "media/image1.png")
+        for name, (uri, content, construct) in others.items():
+            for wrap in (graphic, anchored_graphic):
+                with self.subTest(graphic=name, wrapper=wrap.__name__):
+                    _, meta = self.extract(anchored("Figure:", wrap(uri, content)), extra=extra, relationships=relationships)
+                    warnings = generic_warnings(meta)
+                    self.assertIn("Unsupported Word construct drawing; its semantics are not fully compared.", warnings)
+                    self.assertIn(f"Unsupported XML construct {construct}; content may be omitted or approximate.", warnings)
+
+    def test_documents_without_charts_comments_pictures_or_diagrams_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before #77: headings, lists, a table, tracked
+        # changes, a hyperlink, a symbol, text boxes (DrawingML and VML), an equation, an
+        # embedded object, an imported chunk, WordArt and a footnote, in the body and a header.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", vml_text_box(paragraph("In the header.")))}</w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p><w:r><w:footnoteRef/></w:r>'
+                     f'{run(" A note.")}</w:p></w:footnote></w:footnotes>')
+        body = (paragraph("Title", '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>')
+                + paragraph("Dr. Smith wrote this. Art. 5 applies!")
+                + list_item("First item.", "1") + list_item("Nested.", "1", 1)
+                + "<w:tbl><w:tr><w:tc>" + paragraph("Cell text.") + "</w:tc><w:tc/></w:tr></w:tbl>"
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                + '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>'
+                + f'<w:p><w:hyperlink r:id="link">{run("A link")}</w:hyperlink>{symbol()}</w:p>'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box.")))
+                + f'<w:p>{equation(energy())}</w:p><w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>'
+                + f'<w:p>{run("Data: ")}<w:r>{ole_object("ole")}</w:r>{run("Noted.")}'
+                + '<w:r><w:footnoteReference w:id="1"/></w:r></w:p>' + alt_chunk("chunk")
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (NUMBERING_REL + rel("link", "hyperlink", "https://example.invalid/", external=True)
+                         + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+                         + rel("chunk", "aFChunk", "afchunk.htm") + rel("headerRef", "header", "header1.xml")
+                         + rel("footnotes", "footnotes", "footnotes.xml"))
+        extra = {"word/numbering.xml": numbering(abstract_num("0", level(0), level(1, "decimal", "%2.")), num("1", "0")),
+                 "word/embeddings/Microsoft_Excel_Worksheet.xlsx": "workbook bytes", "word/afchunk.htm": "<p>Chunk</p>",
+                 "word/header1.xml": header, "word/footnotes.xml": footnotes}
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "09ca1f86589040ce639592969e7e91a83528a9ce542d4865632fafe6118c4a36",
+            ".meta.json": "ef18ab06c57777b24914f755ec89c39ec6faa1909c0400d1f5689ee475c84a59",
         })
 
 
