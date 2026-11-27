@@ -445,6 +445,40 @@ def comments_extended(*entries: tuple[str, str | None, str | None]) -> str:
             + "".join(entry(*e) for e in entries) + "</w15:commentsEx>")
 
 
+def dgm_point(model_id: str, *paragraphs: str, kind: str | None = None) -> str:
+    """A SmartArt data model point with one a:p of one run per paragraph; none: no dgm:t."""
+    kind_xml = f' type="{kind}"' if kind else ""
+    text = "".join(f'<a:p><a:r><a:rPr lang="en-US"/><a:t>{escape(p)}</a:t></a:r></a:p>' for p in paragraphs)
+    body = f"<dgm:t><a:bodyPr/><a:lstStyle/>{text}</dgm:t>" if paragraphs else ""
+    return f'<dgm:pt modelId="{model_id}"{kind_xml}><dgm:prSet/><dgm:spPr/>{body}</dgm:pt>'
+
+
+def dgm_cxn(src: str, dest: str, order: int = 0, kind: str | None = None) -> str:
+    """A data model connection; without ``kind`` it is a parOf (parent/child) connection."""
+    kind_xml = f' type="{kind}"' if kind else ""
+    return (f'<dgm:cxn modelId="c{src}-{dest}"{kind_xml} srcId="{src}" destId="{dest}" '
+            f'srcOrd="{order}" destOrd="0"/>')
+
+
+def diagram_data(points: str, connections: str = "") -> str:
+    """A SmartArt data part (dgm:dataModel) with the given points and connections."""
+    return (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst>{points}</dgm:ptLst>'
+            f"<dgm:cxnLst>{connections}</dgm:cxnLst><dgm:bg/><dgm:whole/></dgm:dataModel>")
+
+
+def outline(*nodes: tuple[str, str, str]) -> str:
+    """A data part for an outline of (id, parent id, text) nodes, the doc point being "0",
+    siblings in the given order, with the transition and presentation points Word writes."""
+    points, connections = [dgm_point("0", kind="doc")], []
+    siblings: dict[str, int] = {}
+    for node, parent, text in nodes:
+        order = siblings[parent] = siblings.get(parent, -1) + 1
+        points += [dgm_point(node, *([text] if text else [])), dgm_point(f"p{node}", "TRANS", kind="parTrans"),
+                   dgm_point(f"s{node}", kind="sibTrans"), dgm_point(f"v{node}", "PRES", kind="pres")]
+        connections += [dgm_cxn(parent, node, order), dgm_cxn(node, f"v{node}", 0, "presOf")]
+    return diagram_data("".join(points), "".join(connections))
+
+
 def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str = "Plan",
                  chunk: str = "Chunk text") -> dict[str, str]:
     """The parts a chart, a SmartArt diagram, an embedded workbook and an imported chunk point to."""
@@ -457,9 +491,7 @@ def object_parts(*, value: str = "10", workbook: str = "workbook v1", node: str 
                                               + rel("rId1", "package", "../embeddings/chart_workbook.xlsx")
                                               + "</Relationships>"),
         "word/embeddings/chart_workbook.xlsx": "chart workbook bytes",
-        "word/diagrams/data1.xml": (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="{A}"><dgm:ptLst><dgm:pt modelId="1">'
-                                    f"<dgm:t><a:p><a:r><a:t>{node}</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst>"
-                                    "</dgm:dataModel>"),
+        "word/diagrams/data1.xml": outline(("1", "0", node)),
         "word/diagrams/layout1.xml": "<layout/>",
         "word/diagrams/quickStyle1.xml": "<quickStyle/>",
         "word/diagrams/colors1.xml": "<colors/>",
@@ -2087,8 +2119,9 @@ class CLITests(unittest.TestCase):
             part_entry("embedded object", parts["word/embeddings/Microsoft_Excel_Worksheet.xlsx"], prog_id="Excel.Sheet.12"),
             part_entry("imported chunk", parts["word/afchunk.htm"]),
         ])
-        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported drawing][Unsupported object]"
-                                                "\n\n[Unsupported altChunk]\n")
+        # The diagram's text is shown after its paragraph; the other objects keep their placeholders.
+        self.assertEqual(prose.decode("utf-8"), "Results: [Unsupported drawing][Unsupported object]"
+                                                "\n\n[Diagram]\n\n- Plan\n\n[/Diagram]\n\n[Unsupported altChunk]\n")
         # Hashed parts are compared now; formatting parts and the chart's workbook still are not.
         unrendered = sorted(wn.split(";")[0].removeprefix("Unrendered package part: ")
                             for wn in data["warnings"] if wn.startswith("Unrendered package part"))
@@ -2122,7 +2155,7 @@ class CLITests(unittest.TestCase):
         self.cli("export", "essay.docx")
         self.cli("check", "essay.docx")
         after = self.exported()
-        self.assertEqual(after[0], prose, "object edits must not alter the prose")
+        self.assertEqual(after[0], prose, "chart edits must not alter the prose")
         self.assertNotEqual(after[1], meta)
 
     def test_objects_in_headers_notes_and_text_boxes_are_recorded_by_part(self) -> None:
@@ -2863,6 +2896,223 @@ class EquationTextTests(unittest.TestCase):
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
             ".prose.md": "8a6483a884064a67cfe3ac935b295872d8ad1d864b2b945332068c8189c038b5",
             ".meta.json": "8fd177d4171cfe566c5adda90807756c5fdd5596c408381f3b495d36f21208d2",
+        })
+
+
+DIAGRAM_NOTE = ("SmartArt diagram text is shown as an outline in [Diagram] blocks after its anchoring paragraph; "
+                "layout, shapes and formatting are not shown, and the diagram's data part is fingerprinted in objects.")
+DIAGRAM_UNREACHED_NOTE = ("Some SmartArt diagram text is not connected to the diagram's outline; "
+                          "it is shown at the top level after the outline.")
+UNSUPPORTED_DRAWING = "Unsupported drawing: content is not rendered in prose; inspect the DOCX in Word."
+DIAGRAM_RELS = (rel("dgmData", "diagramData", "diagrams/data1.xml") + rel("dgmLayout", "diagramLayout", "diagrams/layout1.xml")
+                + rel("dgmStyle", "diagramQuickStyle", "diagrams/quickStyle1.xml")
+                + rel("dgmColors", "diagramColors", "diagrams/colors1.xml"))
+PLAN = outline(("1", "0", "Plan"), ("2", "1", "Gather requirements"), ("3", "1", "Draft the outline"), ("4", "0", "Review"))
+PLAN_BLOCK = "[Diagram]\n\n- Plan\n  - Gather requirements\n  - Draft the outline\n- Review\n\n[/Diagram]"
+
+
+def diagram_parts(data: str, name: str = "word/diagrams/data1.xml") -> dict[str, str]:
+    """A SmartArt diagram's data part holding ``data``, with its formatting parts."""
+    return {name: data, "word/diagrams/layout1.xml": "<layout/>", "word/diagrams/quickStyle1.xml": "<quickStyle/>",
+            "word/diagrams/colors1.xml": "<colors/>"}
+
+
+class DiagramTextTests(unittest.TestCase):
+    """SmartArt diagram text as [Diagram] outline blocks in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-diagram-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, data: str | None = PLAN, *, extra: dict[str, str] | None = None,
+                relationships: str = DIAGRAM_RELS) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        parts = {} if data is None else diagram_parts(data)
+        parts.update(extra or {})
+        make_docx(self.path, body, extra=parts, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def outline(self, data: str) -> str:
+        """The prose of one paragraph anchoring one diagram with ``data``."""
+        prose, _ = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        return prose
+
+    def test_a_diagram_renders_its_outline_after_its_anchoring_paragraph(self) -> None:
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")) + paragraph("After."))
+        self.assertEqual(prose, f"Steps:\n\n{PLAN_BLOCK}\n\nAfter.\n")
+        self.assertIn(DIAGRAM_NOTE, meta["warnings"])
+        self.assertNotIn(UNSUPPORTED_DRAWING, meta["warnings"])
+        self.assertNotIn(DIAGRAM_UNREACHED_NOTE, meta["warnings"])
+        # The fingerprint is still the data part's hash, as before diagrams had prose.
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)])
+        # The data part is supported; its formatting parts are still not read.
+        unrendered = [wn for wn in meta["warnings"] if wn.startswith("Unrendered package part")]
+        self.assertEqual(unrendered, [f"Unrendered package part: word/diagrams/{name}.xml; changes to its content are not compared."
+                                      for name in ("colors1", "layout1", "quickStyle1")])
+        # A drawing directly in the body, and one between runs, render the same block.
+        self.assertEqual(self.extract(smartart("dgmData"))[0], PLAN_BLOCK + "\n")
+        prose, _ = self.extract(f'<w:p>{run("Before ")}<w:r>{smartart("dgmData")}</w:r>{run(" after.")}</w:p>')
+        self.assertEqual(prose, f"Before after.\n\n{PLAN_BLOCK}\n")
+
+    def test_node_text_joins_paragraphs_runs_fields_and_breaks_and_splits_sentences(self) -> None:
+        point = ('<dgm:pt modelId="1"><dgm:t><a:bodyPr/><a:p><a:r><a:t>Gather </a:t></a:r><a:r><a:t> data</a:t></a:r>'
+                 '<a:br/><a:r><a:t>now</a:t></a:r></a:p><a:p><a:endParaRPr/></a:p><a:p><a:fld id="{1}" type="slidenum">'
+                 '<a:t>7</a:t></a:fld><a:r><a:t>\n  times</a:t></a:r></a:p></dgm:t></dgm:pt>')
+        data = diagram_data(dgm_point("0", kind="doc") + point + dgm_point("2", "Check the data. Then publish it."),
+                            dgm_cxn("0", "1") + dgm_cxn("1", "2"))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- Gather data now 7 times\n"
+                                             "  - Check the data.\n    Then publish it.\n\n[/Diagram]\n")
+
+    def test_siblings_follow_src_ord_then_connection_order(self) -> None:
+        points = dgm_point("0", kind="doc") + "".join(dgm_point(n, n) for n in "ABC")
+        data = diagram_data(points, dgm_cxn("0", "A", 1) + dgm_cxn("0", "B", 0) + dgm_cxn("0", "C", 0))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- B\n- C\n- A\n\n[/Diagram]\n")
+        reordered = outline(("1", "0", "Plan"), ("3", "1", "Draft the outline"), ("2", "1", "Gather requirements"),
+                            ("4", "0", "Review"))
+        self.assertEqual(self.outline(reordered), "Steps:\n\n[Diagram]\n\n- Plan\n  - Draft the outline\n"
+                                                  "  - Gather requirements\n- Review\n\n[/Diagram]\n")
+
+    def test_cycles_and_self_loops_terminate_without_duplicates(self) -> None:
+        points = dgm_point("0", kind="doc") + dgm_point("1", "One") + dgm_point("2", "Two")
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("1", "1") + dgm_cxn("1", "2") + dgm_cxn("2", "1", 0)
+                            + dgm_cxn("2", "0", 1) + dgm_cxn("2", "2", 2) + dgm_cxn("0", "2", 1))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- One\n  - Two\n\n[/Diagram]\n")
+
+    def test_unreached_points_follow_the_outline_with_one_warning(self) -> None:
+        points = (dgm_point("0", kind="doc") + dgm_point("5", "Loose") + dgm_point("1", "Plan")
+                  + dgm_point("3", "Cycle A") + dgm_point("4", "Cycle B") + dgm_point("6"))
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("3", "4") + dgm_cxn("4", "3") + dgm_cxn("0", "9"))
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        self.assertEqual(prose, "Steps:\n\n[Diagram]\n\n- Plan\n- Loose\n- Cycle A\n- Cycle B\n\n[/Diagram]\n")
+        self.assertEqual([wn for wn in meta["warnings"] if "SmartArt" in wn], [DIAGRAM_NOTE, DIAGRAM_UNREACHED_NOTE])
+        # Without a doc point nothing is reached: every point is shown, in point-list order.
+        data = diagram_data(dgm_point("2", "Second") + dgm_point("1", "First"), dgm_cxn("1", "2"))
+        prose, meta = self.extract(anchored("Steps:", smartart("dgmData")), data)
+        self.assertEqual(prose, "Steps:\n\n[Diagram]\n\n- Second\n- First\n\n[/Diagram]\n")
+        self.assertIn(DIAGRAM_UNREACHED_NOTE, meta["warnings"])
+        # A fully connected diagram has no such warning.
+        self.assertNotIn(DIAGRAM_UNREACHED_NOTE, self.extract(anchored("Steps:", smartart("dgmData")))[1]["warnings"])
+
+    def test_only_node_and_assistant_points_hold_prose(self) -> None:
+        # PLAN's transition and presentation points have text ("TRANS", "PRES") that is never shown.
+        self.assertNotIn("TRANS", self.outline(PLAN))
+        self.assertNotIn("PRES", self.outline(PLAN))
+        points = (dgm_point("0", "Doc text", kind="doc") + dgm_point("1", "Lead", kind="node")
+                  + dgm_point("2", "Helper", kind="asst") + dgm_point("3", kind="asst") + dgm_point("4", "Loose pres", kind="pres"))
+        data = diagram_data(points, dgm_cxn("0", "1") + dgm_cxn("1", "2") + dgm_cxn("1", "3", 1))
+        self.assertEqual(self.outline(data), "Steps:\n\n[Diagram]\n\n- Lead\n  - Helper\n\n[/Diagram]\n")
+
+    def test_deep_nesting_renders_without_recursion(self) -> None:
+        count = 10_000
+        points = dgm_point("0", kind="doc") + "".join(dgm_point(str(n), f"Node {n}") for n in range(1, count + 1))
+        connections = "".join(dgm_cxn(str(n), str(n + 1)) for n in range(count))
+        prose = self.outline(diagram_data(points, connections))
+        lines = prose.split("\n\n")[2].split("\n")
+        self.assertEqual(len(lines), count)
+        self.assertEqual(lines[:2], ["- Node 1", "  - Node 2"])
+        # Indentation stops growing at 20 levels, as for list items.
+        self.assertEqual(lines[20:22], ["  " * 20 + "- Node 21", "  " * 20 + "- Node 22"])
+        self.assertEqual(lines[-1], "  " * 20 + f"- Node {count}")
+
+    def test_without_readable_text_a_diagram_keeps_its_placeholder(self) -> None:
+        placeholder = "Steps:[Unsupported drawing]\n"
+        body = anchored("Steps:", smartart("dgmData"))
+        for name, data, relationships in (
+            ("no relationship", PLAN, ""),
+            ("no part", None, DIAGRAM_RELS),
+            ("external", PLAN, rel("dgmData", "diagramData", "https://example.invalid/data.xml", external=True)),
+            ("no text-bearing points", diagram_data(dgm_point("0", kind="doc") + dgm_point("1", "Trans", kind="parTrans")), DIAGRAM_RELS),
+            ("not a data model", "<dataModel/>", DIAGRAM_RELS),
+            ("no point list", diagram_data("").replace("<dgm:ptLst></dgm:ptLst>", ""), DIAGRAM_RELS),
+        ):
+            with self.subTest(name=name):
+                prose, meta = self.extract(body, data, relationships=relationships)
+                self.assertEqual(prose, placeholder)
+                self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+                self.assertNotIn(DIAGRAM_NOTE, meta["warnings"])
+        # Text-bearing points whose text is empty: an empty diagram, like an empty text box.
+        self.assertEqual(self.outline(outline(("1", "0", ""), ("2", "1", ""))),
+                         "Steps:\n\n[Diagram]\n\n(empty)\n\n[/Diagram]\n")
+
+    def test_a_drawing_that_also_holds_a_picture_keeps_its_placeholder(self) -> None:
+        shared = graphic(DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="dgmData"/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                              '<a:blip r:embed="img"/></pic:blipFill></pic:pic>')
+        prose, meta = self.extract(anchored("Steps:", shared), extra={"word/media/image1.png": "png"},
+                                   relationships=DIAGRAM_RELS + image_rel("img", "media/image1.png"))
+        self.assertEqual(prose, f"Steps:[Unsupported drawing]\n\n{PLAN_BLOCK}\n")
+        self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+
+    def test_diagrams_render_where_anchored_and_not_from_deletions_or_unselected_copies(self) -> None:
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", smartart("hd"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hd", "diagramData", "diagrams/data2.xml")}</Relationships>'
+        body = (anchored("Box:", modern_text_box(anchored("Inside:", smartart("dgmData"))))
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        head = outline(("1", "0", "Header node"))
+        prose, meta = self.extract(body, extra={"word/header1.xml": header, "word/_rels/header1.xml.rels": header_rels,
+                                                "word/diagrams/data2.xml": head},
+                                   relationships=DIAGRAM_RELS + rel("headerRef", "header", "header1.xml"))
+        self.assertEqual(prose, f"Box:\n\n[Text box]\n\nInside:\n\n{PLAN_BLOCK}\n\n[/Text box]\n\n"
+                                "## Header (word/header1.xml)\n\nHead:\n\n[Diagram]\n\n- Header node\n\n[/Diagram]\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN), part_entry("diagram", head, "word/header1.xml")])
+        # A diagram in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{smartart("dgmData")}</w:r></w:del></w:p>'
+        prose, meta = self.extract(deleted)
+        self.assertEqual(prose, "Kept.\n")
+        self.assertNotIn("objects", meta)
+        # Every compatibility copy's prose is read, but a diagram renders only from the chosen one.
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{anchored("Chosen:", smartart("dgmData"))}'
+                 f'</mc:Choice><mc:Fallback>{anchored("Other:", smartart("dgmData"))}</mc:Fallback></mc:AlternateContent>')
+        prose, meta = self.extract(block)
+        self.assertEqual(prose, f"Chosen:\n\n{PLAN_BLOCK}\n\nOther:[Unsupported drawing]\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)])
+        # A diagram in a comment is neither rendered nor recorded.
+        comments = (f'<w:comments xmlns:w="{W}" xmlns:r="{R}"><w:comment w:id="1" w:author="Ada">'
+                    f'{anchored("Note:", smartart("dgmData"))}</w:comment></w:comments>')
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Text.")}{end("1")}</w:p>', extra={"word/comments.xml": comments},
+                                   relationships=DIAGRAM_RELS + COMMENTS_REL)
+        self.assertEqual(prose, "Text.\n")
+        self.assertNotIn("objects", meta)
+
+    def test_a_diagram_part_referenced_twice_renders_twice(self) -> None:
+        prose, meta = self.extract(anchored("One:", smartart("dgmData")) + anchored("Two:", smartart("dgmData")))
+        self.assertEqual(prose, f"One:\n\n{PLAN_BLOCK}\n\nTwo:\n\n{PLAN_BLOCK}\n")
+        self.assertEqual(meta["objects"], [part_entry("diagram", PLAN)] * 2)
+
+    def test_editing_a_node_changes_only_its_line(self) -> None:
+        before = self.outline(PLAN)
+        after = self.outline(outline(("1", "0", "Plan"), ("2", "1", "Gather needs"), ("3", "1", "Draft the outline"),
+                                     ("4", "0", "Review")))
+        changed = [(old, new) for old, new in zip(before.split("\n"), after.split("\n"), strict=True) if old != new]
+        self.assertEqual(changed, [("  - Gather requirements", "  - Gather needs")])
+
+    def test_documents_without_smartart_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before diagrams had prose: charts, embedded
+        # objects, imported chunks, text boxes (one grouped with a picture), images, equations
+        # and WordArt, in the body and a header.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", chart("hc"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart1.xml")}</Relationships>'
+        body = (paragraph("Intro. Second sentence.")
+                + f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box."), picture=True))
+                + anchored("Shape:", drawing_text_box(paragraph("Drawn.") + anchored("Chart:", chart("chart"))))
+                + f'<w:p>{equation(energy())}</w:p><w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>'
+                + anchored("Figure:", picture("img")) + smartart("nowhere")
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        parts = {name: data for name, data in object_parts().items() if not name.startswith("word/diagrams/")}
+        relationships = (rel("chart", "chart", "charts/chart1.xml") + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+                         + rel("chunk", "aFChunk", "afchunk.htm") + image_rel("img", "media/image1.png")
+                         + image_rel("image1", "media/image1.png") + rel("headerRef", "header", "header1.xml"))
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra={**parts, "word/media/image1.png": "png bytes", "word/header1.xml": header,
+                                          "word/_rels/header1.xml.rels": header_rels}, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "9dd8a49a3e1c9cd1144c4f59d06efe69f57863f75c10c91243551b2e9b38a85c",
+            ".meta.json": "44e5c205bb0dce2818d70c96760ddc2f90be5dd8ddcc7806ccbad7bc7996e54d",
         })
 
 

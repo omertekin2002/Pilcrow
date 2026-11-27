@@ -140,6 +140,13 @@ class SafetyLimitTests(LimitTestCase):
         make_docx(self.root / "essay.docx", paragraph("a" * (17 * MIB)))
         self.rejected("error: essay.docx: word/document.xml is ", "16 MiB")
 
+    def test_a_diagram_data_part_over_16_mib_is_rejected(self) -> None:
+        # A SmartArt data part is parsed for its text, so the parsed-part cap applies to it.
+        make_docx(self.root / "essay.docx", anchored("Steps:", cli_tests.smartart("dgm")),
+                  extra={"word/diagrams/data1.xml": "<a/>" + " " * (17 * MIB)},
+                  relationships=cli_tests.rel("dgm", "diagramData", "diagrams/data1.xml"))
+        self.rejected("word/diagrams/data1.xml is ", "16 MiB")
+
     def test_a_relationships_part_over_16_mib_is_rejected(self) -> None:
         make_docx(self.root / "essay.docx", paragraph("Prose."), relationships=" " * (17 * MIB))
         self.rejected("word/_rels/document.xml.rels is ", "16 MiB")

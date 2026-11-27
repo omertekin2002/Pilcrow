@@ -62,6 +62,16 @@ OLE_OBJECT = "{urn:schemas-microsoft-com:office:office}OLEObject"
 UNRENDERED_SHAPE_PARTS = frozenset({"pic", "chart", "relIds", "imagedata"})
 TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchoring paragraph; "
                  "position, anchoring, wrapping and shape formatting are not compared.")
+# A SmartArt diagram's data model (the r:dm part): its points, and the parOf connections
+# that make its outline. Only node and assistant points hold prose.
+DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+DIAGRAM_NOTE = ("SmartArt diagram text is shown as an outline in [Diagram] blocks after its anchoring paragraph; "
+                "layout, shapes and formatting are not shown, and the diagram's data part is fingerprinted in objects.")
+DIAGRAM_UNREACHED_NOTE = ("Some SmartArt diagram text is not connected to the diagram's outline; "
+                          "it is shown at the top level after the outline.")
+# Outline levels deeper than this are indented as this level, as list items are.
+MAX_DIAGRAM_INDENT = 20
 LIST_NOTE = ("List boundaries and indentation are retained; bullet and number formats are recorded in "
              "metadata, but counter values and bullet glyphs are not reconstructed.")
 UNKNOWN_LIST_NOTE = ("Some list numbering formats could not be resolved (no numbering part, an unknown "
@@ -370,8 +380,11 @@ class Reader:
         self.part = "word/document.xml"
         self.rels: Relationships = {}
         self.features: Counter[str] = Counter()
-        # Text boxes found while reading a paragraph, rendered as blocks after it.
-        self.anchored: list[list[Element]] = []
+        # Text boxes found while reading a paragraph, rendered as blocks after it, and the
+        # [Diagram] blocks of SmartArt diagrams, already rendered.
+        self.anchored: list[list[Element | str]] = []
+        # Diagram data part -> its outline lines, or None when it has no text-bearing points.
+        self.diagram_outlines: dict[str, list[str] | None] = {}
         # The current story part's rendered text in fragments, in the accepted view, so a
         # comment range is the fragments between the offsets of its start and end markers.
         self.story: list[str] = []
@@ -488,15 +501,16 @@ class Reader:
             return self.text_boxes(branch) if branch is not None else []
         return [box for child in node for box in self.text_boxes(child)]
 
-    def unrendered_shape_parts(self, node: Element) -> bool:
-        """Whether a shape holding text boxes also holds pictures, charts or diagrams outside them."""
-        if node.tag == w("txbxContent"):
+    def unrendered_shape_parts(self, node: Element, rendered: frozenset[Element] = frozenset()) -> bool:
+        """Whether a shape holding text boxes or ``rendered`` diagrams also holds pictures, charts
+        or diagrams outside them."""
+        if node.tag == w("txbxContent") or node in rendered:
             return False
         if node.tag == f"{{{MC}}}AlternateContent" and (branch := self.branch(node)) is not None:
-            return self.unrendered_shape_parts(branch)
+            return self.unrendered_shape_parts(branch, rendered)
         # Alternatives without a text box (e.g. a grouped picture) are checked in full.
         return (node.tag.rsplit("}", 1)[-1] in UNRENDERED_SHAPE_PARTS
-                or any(self.unrendered_shape_parts(child) for child in node))
+                or any(self.unrendered_shape_parts(child, rendered) for child in node))
 
     def image_refs(self, node: Element, alt: AltText = ("", "")) -> Iterator[tuple[list[str | None], AltText]]:
         """Relationship IDs and alt text of each image in ``node``, in document order.
@@ -735,15 +749,98 @@ class Reader:
                 self.comment_marker(descendant)
 
     def anchor(self, node: Element) -> tuple[str, list[str]]:
-        """Read ``node`` inline and render the text boxes it anchors as separate blocks."""
+        """Read ``node`` inline and render the text boxes and diagrams it anchors as separate blocks."""
         text, boxes = self.anchor_boxes(node)
-        return text, [self.text_box(box) for box in boxes]
+        return text, [self.anchored_block(box) for box in boxes]
 
-    def anchor_boxes(self, node: Element) -> tuple[str, list[Element]]:
-        """Read ``node`` inline and return the text boxes it anchors, not yet rendered."""
+    def anchor_boxes(self, node: Element) -> tuple[str, list[Element | str]]:
+        """Read ``node`` inline and return the text boxes it anchors, not yet rendered, and its
+        rendered [Diagram] blocks."""
         self.anchored.append([])
         text = self.inline(node)
         return text, self.anchored.pop()
+
+    def anchored_block(self, item: Element | str) -> str:
+        return item if isinstance(item, str) else self.text_box(item)
+
+    def diagram(self, node: Element) -> str | None:
+        """A SmartArt diagram's [Diagram] block, or None when its data part is missing, external,
+        or holds no text-bearing points, so the drawing keeps its placeholder."""
+        rid = node.get(f"{{{R}}}dm")
+        rel = self.rels.get(rid) if rid else None
+        if rel is None or rel[2] or rel[1] not in self.names:
+            return None
+        if rel[1] not in self.diagram_outlines:
+            self.diagram_outlines[rel[1]] = self.diagram_outline(self.xml(rel[1]))
+        lines = self.diagram_outlines[rel[1]]
+        if lines is None:
+            return None
+        self.features["diagrams"] += 1
+        self.warn(DIAGRAM_NOTE)
+        return "\n\n".join(("[Diagram]", "\n".join(lines) or "(empty)", "[/Diagram]"))
+
+    def diagram_outline(self, model: Element) -> list[str] | None:
+        """The outline lines of a dgm:dataModel, or None when it has no text-bearing points.
+
+        The parOf connections are walked depth-first from the doc point, siblings by srcOrd and
+        then connection order, each point at most once, without recursion. Text-bearing points
+        the walk never reaches follow at the top level, in point-list order, with a warning.
+        """
+        if model.tag != f"{{{DGM}}}dataModel":
+            return None
+        points: dict[str, tuple[str, str]] = {}  # modelId -> (type, text); the first point wins
+        for point in model.findall(f"{{{DGM}}}ptLst/{{{DGM}}}pt"):
+            points.setdefault(point.get("modelId", ""), (point.get("type", "node"), self.diagram_text(point)))
+        bearing = [key for key, (kind, text) in points.items() if kind == "node" or (kind == "asst" and text)]
+        if not bearing:
+            return None
+        children: dict[str, list[tuple[int, int, str]]] = {}
+        for order, connection in enumerate(model.findall(f"{{{DGM}}}cxnLst/{{{DGM}}}cxn")):
+            if connection.get("type", "parOf") != "parOf":
+                continue
+            rank = decimal(connection.get("srcOrd", "0"))
+            children.setdefault(connection.get("srcId", ""), []).append(
+                (rank if rank is not None else 0, order, connection.get("destId", "")))
+        root = next((key for key, (kind, _) in points.items() if kind == "doc"), None)
+        lines: list[str] = []
+        visited: set[str] = set() if root is None else {root}
+        # (point, level) pairs still to visit, the next one last.
+        stack: list[tuple[str, int]] = [] if root is None else [
+            (child, 0) for *_, child in sorted(children.get(root, []), reverse=True)]
+        while stack:
+            key, depth = stack.pop()
+            if key in visited or key not in points:
+                continue
+            visited.add(key)
+            self.diagram_line(lines, points[key], depth)
+            stack.extend((child, depth + 1) for *_, child in sorted(children.get(key, []), reverse=True))
+        unreached = [key for key in bearing if key not in visited]
+        if any(points[key][1] for key in unreached):
+            self.warn(DIAGRAM_UNREACHED_NOTE)
+        for key in unreached:
+            self.diagram_line(lines, points[key], 0)
+        return lines
+
+    def diagram_line(self, lines: list[str], point: tuple[str, str], depth: int) -> None:
+        """Add a point's outline line, split into sentences like a list item; empty points add none."""
+        kind, text = point
+        found = sentences(text) if kind in {"node", "asst"} else []
+        if found:
+            indent = "  " * min(MAX_DIAGRAM_INDENT, depth)
+            lines.append(indent + "- " + ("\n" + indent + "  ").join(found))
+
+    def diagram_text(self, point: Element) -> str:
+        """A point's text: each dgm:t paragraph's runs, fields and breaks, normalised, joined by a space."""
+        paragraphs = []
+        for para in point.findall(f"{{{DGM}}}t/{{{A}}}p"):
+            parts: list[str] = []
+            for child in para:
+                if child.tag in {f"{{{A}}}r", f"{{{A}}}fld"}:
+                    parts.extend(t.text or "" for t in child.findall(f"{{{A}}}t"))
+                elif child.tag == f"{{{A}}}br":
+                    parts.append(" ")
+            paragraphs.append(normalize("".join(parts)))
+        return " ".join(p for p in paragraphs if p)
 
     def text_box(self, box: Element) -> str:
         self.features["text boxes"] += 1
@@ -828,8 +925,11 @@ class Reader:
             self.record_objects(node)
         if tag in {w("drawing"), w("pict"), w("txbxContent")} and self.anchored and (boxes := self.text_boxes(node)):
             self.anchored[-1].extend(boxes)
-            if not self.unrendered_shape_parts(node):
+            if not self.unrendered_shape_parts(node, self.anchor_diagrams(node)):
                 return ""
+        elif (tag in {w("drawing"), w("pict"), f"{{{MC}}}AlternateContent"} and self.anchored
+              and (rendered := self.anchor_diagrams(node)) and not self.unrendered_shape_parts(node, rendered)):
+            return ""
         if local in {"drawing", "pict", "object", "txbxContent", "AlternateContent", "altChunk", "sym"}:
             self.warn(f"Unsupported {local}: content is not rendered in prose; inspect the DOCX in Word.")
             self.features[local] += 1
@@ -837,6 +937,21 @@ class Reader:
         if tag in {w("pPr"), w("rPr"), w("sdtPr"), w("sdtEndPr")}:
             return ""
         return "".join(self.inline(child) for child in node)
+
+    def anchor_diagrams(self, node: Element) -> frozenset[Element]:
+        """Render the SmartArt diagrams in a drawing as anchored blocks; return those that rendered.
+
+        They are found as objects are, so diagrams in text boxes render with the box, and none
+        render from an unselected mc:AlternateContent copy.
+        """
+        if self.unselected:
+            return frozenset()
+        rendered = []
+        for found in self.object_nodes(node):
+            if found.tag == DIAGRAM and (block := self.diagram(found)) is not None:
+                self.anchored[-1].append(block)
+                rendered.append(found)
+        return frozenset(rendered)
 
     def close_field(self) -> None:
         instruction, form = self.field_stack.pop()
@@ -903,7 +1018,7 @@ class Reader:
         self.emit("", " ")  # a paragraph boundary is a space in comment anchors
         # Render the paragraph before its boxes so list first use follows prose order.
         own = self.paragraph_text(node, text)
-        return "\n\n".join(part for part in (own, *(self.text_box(box) for box in boxes)) if part)
+        return "\n\n".join(part for part in (own, *(self.anchored_block(box) for box in boxes)) if part)
 
     def paragraph_text(self, node: Element, text: str) -> str:
         lines = math_sentences(text)
