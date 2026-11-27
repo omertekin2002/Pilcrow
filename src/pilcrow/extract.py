@@ -10,7 +10,6 @@ import io
 import json
 import posixpath
 import re
-from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -328,8 +327,10 @@ def chart_text(tx: Element | None) -> str:
 def chart_categories(cat: Element | None) -> list[str]:
     """A series's string category labels (c:cat) in index order; numeric and date categories have none.
 
-    A multi-level category joins its levels from the outermost to the innermost with " / ";
-    an outer label covers every index from its own up to the next outer label.
+    A multi-level category joins the points its levels hold at its index, from the outermost
+    to the innermost, with " / ". An outer label is stored once, at the first category of its
+    group, and is shown only there, so each point's text appears in one label at most and the
+    labels are never longer than the cache that holds them.
     """
     if cat is None:
         return []
@@ -342,22 +343,12 @@ def chart_categories(cat: Element | None) -> list[str]:
     if cache is None:
         return []
     # c:lvl elements run from the innermost level outwards.
-    levels = [chart_points(level) for level in cache.findall(ch("lvl"))]
-    starts = [sorted(level) for level in levels]
-    labels = []
-    for index in sorted({i for level in levels for i in level}):
-        parts = []
-        for depth in reversed(range(len(levels))):
-            if depth == 0:
-                text = levels[0].get(index, "")
-            else:
-                at = bisect_right(starts[depth], index)
-                text = levels[depth][starts[depth][at - 1]] if at else ""
+    parts: dict[int, list[str]] = {}
+    for level in reversed(cache.findall(ch("lvl"))):
+        for index, text in chart_points(level).items():
             if text:
-                parts.append(text)
-        if parts:
-            labels.append(" / ".join(parts))
-    return labels
+                parts.setdefault(index, []).append(text)
+    return [" / ".join(parts[i]) for i in sorted(parts)]
 
 
 def size_label(size: int) -> str:

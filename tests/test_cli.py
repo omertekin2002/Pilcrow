@@ -3303,9 +3303,20 @@ class ChartTextTests(unittest.TestCase):
         multi = ('<c:cat><c:multiLvlStrRef><c:f>Sheet1!$A$2:$B$5</c:f><c:multiLvlStrCache><c:ptCount val="4"/>'
                  + level((0, "Q1"), (1, "Q2"), (2, "Q1"), (3, "Q2")) + level((0, "2025"), (2, "2026"))
                  + level((0, "Plan")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        # Each outer label is shown once, on the first category of its group, as Word stores it.
         self.assertEqual(self.labels(f"<c:barChart>{chart_series(chart_cached('Units'), multi)}</c:barChart>"), [
-            "Series: Units", "Category: Plan / 2025 / Q1", "Category: Plan / 2025 / Q2",
-            "Category: Plan / 2026 / Q1", "Category: Plan / 2026 / Q2"])
+            "Series: Units", "Category: Plan / 2025 / Q1", "Category: Q2", "Category: 2026 / Q1", "Category: Q2"])
+        # Empty points add nothing, and an index only an outer level holds is a category of its own.
+        sparse = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level((0, "Q1"), (1, ""))
+                  + level((1, "2026"), (3, "2027")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', sparse)}</c:barChart>"),
+                         ["Category: Q1", "Category: 2026", "Category: 2027"])
+        # A long outer label is never copied into the categories of its group.
+        long = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level(*((i, f"D{i}") for i in range(300)))
+                + level((0, "Y" * 100_000)) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        lines = self.labels(f"<c:barChart>{chart_series('', long)}</c:barChart>")
+        self.assertEqual(lines[:2], ["Category: " + "Y" * 100_000 + " / D0", "Category: D1"])
+        self.assertEqual((len(lines), lines[-1]), (201, "Category: … (100 more)"))
 
     def test_numeric_categories_and_data_values_produce_no_lines(self) -> None:
         numeric = ("<c:cat><c:numRef><c:f>Sheet1!$A$2</c:f><c:numCache><c:formatCode>General</c:formatCode>"
