@@ -443,7 +443,9 @@ clarify."`, `~ link "Report": https://old.example → https://new.example`, or
 diff, and a changed symbol `~ symbol 1
 (word/document.xml): F061 (Symbol) → F062 (Symbol)`; an edited chart, SmartArt
 diagram, embedded object, or imported chunk reads `~ chart 1 (word/document.xml)
-changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`.
+changed` or `~ embedded object 1 (Excel.Sheet.12, word/document.xml) changed`,
+and an edited diagram node also shows as its `-`/`+` lines in the `[Diagram]`
+block of the prose diff.
 Edited image alt text reads `~ image 1 (word/document.xml) alt text: "A red cat"
 → "A blue dog"`, and edited WordArt text `~ WordArt 1 (word/document.xml):
 "SALE" → "CLOSED"`.
@@ -572,13 +574,30 @@ fingerprint of their OMML structure and text (formatting and revision IDs left o
 and by font and character code, so editing, adding, or removing one makes
 companions stale even where the linear text does not show the change. Symbols stay
 `[Unsupported sym]` in prose.
+SmartArt diagram text is shown as an outline after its anchoring paragraph, so an
+edit to a node shows in the prose diff; layout, shapes, and formatting are not
+shown:
+
+```text
+[Diagram]
+
+- Plan
+  - Gather requirements
+  - Draft the outline
+- Review
+
+[/Diagram]
+```
+
 Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
 (`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
 chart part, the diagram's data part, the embedding, the chunk), so editing a
 chart's values, a diagram's text, an embedded workbook, or a chunk, or adding or
 removing one, makes companions stale; renaming the part does not. The fingerprint
-covers the stored part, not how Word draws it; a chart's own workbook and a
-diagram's layout, style, and colour parts are not compared.
+covers the stored part, not how Word draws it, so a diagram edit that leaves its
+outline text unchanged (formatting stored in the data part, for example) still
+makes companions stale; a chart's own workbook and a diagram's layout, style, and
+colour parts are not compared. Charts and embedded objects are not rendered.
 Legacy form fields (`FORMCHECKBOX`, `FORMDROPDOWN`), common in contract, HR, and
 government templates, keep their state outside the prose: Word writes no display
 text for them. Each checkbox's checked state and each dropdown's entries and
@@ -659,6 +678,13 @@ documents containing an equation report stale companions once, because their
 prose now shows each equation as `[Math: …]` text and their coverage warnings
 changed. Run `pilcrow export` and commit the refreshed companions. Documents
 without equations are unaffected.
+
+Upgrading from a version that showed SmartArt diagrams as `[Unsupported drawing]`:
+documents containing a SmartArt diagram report stale companions once, because
+their prose now shows the diagram's text in a `[Diagram]` block and their coverage
+warnings changed. Run `pilcrow export` and commit the refreshed companions. The
+diagram's `objects` entry is unchanged, and documents without SmartArt are
+unaffected.
 
 Run the generated-fixture suite:
 
