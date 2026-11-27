@@ -33,6 +33,7 @@ try:
         checkbox,
         comments_extended,
         comments_part,
+        crossed_chart,
         described_picture,
         dropdown,
         end,
@@ -75,6 +76,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         checkbox,
         comments_extended,
         comments_part,
+        crossed_chart,
         described_picture,
         dropdown,
         end,
@@ -739,6 +741,21 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("\n-Series: 2026\n+Series: 2026 forecast\n", self.markdown())
         marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
         self.assertIn("\n~ Series: 2026{+ forecast+}\n", marked)
+
+    def test_a_save_that_renumbers_chart_axes_is_no_change(self) -> None:
+        # LibreOffice gives every c:axId and c:crossAx a new random value on each save (#77).
+        def write(path: Path, ids: tuple[str, str], value: str = "10") -> None:
+            make_docx(path, anchored("Figure:", chart("chart")), extra=chart_parts(crossed_chart(ids, value=value)),
+                      relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(self.old, ("77217256", "2760290"))
+        write(self.new, ("90904435", "24668023"))
+        report = self.review(code=0)
+        self.assertIn("Prose: no changes", report)
+        self.assertNotIn("Charts, diagrams and embedded objects", report)
+        write(self.new, ("90904435", "24668023"), value="99")
+        self.assertEqual(self.section(self.review(), "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
 
     def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
         self.write_objects(self.old)

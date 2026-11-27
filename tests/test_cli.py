@@ -18,6 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -228,6 +229,26 @@ def part_entry(kind: str, data: str | None, part: str = "word/document.xml", **e
     """The objects entry for an object whose target part holds ``data`` (None: missing)."""
     sha = None if data is None else hashlib.sha256(data.encode("utf-8")).hexdigest()
     return {"kind": kind, "part": part, "sha256": sha, **extra}
+
+
+def chart_form(data: str) -> list[Any]:
+    """The canonical form of a chart part: tag, sorted attributes, text and children, with each
+    c:axId and c:crossAx value replaced by the order in which it first appears."""
+    axes: dict[str, str] = {}
+
+    def form(node: ElementTree.Element) -> list[Any]:
+        attributes = sorted([key, value] for key, value in node.attrib.items())
+        if node.tag in {f"{{{C}}}axId", f"{{{C}}}crossAx"}:
+            attributes = [[key, axes.setdefault(value, str(len(axes))) if key == "val" else value]
+                          for key, value in attributes]
+        return [node.tag, attributes, node.text or "", [form(child) for child in node]]
+    return form(ElementTree.fromstring(data))
+
+
+def chart_entry(data: str, part: str = "word/document.xml") -> dict[str, Any]:
+    """The objects entry for a chart whose part holds ``data``: the hash of its canonical form."""
+    form = json.dumps(chart_form(data), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {"kind": "chart", "part": part, "sha256": hashlib.sha256(form).hexdigest()}
 
 
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
@@ -563,6 +584,20 @@ def quarterly(series_2026: str = "2026", category: str = "Q2", title: str = "Qua
     return chart_space(f'<c:barChart><c:barDir val="col"/>{bars}</c:barChart>'
                        + chart_axis("catAx", chart_rich("Quarter")) + chart_axis("valAx", chart_rich("Revenue (USD)"), "2"),
                        chart_rich(title))
+
+
+def crossed_chart(ids: tuple[str, str] = ("111", "222"), *, crosses: tuple[str, str] | None = None,
+                  value: str = "10", series: str = "2025", extra_axis: str = "") -> str:
+    """A bar chart whose group lists its two axes by c:axId and whose axes cross each other by
+    c:crossAx, as Word and LibreOffice write it; ``crosses`` overrides which axis each crosses."""
+    cat, val = ids
+    cat_crosses, val_crosses = crosses or (val, cat)
+    group = (f'<c:barChart><c:barDir val="col"/>{chart_series(chart_cached(series), chart_categories("Q1", "Q2"), value)}'
+             f'<c:axId val="{cat}"/><c:axId val="{val}"/></c:barChart>')
+    axes = (f'<c:catAx><c:axId val="{cat}"/><c:scaling/><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="{cat_crosses}"/>'
+            f'</c:catAx><c:valAx><c:axId val="{val}"/><c:scaling/><c:delete val="0"/><c:axPos val="l"/>'
+            f'<c:crossAx val="{val_crosses}"/></c:valAx>')
+    return chart_space(group + axes + extra_axis, chart_rich("Revenue"))
 
 
 QUARTERLY_BLOCK = ("[Chart]\n\nTitle: Quarterly revenue\nAxis title: Quarter\nAxis title: Revenue (USD)\n"
@@ -1972,8 +2007,10 @@ class CLITests(unittest.TestCase):
         prose, meta = self.exported()
         self.assertEqual(hashlib.sha256(prose).hexdigest(),
                          "37997d7537bbac3bd80770076952b402b2538528a7fd7efef5d99ea6f9ff8959", prose)
+        # Re-pinned when recognised drawings stopped warning about their wrapper markup (#77):
+        # only the generic drawing, inline, graphic and picture warnings left the metadata.
         self.assertEqual(hashlib.sha256(meta).hexdigest(),
-                         "bf59117831f52348f3221f581f11cef4d2ebcd040d2dc6c0f19a750b89a928e8", meta)
+                         "ee21cdec9947fbdfc967e3aaab2841ee715d878de82c5342e84efa2905bc684e", meta)
         self.assertNotIn("objects", json.loads(meta))
 
     def test_wordart_text_edits_make_check_stale_and_review_names_them(self) -> None:
@@ -2182,7 +2219,7 @@ class CLITests(unittest.TestCase):
         data = json.loads(meta)
         parts = object_parts()
         self.assertEqual(data["objects"], [
-            part_entry("chart", parts["word/charts/chart1.xml"]),
+            chart_entry(parts["word/charts/chart1.xml"]),
             part_entry("diagram", parts["word/diagrams/data1.xml"]),
             part_entry("embedded object", parts["word/embeddings/Microsoft_Excel_Worksheet.xlsx"], prog_id="Excel.Sheet.12"),
             part_entry("imported chunk", parts["word/afchunk.htm"]),
@@ -2246,9 +2283,9 @@ class CLITests(unittest.TestCase):
                  "word/charts/chart3.xml": "<footnoteChart/>"}
         _, meta = self.export_objects(body, extra=extra, relationships=relationships)
         self.assertEqual(meta["objects"], [
-            part_entry("chart", "<bodyChart/>"),
-            part_entry("chart", "<footnoteChart/>", "word/footnotes.xml"),
-            part_entry("chart", "<headerChart/>", "word/header1.xml"),
+            chart_entry("<bodyChart/>"),
+            chart_entry("<footnoteChart/>", "word/footnotes.xml"),
+            chart_entry("<headerChart/>", "word/header1.xml"),
         ])
         self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
 
@@ -2260,6 +2297,19 @@ class CLITests(unittest.TestCase):
         make_docx(self.root / "essay.docx", body, extra={"word/charts/chart2.xml": "<chart/>"},
                   relationships=rel("chart", "chart", "charts/chart2.xml"))
         self.cli("check", "essay.docx")
+
+    def test_a_save_that_renumbers_chart_axes_keeps_check_fresh(self) -> None:
+        # LibreOffice gives every c:axId and c:crossAx a new random value on each save (#77).
+        def write(ids: tuple[str, str], **options: Any) -> None:
+            make_docx(self.root / "essay.docx", anchored("Figure:", chart("chart")),
+                      extra=chart_parts(crossed_chart(ids, **options)), relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(("77217256", "2760290"))
+        self.cli("export", "essay.docx")
+        write(("90904435", "24668023"))
+        self.cli("check", "essay.docx")
+        write(("90904435", "24668023"), value="99")
+        self.assertIn("STALE", self.cli("check", "essay.docx", code=1).stdout)
 
     def test_linked_and_missing_object_parts(self) -> None:
         missing_note = ("Some chart, diagram, embedded object or imported chunk relationships are missing "
@@ -2292,7 +2342,7 @@ class CLITests(unittest.TestCase):
         for body in (inline, block):
             with self.subTest(body=body):
                 _, meta = self.export_objects(body, extra=extra, relationships=relationships)
-                self.assertEqual(meta["objects"], [part_entry("chart", "<chart/>")])
+                self.assertEqual(meta["objects"], [chart_entry("<chart/>")])
                 self.assertEqual(meta["images"], [])
                 unrendered = [wn for wn in meta["warnings"] if "Unrendered package part" in wn]
                 self.assertEqual(unrendered, [
@@ -2963,9 +3013,10 @@ class EquationTextTests(unittest.TestCase):
         outputs = extract(self.path).outputs()
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
             # Re-pinned when legacy checkboxes got prose: the fixture's checkbox now reads ☒,
-            # and the form field note says so; nothing else moved.
+            # and the form field note says so; nothing else moved. Re-pinned again when the
+            # picture's drawing markup stopped warning (#77); the prose did not move.
             ".prose.md": "a93eb6a510a1e7dc5aca4d6a52cc69fddfabe0f734b468695dab5c3adad93219",
-            ".meta.json": "6e68886b40f2fafedbafd84e7490b025e95d49003461615a5d64012fe236df8b",
+            ".meta.json": "f661f269615caebab3ccf6f98dc1a1f5ace0f4be50ca631879b33b26f8dd1b00",
         })
 
 
@@ -3326,8 +3377,10 @@ class DiagramTextTests(unittest.TestCase):
                                           "word/_rels/header1.xml.rels": header_rels}, relationships=relationships)
         outputs = extract(self.path).outputs()
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            # Metadata re-pinned when charts got a canonical hash and recognised drawings stopped
+            # warning about their wrapper markup (#77); the prose did not move.
             ".prose.md": "9dd8a49a3e1c9cd1144c4f59d06efe69f57863f75c10c91243551b2e9b38a85c",
-            ".meta.json": "44e5c205bb0dce2818d70c96760ddc2f90be5dd8ddcc7806ccbad7bc7996e54d",
+            ".meta.json": "c8579c093e2c769931af6894ebb3c6a06ff29d990d6f1125aa63f7f35af121f6",
         })
 
 
@@ -3375,7 +3428,7 @@ class ChartTextTests(unittest.TestCase):
         self.assertIn(CHART_NOTE, meta["warnings"])
         self.assertNotIn(UNSUPPORTED_DRAWING, meta["warnings"])
         # The fingerprint is still the chart part's hash, as before charts had prose.
-        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())])
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
         # The chart part is supported; its embedded workbook is still not read.
         unrendered = [wn for wn in meta["warnings"] if wn.startswith("Unrendered package part")]
         self.assertEqual(unrendered, ["Unrendered package part: word/embeddings/chart_workbook.xlsx; "
@@ -3539,8 +3592,8 @@ class ChartTextTests(unittest.TestCase):
         self.assertEqual(prose, f"Box:\n\n[Text box]\n\nInside:\n\n{QUARTERLY_BLOCK}\n\n[/Text box]\n\n"
                                 f"Both:\n\n{PLAN_BLOCK}\n\n{QUARTERLY_BLOCK}\n\n"
                                 "## Header (word/header1.xml)\n\nHead:\n\n[Chart]\n\nSeries: Header sales\n\n[/Chart]\n")
-        self.assertEqual(meta["objects"], [part_entry("chart", quarterly()), part_entry("diagram", PLAN),
-                                           part_entry("chart", quarterly()), part_entry("chart", sales, "word/header1.xml")])
+        self.assertEqual(meta["objects"], [chart_entry(quarterly()), part_entry("diagram", PLAN),
+                                           chart_entry(quarterly()), chart_entry(sales, "word/header1.xml")])
         self.assertEqual([wn for wn in meta["warnings"] if "[Chart]" in wn or "[Diagram]" in wn], [CHART_NOTE, DIAGRAM_NOTE])
         # A chart in a tracked deletion is not in the accepted view.
         deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{chart("chart")}</w:r></w:del></w:p>'
@@ -3552,7 +3605,7 @@ class ChartTextTests(unittest.TestCase):
                  f'</mc:Choice><mc:Fallback>{anchored("Other:", chart("chart"))}</mc:Fallback></mc:AlternateContent>')
         prose, meta = self.extract(block)
         self.assertEqual(prose, f"Chosen:\n\n{QUARTERLY_BLOCK}\n\nOther:[Unsupported drawing]\n")
-        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())])
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
         # A chart in a comment is neither rendered nor recorded.
         comments = (f'<w:comments xmlns:w="{W}" xmlns:r="{R}"><w:comment w:id="1" w:author="Ada">'
                     f'{anchored("Note:", chart("chart"))}</w:comment></w:comments>')
@@ -3564,7 +3617,7 @@ class ChartTextTests(unittest.TestCase):
     def test_a_chart_part_referenced_twice_renders_twice(self) -> None:
         prose, meta = self.extract(anchored("One:", chart("chart")) + anchored("Two:", chart("chart")))
         self.assertEqual(prose, f"One:\n\n{QUARTERLY_BLOCK}\n\nTwo:\n\n{QUARTERLY_BLOCK}\n")
-        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())] * 2)
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())] * 2)
 
     def test_editing_a_label_changes_only_its_line(self) -> None:
         before = self.block(quarterly())
@@ -3576,6 +3629,55 @@ class ChartTextTests(unittest.TestCase):
                 changed = [(old, new) for old, new in zip(before.split("\n"), after.split("\n"), strict=True) if old != new]
                 self.assertEqual(changed, [line])
 
+    def fingerprint(self, data: str) -> str:
+        """The objects sha256 of one anchored chart whose part holds ``data``."""
+        _, meta = self.extract(anchored("Figure:", chart("chart")), data)
+        (entry,) = meta["objects"]
+        self.assertEqual(entry, chart_entry(data))
+        return str(entry["sha256"])
+
+    def test_renumbered_axis_ids_keep_the_chart_fingerprint(self) -> None:
+        # LibreOffice writes new random axis IDs on every save, and changes nothing else.
+        saved = self.fingerprint(crossed_chart(("77217256", "2760290")))
+        self.assertEqual(self.fingerprint(crossed_chart(("90904435", "24668023"))), saved)
+        self.assertEqual(self.fingerprint(crossed_chart(("1", "2"))), saved)
+        # The IDs are numbered by first appearance, so swapping two values is a renumbering too.
+        self.assertEqual(self.fingerprint(crossed_chart(("2760290", "77217256"))), saved)
+
+    def test_other_chart_edits_still_change_the_fingerprint(self) -> None:
+        saved = self.fingerprint(crossed_chart())
+        serial = '<c:serAx><c:axId val="333"/><c:scaling/><c:delete val="0"/><c:crossAx val="111"/></c:serAx>'
+        edits = {
+            "a cached value": crossed_chart(value="99"),
+            "a series name": crossed_chart(series="2026"),
+            # Each axis crosses itself instead of the other one.
+            "which axis crosses which": crossed_chart(crosses=("111", "222")),
+            "an added axis": crossed_chart(extra_axis=serial),
+            "an axis ID that is not a renumbering": crossed_chart(("111", "111")),
+        }
+        for name, data in edits.items():
+            with self.subTest(edit=name):
+                self.assertNotEqual(self.fingerprint(data), saved)
+
+    def test_a_chart_part_too_large_to_parse_keeps_its_raw_hash(self) -> None:
+        # Over the parsed-part cap the chart part cannot be parsed, so its fingerprint is the
+        # streamed hash of its bytes, as before charts had a canonical form; no error is raised.
+        from zipfile import ZipFile as Package
+
+        from pilcrow import extract as module
+
+        data = crossed_chart()
+        make_docx(self.path, f'<w:p><w:r>{chart("chart")}</w:r></w:p>', extra=chart_parts(data),
+                  relationships=CHART_REL)
+        with Package(self.path) as package, patch.object(module, "MAX_PARSED_PART_BYTES", len(data) - 1):
+            extractor = module.Reader(package)
+            extractor.rels = extractor.relationships("word/document.xml")
+            self.assertEqual(extractor.object_part("chart", "chart"), part_entry("chart", data))
+        with Package(self.path) as package:
+            extractor = module.Reader(package)
+            extractor.rels = extractor.relationships("word/document.xml")
+            self.assertEqual(extractor.object_part("chart", "chart"), chart_entry(data))
+
     def test_documents_without_labelled_charts_keep_their_companions(self) -> None:
         # Pinned from the companions Pilcrow wrote before charts had prose: OBJECT_BODY (an
         # unlabelled chart, a SmartArt diagram, an embedded object and an imported chunk).
@@ -3584,8 +3686,148 @@ class ChartTextTests(unittest.TestCase):
         make_docx(self.path, OBJECT_BODY, extra=object_parts(), relationships=OBJECT_RELS)
         outputs = extract(self.path).outputs()
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            # Metadata re-pinned when charts got a canonical hash and recognised drawings stopped
+            # warning about their wrapper markup (#77); the prose did not move.
             ".prose.md": "fec4a0a3752a5c8b11f07f875c2d26c283d7c5c06bd6f88d4277092e8d1f8ba9",
-            ".meta.json": "4440cebbc8036a47a9836be2978b90a50dcdd57f7051a85466b28b846ec3fa91",
+            ".meta.json": "743cec43e929caab6328a1f370ed3ce65b89d7072eb63188ca3bfa6538b4a27d",
+        })
+
+
+def anchored_graphic(uri: str, content: str) -> str:
+    """A floating (wp:anchor) DrawingML graphic frame holding ``content``, with the position,
+    extent, wrapping and properties Word writes around it."""
+    return (f'<w:drawing><wp:anchor xmlns:wp="{WP}" distT="0" distB="0" distL="114300" distR="114300" simplePos="0" '
+            'relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>'
+            '<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>'
+            '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>'
+            '<wp:extent cx="914400" cy="914400"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="bothSides"/>'
+            f'<wp:docPr id="1" name="Graphic 1"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="{A}"><a:graphicData uri="{uri}">'
+            f'{content}</a:graphicData></a:graphic></wp:anchor></w:drawing>')
+
+
+def generic_warnings(meta: dict[str, Any]) -> list[str]:
+    """The allowlist's generic construct warnings, without the specific notes."""
+    return [wn for wn in meta["warnings"] if wn.startswith(("Unsupported Word construct", "Unsupported XML construct"))]
+
+
+class RecognisedConstructTests(unittest.TestCase):
+    """Constructs Pilcrow records and notes on its own do not also warn as unknown markup (#77)."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-recognised-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, *, extra: dict[str, str] | None = None, relationships: str = "") -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def test_a_comment_annotation_mark_does_not_warn(self) -> None:
+        # Word and LibreOffice start every comment with a w:annotationRef run.
+        comments = comments_part({"1": "Please check."}).replace("<w:r>", "<w:r><w:annotationRef/></w:r><w:r>", 1)
+        self.assertIn("annotationRef", comments)
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Commented passage.")}{end("1")}</w:p>',
+                                   extra={"word/comments.xml": comments}, relationships=COMMENTS_REL)
+        self.assertEqual(prose, "Commented passage.\n")
+        self.assertEqual(generic_warnings(meta), [])
+        self.assertIn(COMMENT_NOTE, meta["warnings"])
+        self.assertEqual([entry["text"] for entry in meta["review"] if entry["kind"] == "comment"], ["Please check."])
+
+    def test_drawings_holding_pictures_charts_or_diagrams_give_only_their_own_notes(self) -> None:
+        unlabelled = f'<c:chartSpace xmlns:c="{C}"><c:chart/></c:chartSpace>'
+        graphics = {
+            "picture": (PIC, f'<pic:pic xmlns:pic="{PIC}"><pic:nvPicPr><pic:cNvPr id="0" name="cat.png"/><pic:cNvPicPr/>'
+                             '</pic:nvPicPr><pic:blipFill><a:blip r:embed="img"/><a:stretch><a:fillRect/></a:stretch>'
+                             '</pic:blipFill><pic:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>',
+                        [IMAGE_NOTE, UNSUPPORTED_DRAWING]),
+            "chart": (C, f'<c:chart xmlns:c="{C}" r:id="chart"/>', [CHART_NOTE]),
+            "unlabelled chart": (C, f'<c:chart xmlns:c="{C}" r:id="bare"/>', [UNSUPPORTED_DRAWING]),
+            "diagram": (DGM, f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="dgmData" r:lo="lo" r:qs="qs" r:cs="cs"/>', [DIAGRAM_NOTE]),
+        }
+        extra = {**chart_parts(quarterly()), **diagram_parts(PLAN), "word/media/image1.png": "png bytes",
+                 "word/charts/chart2.xml": unlabelled}
+        relationships = (CHART_REL + DIAGRAM_RELS + image_rel("img", "media/image1.png")
+                         + rel("bare", "chart", "charts/chart2.xml"))
+        for name, (uri, content, notes) in graphics.items():
+            for wrap in (graphic, anchored_graphic):
+                with self.subTest(graphic=name, wrapper=wrap.__name__):
+                    _, meta = self.extract(anchored("Figure:", wrap(uri, content)), extra=extra, relationships=relationships)
+                    self.assertEqual(generic_warnings(meta), [])
+                    for note in notes:
+                        self.assertIn(note, meta["warnings"])
+                    self.assertEqual(len(meta["images"]) + len(meta.get("objects", [])), 1)
+
+    def test_a_compatibility_copy_holding_only_a_recognised_drawing_does_not_warn(self) -> None:
+        # The recorded copy (the first mc:Choice) holds only a chart; the picture of it in
+        # mc:Fallback is not read, as with text boxes.
+        copies = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{chart("chart")}</mc:Choice>'
+                  f'<mc:Fallback>{picture("img")}</mc:Fallback></mc:AlternateContent>')
+        extra = {**chart_parts(quarterly()), "word/media/image1.png": "png bytes"}
+        _, meta = self.extract(anchored("Figure:", copies), extra=extra,
+                               relationships=CHART_REL + image_rel("img", "media/image1.png"))
+        self.assertEqual(generic_warnings(meta), [])
+        self.assertIn(CHART_NOTE, meta["warnings"])
+        self.assertEqual(meta["objects"], [chart_entry(quarterly())])
+
+    def test_drawings_holding_anything_else_still_warn(self) -> None:
+        shape = (f'<wps:wsp xmlns:wps="{WPS}"><wps:cNvSpPr/><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                 '</wps:spPr><wps:bodyPr/></wps:wsp>')
+        group = (f'<wpg:wgp xmlns:wpg="{WPG}"><wpg:cNvGrpSpPr/><wpg:grpSpPr/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                 '<a:blip r:embed="img"/></pic:blipFill></pic:pic></wpg:wgp>')
+        chartex = "http://schemas.microsoft.com/office/drawing/2014/chartex"
+        others = {
+            "a shape without a text box": (WPS, shape, "wsp"),
+            "a grouped picture": (WPG, group, "wgp"),
+            "a chartex chart": (chartex, f'<cx:chart xmlns:cx="{chartex}" r:id="chart"/>', "chart"),
+            "a chart next to a shape": (C, f'<c:chart xmlns:c="{C}" r:id="chart"/>{shape}', "wsp"),
+            "an empty frame": (PIC, "", "graphicData"),
+        }
+        extra = {**chart_parts(quarterly()), "word/media/image1.png": "png bytes"}
+        relationships = CHART_REL + image_rel("img", "media/image1.png")
+        for name, (uri, content, construct) in others.items():
+            for wrap in (graphic, anchored_graphic):
+                with self.subTest(graphic=name, wrapper=wrap.__name__):
+                    _, meta = self.extract(anchored("Figure:", wrap(uri, content)), extra=extra, relationships=relationships)
+                    warnings = generic_warnings(meta)
+                    self.assertIn("Unsupported Word construct drawing; its semantics are not fully compared.", warnings)
+                    self.assertIn(f"Unsupported XML construct {construct}; content may be omitted or approximate.", warnings)
+
+    def test_documents_without_charts_comments_pictures_or_diagrams_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before #77: headings, lists, a table, tracked
+        # changes, a hyperlink, a symbol, text boxes (DrawingML and VML), an equation, an
+        # embedded object, an imported chunk, WordArt and a footnote, in the body and a header.
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", vml_text_box(paragraph("In the header.")))}</w:hdr>'
+        footnotes = (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p><w:r><w:footnoteRef/></w:r>'
+                     f'{run(" A note.")}</w:p></w:footnote></w:footnotes>')
+        body = (paragraph("Title", '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>')
+                + paragraph("Dr. Smith wrote this. Art. 5 applies!")
+                + list_item("First item.", "1") + list_item("Nested.", "1", 1)
+                + "<w:tbl><w:tr><w:tc>" + paragraph("Cell text.") + "</w:tc><w:tc/></w:tr></w:tbl>"
+                + f'<w:p>{run("Kept ")}<w:ins w:id="5" w:author="Ada">{run("inserted")}</w:ins>'
+                + '<w:del w:id="6" w:author="Ada"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>'
+                + f'<w:p><w:hyperlink r:id="link">{run("A link")}</w:hyperlink>{symbol()}</w:p>'
+                + anchored("Box:", modern_text_box(paragraph("Inside the box.")))
+                + f'<w:p>{equation(energy())}</w:p><w:p><w:r>{vml_wordart("SALE")}</w:r></w:p>'
+                + f'<w:p>{run("Data: ")}<w:r>{ole_object("ole")}</w:r>{run("Noted.")}'
+                + '<w:r><w:footnoteReference w:id="1"/></w:r></w:p>' + alt_chunk("chunk")
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        relationships = (NUMBERING_REL + rel("link", "hyperlink", "https://example.invalid/", external=True)
+                         + rel("ole", "package", "embeddings/Microsoft_Excel_Worksheet.xlsx")
+                         + rel("chunk", "aFChunk", "afchunk.htm") + rel("headerRef", "header", "header1.xml")
+                         + rel("footnotes", "footnotes", "footnotes.xml"))
+        extra = {"word/numbering.xml": numbering(abstract_num("0", level(0), level(1, "decimal", "%2.")), num("1", "0")),
+                 "word/embeddings/Microsoft_Excel_Worksheet.xlsx": "workbook bytes", "word/afchunk.htm": "<p>Chunk</p>",
+                 "word/header1.xml": header, "word/footnotes.xml": footnotes}
+        from pilcrow.extract import extract
+
+        make_docx(self.path, body, extra=extra, relationships=relationships)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "09ca1f86589040ce639592969e7e91a83528a9ce542d4865632fafe6118c4a36",
+            ".meta.json": "ef18ab06c57777b24914f755ec89c39ec6faa1909c0400d1f5689ee475c84a59",
         })
 
 
