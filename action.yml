@@ -19,6 +19,12 @@ inputs:
       document text visible to anyone who can view the workflow run).
     required: false
     default: "none"
+  word-diff:
+    description: >-
+      With `summary: full`, mark the changed words inside a replaced sentence, as
+      `pilcrow review --word-diff` does: "true" or "false". Ignored by `outline`.
+    required: false
+    default: "false"
   base:
     description: >-
       Revision to compare from when `summary` is set; the new side is always HEAD.
@@ -80,15 +86,22 @@ runs:
         PILCROW_ROOT: ${{ inputs.root }}
         PILCROW_BASE: ${{ inputs.base }}
         PILCROW_MODE: ${{ inputs.summary }}
+        PILCROW_WORD_DIFF: ${{ inputs.word-diff }}
       run: |
         mode=$(printf '%s' "$PILCROW_MODE" | tr '[:upper:]' '[:lower:]')
         case "$mode" in
           outline|full) ;;
           *) echo "::error::summary must be none, outline or full, not '$PILCROW_MODE'"; exit 2 ;;
         esac
+        marks=''
+        case "$(printf '%s' "$PILCROW_WORD_DIFF" | tr '[:upper:]' '[:lower:]')" in
+          true) marks=--word-diff ;;
+          false|'') ;;
+          *) echo "::error::word-diff must be true or false, not '$PILCROW_WORD_DIFF'"; exit 2 ;;
+        esac
         file="$RUNNER_TEMP/pilcrow-summary-$$-$RANDOM.md"
         # "--option=value", so a value that starts with "-" is not read as an option.
-        if "$PILCROW_PYTHON" -m pilcrow.summary --base="$PILCROW_BASE" --root="$PILCROW_ROOT" --mode="$mode" --output="$file"; then
+        if "$PILCROW_PYTHON" -m pilcrow.summary --base="$PILCROW_BASE" --root="$PILCROW_ROOT" --mode="$mode" ${marks:+"$marks"} --output="$file"; then
           cat "$file" >> "$GITHUB_STEP_SUMMARY"
           echo "file=$file" >> "$GITHUB_OUTPUT"
         else
