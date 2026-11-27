@@ -390,8 +390,8 @@ would contain and writes nothing. Coverage warnings go to stderr, so they can
 appear in the terminal alongside the diff. Because Git converts each revision on
 demand, this also works for history committed before you used Pilcrow, with no
 companions. It shows prose only: changes recorded in `.meta.json`, such as
-comments, list formats, images and their alt text, WordArt text, form
-checkbox and dropdown state, and tracked-change authors, do not appear, so it does not replace companions,
+comments, list formats, images and their alt text, WordArt text, dropdown
+entry lists, and tracked-change authors, do not appear, so it does not replace companions,
 `pilcrow check`, or review in Word. Whether
 GitHub Desktop uses the driver is **untested**.
 
@@ -451,7 +451,8 @@ Edited image alt text reads `~ image 1 (word/document.xml) alt text: "A red cat"
 "SALE" → "CLOSED"`.
 Ticking a legacy form checkbox reads `~ field 1 (FORMCHECKBOX "Check1")
 in word/document.xml: unchecked → checked`, and choosing another dropdown entry
-`~ field 2 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"`. A comment is called resolved, reopened,
+`~ field 2 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"`; the
+new state also shows as the changed prose line the field sits on. A comment is called resolved, reopened,
 re-anchored, or edited only when its author, text, and anchor identify exactly
 one comment on each side; otherwise the report says it was removed and added.
 When something changed, the coverage warnings of both files are listed once.
@@ -626,11 +627,15 @@ chart edit that only changes its values, still makes companions stale; a chart's
 own workbook and a diagram's layout, style, and colour parts are not compared.
 Embedded objects are not rendered.
 Legacy form fields (`FORMCHECKBOX`, `FORMDROPDOWN`), common in contract, HR, and
-government templates, keep their state outside the prose: Word writes no display
+government templates, keep their state outside the text: Word writes no display
 text for them. Each checkbox's checked state and each dropdown's entries and
-selected entry are recorded with the field in metadata, so ticking a box or
-choosing another entry makes companions stale; the state is not shown in the
-prose. A text form field's value is its display text, already in the prose.
+selected entry are recorded with the field in metadata, and the state is shown in
+the prose where the field sits: a checkbox as `☒` (checked) or `☐` (unchecked),
+the glyphs Word's content-control checkboxes use, and a dropdown as its selected
+entry's text (nothing when no entry is selected). So `Agree: ☐ Terms: Net 30`
+becomes `Agree: ☒ Terms: Net 60` in the prose diff when the box is ticked and
+another entry chosen. A changed list of dropdown entries is in metadata only.
+A text form field's value is its display text, already in the prose.
 Content-control checkboxes need nothing extra, because their glyph is prose text.
 Comments stay out of the prose; their text, author, and anchored text (the
 accepted text their range covers, and the part it is in) are recorded in metadata,
@@ -693,6 +698,14 @@ because their field entries in `.meta.json` now have a `form` key (and documents
 with any legacy form field no longer warn about its `w:ffData`). Run `pilcrow
 export` and commit the refreshed companions. Documents without legacy form
 fields are unaffected.
+
+Upgrading from a version that did not show legacy form field state in prose:
+documents containing a checkbox or dropdown form field report stale companions
+once, because their prose now shows each checkbox as `☒` or `☐` and each
+dropdown's selected entry where the field sits, and their coverage warnings
+changed. Run `pilcrow export` and commit the refreshed companions. Field
+metadata is unchanged, and documents without a legacy checkbox or dropdown
+(including those with only text form fields) are unaffected.
 
 Upgrading from a version that did not record image alt text and WordArt text:
 documents containing an image with alt text, or legacy VML WordArt, report stale

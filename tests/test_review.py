@@ -490,7 +490,10 @@ class ReviewTests(unittest.TestCase):
     def test_ticking_a_form_checkbox(self) -> None:
         self.write_forms(checkbox("0"), checkbox("1"))
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        # The box's state is prose, so the answer changes the line it sits on, too.
+        self.assertIn("\n-Sublet: \u2610\n+Sublet: \u2612\n", report)
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Sublet: [-\u2610-]{+\u2612+}\n", marked)
         self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMCHECKBOX "Check1") in word/document.xml: unchecked → checked'])
         self.write_forms(checkbox(None, "1"), checkbox(None, "0"))
@@ -500,11 +503,16 @@ class ReviewTests(unittest.TestCase):
     def test_choosing_another_dropdown_entry(self) -> None:
         self.write_forms(dropdown("Yes", "No", result="0"), dropdown("Yes", "No", result="1"))
         report = self.review()
-        self.assertIn("Prose: no changes", report)
+        self.assertIn("\n-Sublet: Yes\n+Sublet: No\n", report)
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Sublet: [-Yes-]{+No+}\n", marked)
         self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: "Yes" → "No"'])
         self.write_forms(dropdown("Yes", "No", result="1"), dropdown("Yes", "No", "Maybe", result="1"))
-        self.assertEqual(self.section(self.review(), "Fields"),
+        report = self.review()
+        # The entry list is not prose: with the same selection, only the Fields line moves.
+        self.assertIn("Prose: no changes", report)
+        self.assertEqual(self.section(report, "Fields"),
                          ['~ field 1 (FORMDROPDOWN "Drop1") in word/document.xml: entries changed'])
         self.write_forms(dropdown("Yes", "No", result="0"), dropdown("No", "Yes", result="0"))
         self.assertEqual(self.section(self.review(), "Fields"),
