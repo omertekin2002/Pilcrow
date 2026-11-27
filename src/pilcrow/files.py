@@ -84,7 +84,19 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
             continue  # above the document's repository
         directory = folder.parent
         break
-    name = path.relative_to(directory).as_posix()
+    return read_blob(directory, revision, path.relative_to(directory).as_posix(), limit)
+
+
+def read_blob(directory: Path, revision: str, name: str, limit: int) -> bytes:
+    """Read ``name``, a ``/``-separated path relative to ``directory``, as committed at ``revision``.
+
+    Git runs in ``directory``, so the blob comes from the repository holding it,
+    the same one a listing run there names, even when a nested repository now
+    sits on the path in the work tree. Read-only plumbing only; the blob's size
+    is checked against ``limit`` before it is read.
+    """
+    if revision.startswith("-"):
+        raise ValueError('a revision must not start with "-"')
     # Neither argument can start with "-": the revision is checked above, and the second starts with a hash.
     tree = git_output(directory, "rev-parse", "--verify", "--quiet", f"{revision}^{{tree}}")
     if tree is None:
@@ -104,6 +116,49 @@ def revision_blob(path: Path, revision: str, limit: int) -> bytes:
     if len(content) != size:
         raise ValueError(f"Git returned {len(content)} bytes for a {size}-byte file")
     return content
+
+
+def resolve(root: Path, revision: str) -> str | None:
+    """The full commit ID ``revision`` names, or None if it names no commit here."""
+    if revision.startswith("-"):
+        return None
+    found = git_output(root, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}")
+    return found.decode("ascii").strip() if found else None
+
+
+def merge_base(root: Path, base: str, head: str) -> str | None:
+    """The full commit ID of the best common ancestor of ``base`` and ``head``, or None if they share none."""
+    found = (git_output(root, "merge-base", base, head) or b"").decode("ascii").strip()
+    return found or None
+
+
+def changed(root: Path, base: str, head: str | None) -> list[tuple[str, str]]:
+    """(status letter, path relative to the root) of each eligible DOCX that differs, sorted by path.
+
+    ``head`` None compares ``base`` with the work tree, where untracked documents
+    that are not ignored are listed as added (A). Blobs for the listed paths are
+    read with ``read_blob(root, ...)``, from the repository that listed them.
+    """
+    # --relative limits the listing to the root and prints paths relative to it; no rename
+    # detection, so a renamed document is listed as removed and added.
+    if head is None:
+        # --no-optional-locks: comparing with the work tree must not refresh the index.
+        output = git_output(root, "--no-optional-locks", "diff", "--no-ext-diff", "--name-status", "--no-renames",
+                            "--relative", "-z", base, "--", ".")
+    else:
+        output = git_output(root, "diff", "--no-ext-diff", "--name-status", "--no-renames", "--relative", "-z",
+                            base, head, "--", ".")
+    fields = [os.fsdecode(f) for f in (output or b"").split(b"\0") if f]
+    statuses = {path: status[:1] for status, path in zip(fields[::2], fields[1::2], strict=True)}
+    if head is None:
+        # ls-files prints paths relative to the directory it runs in, as --relative does above.
+        untracked = git_output(root, "ls-files", "-z", "--others", "--exclude-standard", "--", ".")
+        for raw in (untracked or b"").split(b"\0"):
+            if raw:
+                path = os.fsdecode(raw)
+                # Removed from the index but still on disk: both sides exist, so it is a modification.
+                statuses[path] = "M" if statuses.get(path) == "D" else "A"
+    return sorted(((status, path) for path, status in statuses.items() if eligible(Path(path))), key=lambda p: p[1])
 
 
 def eligible(path: Path) -> bool:

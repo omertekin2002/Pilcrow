@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .extract import MAX_PACKAGE_BYTES, extract
-from .files import eligible, git_output, revision_blob
+from .files import changed, git_output, merge_base, read_blob, resolve
 from .review import Report, build, code, escape, markdown
 
 MODES = ("outline", "full")
@@ -72,14 +72,6 @@ def annotate(message: str) -> None:
     print(f"::warning::{value}", flush=True)
 
 
-def resolve(root: Path, revision: str) -> str | None:
-    """The full commit ID ``revision`` names, or None if it names no commit here."""
-    if revision.startswith("-"):
-        return None
-    found = git_output(root, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}")
-    return found.decode("ascii").strip() if found else None
-
-
 def shallow(root: Path) -> bool:
     try:
         return (git_output(root, "rev-parse", "--is-shallow-repository") or b"").strip() == b"true"
@@ -87,28 +79,13 @@ def shallow(root: Path) -> bool:
         return False
 
 
-def merge_base(root: Path, base: str, head: str) -> str | None:
-    """The full commit ID of the best common ancestor of ``base`` and ``head``, or None if they share none."""
-    found = (git_output(root, "merge-base", base, head) or b"").decode("ascii").strip()
-    return found or None
-
-
-def changed(root: Path, base: str, head: str) -> list[tuple[str, str]]:
-    """(status letter, path relative to the root) of each eligible DOCX that differs, sorted by path."""
-    # --relative limits the listing to the root and prints paths relative to it; no rename
-    # detection, so a renamed document is listed as removed and added.
-    output = git_output(root, "diff", "--no-ext-diff", "--name-status", "--no-renames", "--relative", "-z", base, head, "--", ".")
-    fields = [os.fsdecode(f) for f in (output or b"").split(b"\0") if f]
-    pairs = list(zip(fields[::2], fields[1::2], strict=True))
-    return sorted(((status[:1], path) for status, path in pairs if eligible(Path(path))), key=lambda p: p[1])
-
-
 def compare(root: Path, path: str, base: str, head: str, marks: bool = False) -> Document:
     """Read ``path`` at both revisions and compare them; a read error is reported, not raised.
 
     ``marks`` marks the changed words of replaced prose lines that pair up (``--word-diff``)."""
     try:
-        old, new = (extract(revision_blob(root / path, rev, MAX_PACKAGE_BYTES)) for rev in (base, head))
+        # From the repository that listed the path, even if a nested repository now sits on it.
+        old, new = (extract(read_blob(root, rev, path, MAX_PACKAGE_BYTES)) for rev in (base, head))
         report = build(old, new, marks)
     except Exception as exc:  # any failure, not only DocumentError: one document must never stop the others
         return Document(path, "could not be read", error=shown(str(exc)) or type(exc).__name__)

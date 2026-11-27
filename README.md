@@ -561,6 +561,41 @@ with `-`. A file added or deleted in the commit has no other side to compare, so
 it reports an error. `git difftool` ignores the exit code unless you pass
 `--trust-exit-code`.
 
+### Review a whole branch
+
+To review every DOCX a branch or a range of commits changed before you push,
+give `--all` instead of a path (`--all` first ships in the release after v0.1.9):
+
+```sh
+pilcrow review --rev main --all                          # main → working copy
+pilcrow review --rev main --all --merge-base             # only what this branch changed since it left main
+pilcrow review --rev main --rev feature --all --format markdown
+```
+
+It lists the changed documents with Git and prints one report per document, in
+path order, each headed by its path in the repository, such as
+`Review: main:docs/a.docx → docs/a.docx`. A document that was added or removed
+gets a single line, `Added: docs/c.docx` or `Removed: main:docs/d.docx` (a
+heading in Markdown). Renames are not detected, so a renamed document shows as
+removed and added. `--format markdown` and `--word-diff` work as above.
+
+- **One `--rev`** compares that revision with the working copy, including
+  uncommitted edits. Untracked documents count as added unless Git ignores them.
+- **Two `--rev`s** compare the two revisions; the working copy is not read.
+- **`--merge-base`** compares from where the branch left the first revision
+  (`git merge-base REV REV2`, or `REV` and `HEAD` with one `--rev`), as
+  `git diff --merge-base` does, so edits made on `main` since then are left
+  out. The header names the merge-base commit.
+- **`--root`** limits the review to a folder, as in `export` and `check`; the
+  default is the current directory. As there, Word lock files (`~$*.docx`) and
+  anything under `.pilcrow/` are skipped.
+
+It is read-only, like the single-document form. A document that cannot be read
+is an error on stderr naming its path, and the other documents are still
+reported. It exits 2 if any revision or document could not be read, 1 if any
+document changed, was added or was removed, and 0 otherwise. When no document
+changed, it prints `No DOCX documents changed.` and exits 0.
+
 In CI, the GitHub Action can publish these reports for every changed document in
 the job summary; see [Review report in the job summary](#review-report-in-the-job-summary-optional).
 
