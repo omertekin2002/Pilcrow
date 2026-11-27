@@ -45,10 +45,12 @@ try:
         numbering,
         object_parts,
         ole_object,
+        outline,
         paragraph,
         picture,
         rel,
         run,
+        smartart,
         start,
         symbol,
         vml_wordart,
@@ -83,10 +85,12 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         numbering,
         object_parts,
         ole_object,
+        outline,
         paragraph,
         picture,
         rel,
         run,
+        smartart,
         start,
         symbol,
         vml_wordart,
@@ -682,13 +686,32 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(edit=edit):
                 self.write_objects(self.new, **edit)
                 report = self.review()
-                self.assertIn("Prose: no changes", report)
+                if "node" in edit:  # a diagram's text is prose
+                    self.assertIn("\n-- Plan\n+- Build\n", report)
+                else:
+                    self.assertIn("Prose: no changes", report)
                 self.assertEqual(self.section(report, title), [line])
                 self.assertNotIn("Equations and symbols", report)
                 markdown = self.markdown()
                 self.assertIn(f"### {title}\n\n- `~` {line[2:]}\n", markdown)
         self.write_objects(self.new)
         self.assertNotIn(title, self.review(code=0))
+
+    def test_a_diagram_node_edit_shows_in_the_prose_diff(self) -> None:
+        def write(path: Path, step: str) -> None:
+            data = outline(("1", "0", "Plan"), ("2", "1", step), ("3", "0", "Review"))
+            make_docx(path, f'<w:p>{run("Steps:")}<w:r>{smartart("dgm")}</w:r></w:p>',
+                      extra={"word/diagrams/data1.xml": data}, relationships=rel("dgm", "diagramData", "diagrams/data1.xml"))
+
+        write(self.old, "Gather the requirements")
+        write(self.new, "Gather the needs")
+        report = self.review()
+        self.assertIn("\n [Diagram]\n \n - Plan\n-  - Gather the requirements\n+  - Gather the needs\n - Review\n", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ diagram 1 (word/document.xml) changed"])
+        self.assertIn("\n-  - Gather the requirements\n+  - Gather the needs\n", self.markdown())
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~   - Gather the [-requirements-]{+needs+}\n", marked)
 
     def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
         self.write_objects(self.old)
