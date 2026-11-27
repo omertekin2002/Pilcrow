@@ -67,6 +67,10 @@ TEXT_BOX_NOTE = ("Text box text is shown in [Text box] blocks after its anchorin
 # that make its outline. Only node and assistant points hold prose.
 DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+# DrawingML graphics recorded and noted on their own (images, charts and SmartArt diagrams):
+# the drawing markup around them is not audited.
+GRAPHIC_DATA = f"{{{A}}}graphicData"
+RECOGNISED_GRAPHICS = frozenset({PICTURE, CHART, DIAGRAM})
 DIAGRAM_NOTE = ("SmartArt diagram text is shown as an outline in [Diagram] blocks after its anchoring paragraph; "
                 "layout, shapes and formatting are not shown, and the diagram's data part is fingerprinted in objects.")
 DIAGRAM_UNREACHED_NOTE = ("Some SmartArt diagram text is not connected to the diagram's outline; "
@@ -286,6 +290,34 @@ def ch(name: str) -> str:
     return f"{{{CHART_NS}}}{name}"
 
 
+# Axis IDs are arbitrary numbers that only link a chart group's axes to each other; LibreOffice
+# writes new random ones on every save.
+CHART_AXIS_IDS = frozenset({ch("axId"), ch("crossAx")})
+
+
+def chart_form(space: Element) -> list[Any]:
+    """A chart part as nested lists: tag, sorted attributes, text, children.
+
+    Each c:axId and c:crossAx value becomes the order in which that value first appears in the
+    part, so a save that only renumbers the axes keeps the same form while which axis crosses
+    which still counts.
+    """
+    axes: dict[str, str] = {}
+
+    def form(node: Element) -> list[Any]:
+        attributes = sorted([key, value] for key, value in node.attrib.items())
+        if node.tag in CHART_AXIS_IDS:
+            attributes = [[key, axes.setdefault(value, str(len(axes))) if key == "val" else value]
+                          for key, value in attributes]
+        return [node.tag, attributes, node.text or "", [form(child) for child in node]]
+    return form(space)
+
+
+def chart_hash(space: Element) -> str:
+    data = json.dumps(chart_form(space), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
 def drawing_text(paragraphs: Iterable[Element]) -> str:
     """DrawingML text: each a:p's runs, fields and breaks (as a space), normalised, joined by a space."""
     found = []
@@ -469,6 +501,10 @@ class Reader:
         self.diagram_outlines: dict[str, list[str] | None] = {}
         # Chart part -> its label lines; empty when it has none.
         self.chart_labels: dict[str, list[str]] = {}
+        # Chart part -> its parsed tree, shared by its fingerprint and its [Chart] block.
+        self.chart_trees: dict[str, Element] = {}
+        # Chart part -> its fingerprint.
+        self.chart_hashes: dict[str, str] = {}
         # The current story part's rendered text in fragments, in the accepted view, so a
         # comment range is the fragments between the offsets of its start and end markers.
         self.story: list[str] = []
@@ -709,6 +745,8 @@ class Reader:
         rel = self.rels.get(rid) if rid else None
         if rel is not None and rel[2]:
             entry["target"] = rel[1]  # never fetched, like linked images
+        elif rel is not None and rel[1] in self.names and kind == "chart":
+            entry["sha256"] = self.chart_fingerprint(rel[1])
         elif rel is not None and rel[1] in self.names:
             if rel[1] not in self.media:
                 self.media[rel[1]] = self.hash_part(rel[1])
@@ -717,6 +755,22 @@ class Reader:
             self.warn(MISSING_OBJECT_NOTE)
             entry["sha256"] = None
         return entry
+
+    def chart_tree(self, name: str) -> Element:
+        """A chart part, parsed once within the XML caps for both its fingerprint and its [Chart] block."""
+        if name not in self.chart_trees:
+            self.chart_trees[name] = self.xml(name)
+        return self.chart_trees[name]
+
+    def chart_fingerprint(self, name: str) -> str:
+        """A chart part's hash: of its canonical form (see ``chart_form``), or of its raw bytes
+        when it cannot be parsed within the XML caps."""
+        if name not in self.chart_hashes:
+            try:
+                self.chart_hashes[name] = chart_hash(self.chart_tree(name))
+            except DocumentError:
+                self.chart_hashes[name] = self.hash_part(name)[0]
+        return self.chart_hashes[name]
 
     def equation_text(self, node: Element) -> str:
         """An equation as linear text: ``[Math: …]`` per m:oMath, separated by a space.
@@ -925,7 +979,7 @@ class Reader:
         if rel is None or rel[2] or rel[1] not in self.names:
             return None
         if rel[1] not in self.chart_labels:
-            self.chart_labels[rel[1]] = self.chart_lines(self.xml(rel[1]))
+            self.chart_labels[rel[1]] = self.chart_lines(self.chart_tree(rel[1]))
         lines = self.chart_labels[rel[1]]
         if not lines:
             return None
@@ -1392,7 +1446,7 @@ class Reader:
 
     def audit(self, tree: Element) -> None:
         # This small allowlist is intentionally conservative: unknown constructs warn.
-        known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
+        known = set("document body p r t delText tab br cr noBreakHyphen softHyphen pPr rPr sectPr tbl tr tc tblPr trPr tcPr tblGrid gridCol sdt sdtContent sdtPr sdtEndPr customXml smartTag ins del moveFrom moveTo hyperlink bookmarkStart bookmarkEnd proofErr permStart permEnd commentRangeStart commentRangeEnd commentReference annotationRef footnoteReference endnoteReference footnotes footnote endnotes endnote footnoteRef endnoteRef comments comment hdr ftr fldChar instrText fldSimple lastRenderedPageBreak moveFromRangeStart moveFromRangeEnd moveToRangeStart moveToRangeEnd".split())
         def visit_form(node: Element) -> None:
             for child in node:
                 if child.tag not in FORM_DATA[node.tag]:
@@ -1412,6 +1466,11 @@ class Reader:
                 for child in branch:
                     visit(child, math)
                 return
+            if node.tag == f"{{{MC}}}AlternateContent" and (copy := self.image_branch(node)) is not None \
+                    and len(copy) and all(self.recognised_drawing(child) for child in copy):
+                return  # the copy whose images and objects are recorded holds only recognised graphics
+            if self.recognised_drawing(node):
+                return  # inline() notes the picture, chart or diagram; its wrapper adds nothing
             if node.tag in {w("drawing"), w("pict"), w("txbxContent")}:
                 # A rendered text box: audit its Word content, not the shape markup around it.
                 # inline() warns for pictures or charts that share the shape.
@@ -1436,6 +1495,15 @@ class Reader:
             for child in node:
                 visit(child, math)
         visit(tree)
+
+    def recognised_drawing(self, node: Element) -> bool:
+        """Whether ``node`` is a w:drawing whose graphics all hold only pictures, charts or
+        SmartArt diagrams, which are recorded and noted on their own."""
+        if node.tag != w("drawing"):
+            return False
+        frames = list(node.iter(GRAPHIC_DATA))
+        return bool(frames) and all(len(frame) and all(item.tag in RECOGNISED_GRAPHICS for item in frame)
+                                    for frame in frames)
 
     def render_part(self, part: str, tree: Element) -> str:
         self.part, self.rels = part, self.relationships(part)
@@ -1533,6 +1601,7 @@ class Reader:
                 entry["anchor"] = entry["anchor_part"] = None
                 self.warn(UNANCHORED_COMMENT_NOTE)
         supported.update(self.media)
+        supported.update(self.chart_hashes)
         for name in sorted(self.names):
             if name in supported or name.endswith("/") or name.endswith(".rels") or name == "[Content_Types].xml" or name.startswith("docProps/"):
                 continue

@@ -671,8 +671,10 @@ Charts, SmartArt diagrams, embedded (OLE) objects, and imported chunks
 (`w:altChunk`) are recorded by the SHA-256 of the package part they point to (the
 chart part, the diagram's data part, the embedding, the chunk), so editing a
 chart's values, a diagram's text, an embedded workbook, or a chunk, or adding or
-removing one, makes companions stale; renaming the part does not. The fingerprint
-covers the stored part, not how Word draws it, so a diagram edit that leaves its
+removing one, makes companions stale; renaming the part does not. A chart part is
+hashed with its axis IDs (`c:axId`, `c:crossAx`) numbered in order of appearance,
+because LibreOffice writes new random ones on every save; which axis crosses which
+still counts. The fingerprint covers the stored part, not how Word draws it, so a diagram edit that leaves its
 outline text unchanged (formatting stored in the data part, for example), or a
 chart edit that only changes its values, still makes companions stale; a chart's
 own workbook and a diagram's layout, style, and colour parts are not compared.
@@ -783,6 +785,16 @@ category report stale companions once, because their prose now shows those
 labels in a `[Chart]` block and their coverage warnings changed. Run `pilcrow
 export` and commit the refreshed companions. The chart's `objects` entry is
 unchanged, and documents without such a chart are unaffected.
+
+Upgrading from a version that hashed chart parts byte for byte, or that warned
+about the drawing markup around pictures, charts and SmartArt diagrams and about
+the `annotationRef` mark in comments: documents containing a chart, a picture, a
+SmartArt diagram or a comment report stale companions once, because a chart's
+`objects` hash now ignores axis ID renumbering and those generic
+`Unsupported Word construct …` / `Unsupported XML construct …` warnings are gone
+(the specific chart, diagram, image and placeholder notes stay). Their prose is
+unchanged. Run `pilcrow export` and commit the refreshed companions. Documents
+without any of these are unaffected.
 
 Run the generated-fixture suite:
 
