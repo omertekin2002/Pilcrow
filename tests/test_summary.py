@@ -380,6 +380,16 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("good.docx", text)
             self.assertIn("Prose changed" if mode == "outline" else "+After.", text)
 
+    def test_a_nested_repository_does_not_hide_a_listed_document(self) -> None:
+        make_docx(self.repo / "sub" / "a.docx", paragraph("Before."))
+        base = self.commit("first")
+        make_docx(self.repo / "sub" / "a.docx", paragraph("After."))
+        self.commit("second")
+        self.git("init", "-q", cwd=self.repo / "sub")  # a repository appears on the listed path later
+        text, printed = self.summarize(base)
+        self.assertIn("- `sub/a.docx` — changed: Prose changed\n", text)
+        self.assertEqual(printed, "")
+
     def test_an_unexpected_error_is_reported_like_a_read_error(self) -> None:
         make_docx(self.repo / "a.docx", paragraph("One."))
         make_docx(self.repo / "b.docx", paragraph("One."))
