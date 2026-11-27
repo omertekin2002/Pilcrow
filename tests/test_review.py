@@ -29,6 +29,7 @@ try:
         alt_chunk,
         anchored,
         chart,
+        chart_parts,
         checkbox,
         comments_extended,
         comments_part,
@@ -48,6 +49,7 @@ try:
         outline,
         paragraph,
         picture,
+        quarterly,
         rel,
         run,
         smartart,
@@ -69,6 +71,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         alt_chunk,
         anchored,
         chart,
+        chart_parts,
         checkbox,
         comments_extended,
         comments_part,
@@ -88,6 +91,7 @@ except ImportError:  # discovered with -s tests: the directory itself is on sys.
         outline,
         paragraph,
         picture,
+        quarterly,
         rel,
         run,
         smartart,
@@ -712,6 +716,21 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("\n-  - Gather the requirements\n+  - Gather the needs\n", self.markdown())
         marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
         self.assertIn("\n~   - Gather the [-requirements-]{+needs+}\n", marked)
+
+    def test_a_chart_series_rename_shows_in_the_prose_diff(self) -> None:
+        def write(path: Path, series: str) -> None:
+            make_docx(path, anchored("Figure:", chart("chart")), extra=chart_parts(quarterly(series)),
+                      relationships=rel("chart", "chart", "charts/chart1.xml"))
+
+        write(self.old, "2026")
+        write(self.new, "2026 forecast")
+        report = self.review()
+        self.assertIn("\n Series: 2025\n-Series: 2026\n+Series: 2026 forecast\n Category: Q1\n", report)
+        self.assertEqual(self.section(report, "Charts, diagrams and embedded objects"),
+                         ["~ chart 1 (word/document.xml) changed"])
+        self.assertIn("\n-Series: 2026\n+Series: 2026 forecast\n", self.markdown())
+        marked = self.pilcrow("review", "--word-diff", "old.docx", "new.docx", code=1).stdout.decode("utf-8")
+        self.assertIn("\n~ Series: 2026{+ forecast+}\n", marked)
 
     def test_objects_are_numbered_by_kind_and_added_or_removed(self) -> None:
         self.write_objects(self.old)

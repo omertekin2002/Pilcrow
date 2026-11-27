@@ -511,6 +511,72 @@ OBJECT_BODY = (f'<w:p>{run("Results: ")}<w:r>{chart("chart")}</w:r><w:r>{smartar
                f'<w:r>{ole_object("ole")}</w:r></w:p>{alt_chunk("chunk")}')
 
 
+
+def chart_rich(*paragraphs: str) -> str:
+    """A chart label (c:tx) as rich text, one a:p of one run per paragraph."""
+    text = "".join(f'<a:p><a:pPr><a:defRPr/></a:pPr><a:r><a:rPr lang="en-US"/><a:t>{escape(p)}</a:t></a:r></a:p>'
+                   for p in paragraphs)
+    return f"<c:tx><c:rich><a:bodyPr/><a:lstStyle/>{text}</c:rich></c:tx>"
+
+
+def str_points(*values: str) -> str:
+    return f'<c:ptCount val="{len(values)}"/>' + "".join(
+        f'<c:pt idx="{i}"><c:v>{escape(v)}</c:v></c:pt>' for i, v in enumerate(values))
+
+
+def chart_cached(*values: str) -> str:
+    """A chart label (c:tx) as a cell reference with its cached string, as Word writes series names."""
+    return f"<c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache>{str_points(*values)}</c:strCache></c:strRef></c:tx>"
+
+
+def chart_categories(*values: str) -> str:
+    """A series's string categories (c:cat) from a cell range's cached strings."""
+    return f"<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$9</c:f><c:strCache>{str_points(*values)}</c:strCache></c:strRef></c:cat>"
+
+
+def chart_series(name: str = "", categories: str = "", value: str = "10") -> str:
+    """A c:ser with a name (a c:tx), categories (a c:cat) and one cached data value."""
+    return (f'<c:ser><c:idx val="0"/><c:order val="0"/>{name}{categories}<c:val><c:numRef><c:f>Sheet1!$B$2</c:f>'
+            f'<c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>{value}</c:v>'
+            "</c:pt></c:numCache></c:numRef></c:val></c:ser>")
+
+
+def chart_axis(kind: str, title: str = "", ax_id: str = "1") -> str:
+    """An axis (c:catAx, c:valAx, ...), titled with a c:tx when ``title`` is given."""
+    heading = f'<c:title>{title}<c:overlay val="0"/></c:title>' if title else ""
+    return f'<c:{kind}><c:axId val="{ax_id}"/><c:scaling/><c:delete val="0"/>{heading}</c:{kind}>'
+
+
+def chart_space(plot: str, title: str | None = None, *, deleted: str | None = None) -> str:
+    """A chart part: a c:title holding ``title`` (a c:tx, or "" for none) and a plot area holding ``plot``."""
+    heading = "" if title is None else f'<c:title>{title}<c:overlay val="0"/></c:title>'
+    removed = "" if deleted is None else f"<c:autoTitleDeleted{deleted}/>"
+    return (f'<c:chartSpace xmlns:c="{C}" xmlns:a="{A}" xmlns:r="{R}"><c:date1904 val="0"/><c:chart>{heading}{removed}'
+            f'<c:plotArea><c:layout/>{plot}</c:plotArea><c:plotVisOnly val="1"/></c:chart>'
+            '<c:externalData r:id="rId1"/></c:chartSpace>')
+
+
+def quarterly(series_2026: str = "2026", category: str = "Q2", title: str = "Quarterly revenue") -> str:
+    """A bar chart with a rich-text title and axis titles, two named series and shared categories."""
+    quarters = chart_categories("Q1", category, "Q3")
+    bars = chart_series(chart_cached("2025"), quarters) + chart_series(chart_cached(series_2026), quarters, "12")
+    return chart_space(f'<c:barChart><c:barDir val="col"/>{bars}</c:barChart>'
+                       + chart_axis("catAx", chart_rich("Quarter")) + chart_axis("valAx", chart_rich("Revenue (USD)"), "2"),
+                       chart_rich(title))
+
+
+QUARTERLY_BLOCK = ("[Chart]\n\nTitle: Quarterly revenue\nAxis title: Quarter\nAxis title: Revenue (USD)\n"
+                   "Series: 2025\nSeries: 2026\nCategory: Q1\nCategory: Q2\nCategory: Q3\n\n[/Chart]")
+
+
+def chart_parts(data: str, name: str = "word/charts/chart1.xml") -> dict[str, str]:
+    """A chart part holding ``data``, with the embedded workbook it reads its values from."""
+    rels = name.replace("charts/", "charts/_rels/") + ".rels"
+    return {name: data, rels: f'<Relationships xmlns="{PKG_R}">{rel("rId1", "package", "../embeddings/chart_workbook.xlsx")}'
+                              "</Relationships>",
+            "word/embeddings/chart_workbook.xlsx": "chart workbook bytes"}
+
+
 class CLITests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-test-")
@@ -2174,13 +2240,13 @@ class CLITests(unittest.TestCase):
                          + rel("footnotes", "footnotes", "footnotes.xml"))
         extra = {"word/header1.xml": header, "word/_rels/header1.xml.rels": chart_rels,
                  "word/footnotes.xml": footnotes, "word/_rels/footnotes.xml.rels": footnote_rels,
-                 "word/charts/chart1.xml": "<body chart/>", "word/charts/chart2.xml": "<header chart/>",
-                 "word/charts/chart3.xml": "<footnote chart/>"}
+                 "word/charts/chart1.xml": "<bodyChart/>", "word/charts/chart2.xml": "<headerChart/>",
+                 "word/charts/chart3.xml": "<footnoteChart/>"}
         _, meta = self.export_objects(body, extra=extra, relationships=relationships)
         self.assertEqual(meta["objects"], [
-            part_entry("chart", "<body chart/>"),
-            part_entry("chart", "<footnote chart/>", "word/footnotes.xml"),
-            part_entry("chart", "<header chart/>", "word/header1.xml"),
+            part_entry("chart", "<bodyChart/>"),
+            part_entry("chart", "<footnoteChart/>", "word/footnotes.xml"),
+            part_entry("chart", "<headerChart/>", "word/header1.xml"),
         ])
         self.assertFalse([wn for wn in meta["warnings"] if "Unrendered package part" in wn], meta["warnings"])
 
@@ -3113,6 +3179,264 @@ class DiagramTextTests(unittest.TestCase):
         self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
             ".prose.md": "9dd8a49a3e1c9cd1144c4f59d06efe69f57863f75c10c91243551b2e9b38a85c",
             ".meta.json": "44e5c205bb0dce2818d70c96760ddc2f90be5dd8ddcc7806ccbad7bc7996e54d",
+        })
+
+
+
+CHART_NOTE = ("Chart titles, axis titles, series names and text categories are shown in [Chart] blocks after "
+              "their anchoring paragraph, from the chart's cached values; data values, numeric categories, "
+              "data labels and formatting are not shown, and the chart part is fingerprinted in objects.")
+CHART_REL = rel("chart", "chart", "charts/chart1.xml")
+
+
+class ChartTextTests(unittest.TestCase):
+    """Chart labels as [Chart] blocks in prose, read in process."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="pilcrow-chart-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "essay.docx"
+
+    def extract(self, body: str, data: str | None = None, *, extra: dict[str, str] | None = None,
+                relationships: str = CHART_REL) -> tuple[str, dict[str, Any]]:
+        from pilcrow.extract import extract
+
+        parts = chart_parts(quarterly() if data is None else data)
+        parts.update(extra or {})
+        make_docx(self.path, body, extra=parts, relationships=relationships)
+        result = extract(self.path)
+        return result.prose, result.metadata
+
+    def block(self, data: str) -> str:
+        """The prose of one paragraph anchoring one chart with part ``data``."""
+        prose, _ = self.extract(anchored("Figure:", chart("chart")), data)
+        return prose
+
+    def labels(self, plot: str, title: str | None = None, **options: str) -> list[str]:
+        """The label lines of a chart with ``plot`` and ``title``; [] when it keeps its placeholder."""
+        prose = self.block(chart_space(plot, title, **options))
+        if "[Chart]" not in prose:
+            self.assertEqual(prose, "Figure:[Unsupported drawing]\n")
+            return []
+        return prose.split("\n\n")[2].split("\n")
+
+    def test_a_chart_renders_its_labels_after_its_anchoring_paragraph(self) -> None:
+        prose, meta = self.extract(anchored("Figure:", chart("chart")) + paragraph("After."))
+        self.assertEqual(prose, f"Figure:\n\n{QUARTERLY_BLOCK}\n\nAfter.\n")
+        self.assertIn(CHART_NOTE, meta["warnings"])
+        self.assertNotIn(UNSUPPORTED_DRAWING, meta["warnings"])
+        # The fingerprint is still the chart part's hash, as before charts had prose.
+        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())])
+        # The chart part is supported; its embedded workbook is still not read.
+        unrendered = [wn for wn in meta["warnings"] if wn.startswith("Unrendered package part")]
+        self.assertEqual(unrendered, ["Unrendered package part: word/embeddings/chart_workbook.xlsx; "
+                                      "changes to its content are not compared."])
+        # A drawing directly in the body, and one between runs, render the same block.
+        self.assertEqual(self.extract(chart("chart"))[0], QUARTERLY_BLOCK + "\n")
+        prose, _ = self.extract(f'<w:p>{run("Before ")}<w:r>{chart("chart")}</w:r>{run(" after.")}</w:p>')
+        self.assertEqual(prose, f"Before after.\n\n{QUARTERLY_BLOCK}\n")
+
+    def test_labels_read_rich_text_cached_strings_and_literals(self) -> None:
+        rich = ('<c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>Sales </a:t></a:r><a:r><a:t> by</a:t></a:r><a:br/>'
+                '<a:r><a:t>region</a:t></a:r></a:p><a:p><a:endParaRPr/></a:p><a:p><a:fld id="{1}" type="datetime">'
+                '<a:t>2026</a:t></a:fld><a:r><a:t>\n  final</a:t></a:r></a:p></c:rich></c:tx>')
+        literal = "<c:tx><c:v>  Plan\tA </c:v></c:tx>"
+        plot = (f"<c:lineChart>{chart_series(chart_cached('North', 'East'))}{chart_series(literal)}"
+                f"{chart_series(chart_rich('Rich', 'name'))}</c:lineChart>"
+                + chart_axis("valAx", chart_cached("Units sold")))
+        self.assertEqual(self.labels(plot, rich), ["Title: Sales by region 2026 final", "Axis title: Units sold",
+                                                   "Series: North East", "Series: Plan A", "Series: Rich name"])
+        # A title linked to a cell reads its cached string.
+        self.assertEqual(self.labels("<c:pieChart/>", chart_cached("Linked title")), ["Title: Linked title"])
+
+    def test_no_title_line_when_the_title_is_deleted_absent_or_automatic(self) -> None:
+        plot = f"<c:pieChart>{chart_series(chart_cached('Share'))}</c:pieChart>"
+        self.assertEqual(self.labels(plot, chart_rich("Shown"), deleted=' val="0"'), ["Title: Shown", "Series: Share"])
+        for name, options in (("deleted", {"deleted": ' val="1"'}), ("deleted, no val", {"deleted": ""}),
+                              ("deleted, true", {"deleted": ' val="true"'})):
+            with self.subTest(name=name):
+                self.assertEqual(self.labels(plot, chart_rich("Hidden"), **options), ["Series: Share"])
+        # No c:title, and a c:title without text (Word draws the series name): no title line.
+        self.assertEqual(self.labels(plot), ["Series: Share"])
+        self.assertEqual(self.labels(plot, ""), ["Series: Share"])
+
+    def test_axis_titles_follow_document_order(self) -> None:
+        plot = ("<c:surfaceChart/>" + chart_axis("dateAx", chart_rich("Month")) + chart_axis("valAx", "", "2")
+                + chart_axis("serAx", chart_rich("Depth"), "3") + chart_axis("catAx", chart_rich("Site"), "4")
+                + '<c:spPr><c:title/></c:spPr>')
+        self.assertEqual(self.labels(plot), ["Axis title: Month", "Axis title: Depth", "Axis title: Site"])
+
+    def test_series_follow_document_order_across_chart_groups(self) -> None:
+        plot = (f"<c:barChart>{chart_series(chart_cached('Bars'))}{chart_series()}</c:barChart>"
+                f"<c:lineChart>{chart_series(chart_cached('Trend'))}</c:lineChart>"
+                f"<c:scatterChart>{chart_series(chart_rich('Points'))}</c:scatterChart>")
+        self.assertEqual(self.labels(plot), ["Series: Bars", "Series: Trend", "Series: Points"])
+
+    def test_shared_categories_are_listed_once_and_others_per_series(self) -> None:
+        months = chart_categories("Jan", "Feb")
+        numeric = "<c:cat><c:numRef><c:f>Sheet1!$A$2</c:f><c:numCache><c:pt idx='0'><c:v>2025</c:v></c:pt></c:numCache></c:numRef></c:cat>"
+        shared = (f"<c:barChart>{chart_series(chart_cached('A'), months)}{chart_series(chart_cached('B'), numeric)}"
+                  f"{chart_series(chart_cached('C'), months)}</c:barChart>")
+        self.assertEqual(self.labels(shared), ["Series: A", "Series: B", "Series: C", "Category: Jan", "Category: Feb"])
+        differing = (f"<c:barChart>{chart_series(chart_cached('A'), months)}{chart_series('', chart_categories('Mar'))}"
+                     f"{chart_series(chart_cached('C'), numeric)}{chart_series(chart_cached('D'), chart_categories('Feb', 'Jan'))}"
+                     "</c:barChart>")
+        self.assertEqual(self.labels(differing), ["Series: A", "Category: Jan", "Category: Feb", "Category: Mar",
+                                                  "Series: C", "Series: D", "Category: Feb", "Category: Jan"])
+        # Categories without any series name still give the chart a block.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', months)}</c:barChart>"), ["Category: Jan", "Category: Feb"])
+
+    def test_category_points_follow_idx_and_literals_count(self) -> None:
+        unordered = ('<c:cat><c:strRef><c:f>x</c:f><c:strCache><c:ptCount val="5"/><c:pt idx="2"><c:v>Third</c:v></c:pt>'
+                     '<c:pt idx="0"><c:v> First </c:v></c:pt><c:pt idx="1"><c:v/></c:pt><c:pt idx="2"><c:v>Again</c:v></c:pt>'
+                     '<c:pt idx="x"><c:v>Bad</c:v></c:pt><c:pt idx="10"><c:v>Last</c:v></c:pt></c:strCache></c:strRef></c:cat>')
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', unordered)}</c:barChart>"),
+                         ["Category: First", "Category: Third", "Category: Last"])
+        literal = f"<c:cat><c:strLit>{str_points('North', 'South')}</c:strLit></c:cat>"
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', literal)}</c:barChart>"),
+                         ["Category: North", "Category: South"])
+
+    def test_multi_level_categories_join_outermost_to_innermost(self) -> None:
+        def level(*points: tuple[int, str]) -> str:
+            return "<c:lvl>" + "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in points) + "</c:lvl>"
+
+        multi = ('<c:cat><c:multiLvlStrRef><c:f>Sheet1!$A$2:$B$5</c:f><c:multiLvlStrCache><c:ptCount val="4"/>'
+                 + level((0, "Q1"), (1, "Q2"), (2, "Q1"), (3, "Q2")) + level((0, "2025"), (2, "2026"))
+                 + level((0, "Plan")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        # Each outer label is shown once, on the first category of its group, as Word stores it.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series(chart_cached('Units'), multi)}</c:barChart>"), [
+            "Series: Units", "Category: Plan / 2025 / Q1", "Category: Q2", "Category: 2026 / Q1", "Category: Q2"])
+        # Empty points add nothing, and an index only an outer level holds is a category of its own.
+        sparse = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level((0, "Q1"), (1, ""))
+                  + level((1, "2026"), (3, "2027")) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', sparse)}</c:barChart>"),
+                         ["Category: Q1", "Category: 2026", "Category: 2027"])
+        # A long outer label is never copied into the categories of its group.
+        long = ('<c:cat><c:multiLvlStrRef><c:f>x</c:f><c:multiLvlStrCache>' + level(*((i, f"D{i}") for i in range(300)))
+                + level((0, "Y" * 100_000)) + "</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>")
+        lines = self.labels(f"<c:barChart>{chart_series('', long)}</c:barChart>")
+        self.assertEqual(lines[:2], ["Category: " + "Y" * 100_000 + " / D0", "Category: D1"])
+        self.assertEqual((len(lines), lines[-1]), (201, "Category: … (100 more)"))
+
+    def test_numeric_categories_and_data_values_produce_no_lines(self) -> None:
+        numeric = ("<c:cat><c:numRef><c:f>Sheet1!$A$2</c:f><c:numCache><c:formatCode>General</c:formatCode>"
+                   '<c:pt idx="0"><c:v>2025</c:v></c:pt></c:numCache></c:numRef></c:cat>')
+        literal = '<c:cat><c:numLit><c:pt idx="0"><c:v>7</c:v></c:pt></c:numLit></c:cat>'
+        plot = f"<c:barChart>{chart_series(chart_cached('Units'), numeric, '4242')}{chart_series('', literal)}</c:barChart>"
+        self.assertEqual(self.labels(plot), ["Series: Units"])
+        # Without any label at all, the chart keeps its placeholder.
+        self.assertEqual(self.labels(f"<c:barChart>{chart_series('', numeric)}</c:barChart>"), [])
+
+    def test_categories_are_capped_at_200_lines_per_chart(self) -> None:
+        days = chart_categories(*(f"Day {n}" for n in range(1, 251)))
+        lines = self.labels(f"<c:lineChart>{chart_series(chart_cached('Visits'), days)}</c:lineChart>")
+        self.assertEqual(len(lines), 202)
+        self.assertEqual(lines[:2], ["Series: Visits", "Category: Day 1"])
+        self.assertEqual(lines[-2:], ["Category: Day 200", "Category: … (50 more)"])
+        # Per-series categories share the cap; later series names still show.
+        plot = (f"<c:barChart>{chart_series(chart_cached('A'), chart_categories(*(f'A{n}' for n in range(150))))}"
+                f"{chart_series(chart_cached('B'), chart_categories(*(f'B{n}' for n in range(100))))}"
+                f"{chart_series(chart_cached('C'), chart_categories('C0'))}</c:barChart>")
+        lines = self.labels(plot)
+        self.assertEqual(sum(line.startswith("Category: ") for line in lines), 201)
+        self.assertEqual(lines[150:153], ["Category: A149", "Series: B", "Category: B0"])
+        self.assertEqual(lines[-3:], ["Category: B49", "Category: … (51 more)", "Series: C"])
+        # Exactly 200 categories need no such line.
+        lines = self.labels(f"<c:lineChart>{chart_series('', chart_categories(*map(str, range(200))))}</c:lineChart>")
+        self.assertEqual((len(lines), lines[-1]), (200, "Category: 199"))
+
+    def test_without_labels_a_chart_keeps_its_placeholder(self) -> None:
+        placeholder = "Figure:[Unsupported drawing]\n"
+        body = anchored("Figure:", chart("chart"))
+        unlabelled = object_parts()["word/charts/chart1.xml"]
+        for name, data, relationships in (
+            ("no labels", unlabelled, CHART_REL),
+            ("no relationship", quarterly(), ""),
+            ("no part", None, rel("chart", "chart", "charts/chart9.xml")),
+            ("external", quarterly(), rel("chart", "chart", "https://example.invalid/chart.xml", external=True)),
+            ("not a chart space", "<chart/>", CHART_REL),
+            ("no chart", f'<c:chartSpace xmlns:c="{C}"/>', CHART_REL),
+            ("no plot area", f'<c:chartSpace xmlns:c="{C}"><c:chart/></c:chartSpace>', CHART_REL),
+        ):
+            with self.subTest(name=name):
+                prose, meta = self.extract(body, data, relationships=relationships)
+                self.assertEqual(prose, placeholder)
+                self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+                self.assertNotIn(CHART_NOTE, meta["warnings"])
+        # An Office 2016 chart (cx:chart) is not a c:chart and keeps today's output.
+        cx = graphic("http://schemas.microsoft.com/office/drawing/2014/chartex",
+                     '<cx:chart xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex" r:id="chart"/>')
+        self.assertEqual(self.extract(anchored("Figure:", cx))[0], placeholder)
+
+    def test_a_drawing_that_also_holds_a_picture_keeps_its_placeholder(self) -> None:
+        shared = graphic(C, f'<c:chart xmlns:c="{C}" r:id="chart"/><pic:pic xmlns:pic="{PIC}"><pic:blipFill>'
+                            '<a:blip r:embed="img"/></pic:blipFill></pic:pic>')
+        prose, meta = self.extract(anchored("Figure:", shared), extra={"word/media/image1.png": "png"},
+                                   relationships=CHART_REL + image_rel("img", "media/image1.png"))
+        self.assertEqual(prose, f"Figure:[Unsupported drawing]\n\n{QUARTERLY_BLOCK}\n")
+        self.assertIn(UNSUPPORTED_DRAWING, meta["warnings"])
+
+    def test_charts_render_where_anchored_and_not_from_deletions_or_unselected_copies(self) -> None:
+        sales = chart_space(f"<c:pieChart>{chart_series(chart_cached('Header sales'))}</c:pieChart>")
+        header = f'<w:hdr xmlns:w="{W}" xmlns:r="{R}">{anchored("Head:", chart("hc"))}</w:hdr>'
+        header_rels = f'<Relationships xmlns="{PKG_R}">{rel("hc", "chart", "charts/chart2.xml")}</Relationships>'
+        # A chart in a text box, then a chart beside a SmartArt diagram in one paragraph.
+        body = (anchored("Box:", modern_text_box(anchored("Inside:", chart("chart"))))
+                + f'<w:p>{run("Both:")}<w:r>{smartart("dgmData")}</w:r><w:r>{chart("chart")}</w:r></w:p>'
+                + '<w:sectPr><w:headerReference w:type="default" r:id="headerRef"/></w:sectPr>')
+        prose, meta = self.extract(body, extra={"word/header1.xml": header, "word/_rels/header1.xml.rels": header_rels,
+                                                "word/charts/chart2.xml": sales, **diagram_parts(PLAN)},
+                                   relationships=CHART_REL + DIAGRAM_RELS + rel("headerRef", "header", "header1.xml"))
+        self.assertEqual(prose, f"Box:\n\n[Text box]\n\nInside:\n\n{QUARTERLY_BLOCK}\n\n[/Text box]\n\n"
+                                f"Both:\n\n{PLAN_BLOCK}\n\n{QUARTERLY_BLOCK}\n\n"
+                                "## Header (word/header1.xml)\n\nHead:\n\n[Chart]\n\nSeries: Header sales\n\n[/Chart]\n")
+        self.assertEqual(meta["objects"], [part_entry("chart", quarterly()), part_entry("diagram", PLAN),
+                                           part_entry("chart", quarterly()), part_entry("chart", sales, "word/header1.xml")])
+        self.assertEqual([wn for wn in meta["warnings"] if "[Chart]" in wn or "[Diagram]" in wn], [CHART_NOTE, DIAGRAM_NOTE])
+        # A chart in a tracked deletion is not in the accepted view.
+        deleted = f'<w:p>{run("Kept.")}<w:del w:id="1" w:author="Ada"><w:r>{chart("chart")}</w:r></w:del></w:p>'
+        prose, meta = self.extract(deleted)
+        self.assertEqual(prose, "Kept.\n")
+        self.assertNotIn("objects", meta)
+        # Every compatibility copy's prose is read, but a chart renders only from the chosen one.
+        block = (f'<mc:AlternateContent xmlns:mc="{MC}"><mc:Choice Requires="c14">{anchored("Chosen:", chart("chart"))}'
+                 f'</mc:Choice><mc:Fallback>{anchored("Other:", chart("chart"))}</mc:Fallback></mc:AlternateContent>')
+        prose, meta = self.extract(block)
+        self.assertEqual(prose, f"Chosen:\n\n{QUARTERLY_BLOCK}\n\nOther:[Unsupported drawing]\n")
+        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())])
+        # A chart in a comment is neither rendered nor recorded.
+        comments = (f'<w:comments xmlns:w="{W}" xmlns:r="{R}"><w:comment w:id="1" w:author="Ada">'
+                    f'{anchored("Note:", chart("chart"))}</w:comment></w:comments>')
+        prose, meta = self.extract(f'<w:p>{start("1")}{run("Text.")}{end("1")}</w:p>', extra={"word/comments.xml": comments},
+                                   relationships=CHART_REL + COMMENTS_REL)
+        self.assertEqual(prose, "Text.\n")
+        self.assertNotIn("objects", meta)
+
+    def test_a_chart_part_referenced_twice_renders_twice(self) -> None:
+        prose, meta = self.extract(anchored("One:", chart("chart")) + anchored("Two:", chart("chart")))
+        self.assertEqual(prose, f"One:\n\n{QUARTERLY_BLOCK}\n\nTwo:\n\n{QUARTERLY_BLOCK}\n")
+        self.assertEqual(meta["objects"], [part_entry("chart", quarterly())] * 2)
+
+    def test_editing_a_label_changes_only_its_line(self) -> None:
+        before = self.block(quarterly())
+        for edit, line in (({"series_2026": "2026 (forecast)"}, ("Series: 2026", "Series: 2026 (forecast)")),
+                           ({"category": "Q2 (est.)"}, ("Category: Q2", "Category: Q2 (est.)")),
+                           ({"title": "Revenue by quarter"}, ("Title: Quarterly revenue", "Title: Revenue by quarter"))):
+            with self.subTest(edit=edit):
+                after = self.block(quarterly(**edit))
+                changed = [(old, new) for old, new in zip(before.split("\n"), after.split("\n"), strict=True) if old != new]
+                self.assertEqual(changed, [line])
+
+    def test_documents_without_labelled_charts_keep_their_companions(self) -> None:
+        # Pinned from the companions Pilcrow wrote before charts had prose: OBJECT_BODY (an
+        # unlabelled chart, a SmartArt diagram, an embedded object and an imported chunk).
+        from pilcrow.extract import extract
+
+        make_docx(self.path, OBJECT_BODY, extra=object_parts(), relationships=OBJECT_RELS)
+        outputs = extract(self.path).outputs()
+        self.assertEqual({name: hashlib.sha256(data).hexdigest() for name, data in outputs.items()}, {
+            ".prose.md": "fec4a0a3752a5c8b11f07f875c2d26c283d7c5c06bd6f88d4277092e8d1f8ba9",
+            ".meta.json": "4440cebbc8036a47a9836be2978b90a50dcdd57f7051a85466b28b846ec3fa91",
         })
 
 
